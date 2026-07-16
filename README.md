@@ -2,7 +2,7 @@ FDE Agent is a local-first, evidence-driven engineering agent that analyzes Lega
 
 # FDE Agent
 
-**v0.1.0 release candidate — Read-only AI Integration Assessment and Safe Sandbox Foundation**
+**v0.1.0 — Read-only AI Integration Assessment and Safe Sandbox Foundation**
 
 FDE Agent is not a general chat assistant and it is not an unrestricted coding Agent. General assistants can answer from conversation context without examining a selected system; unrestricted coding Agents may edit files or run commands. This release instead routes engineering requests into bounded read-only inspection, records the evidence behind each claim, preserves uncertainty, and exposes no live workspace-mutation or shell-execution capability. Its Safe Sandbox feature copies approved source into a disposable, independently stored workspace and never authorizes Phase 2D.1 mutation operations.
 
