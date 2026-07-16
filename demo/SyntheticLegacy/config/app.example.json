@@ -1,0 +1,6 @@
+{
+  "environment": "<ENVIRONMENT_NAME>",
+  "databaseHost": "<DATABASE_HOST>",
+  "auditSink": "<AUDIT_SINK>",
+  "outboundActionsEnabled": false
+}

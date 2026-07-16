@@ -1,0 +1,30 @@
+name: Deterministic Swift CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      FDE_MODEL_PROVIDER: local
+      FDE_RUN_LIVE_SANDBOX_ACCEPTANCE: "0"
+      FDE_RUN_LIVE_PRODUCT_RUNTIME_ACCEPTANCE: "0"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Show Swift toolchain
+        run: swift --version
+
+      - name: Isolated Swift build
+        run: swift build --scratch-path "$RUNNER_TEMP/fde-build"
+
+      - name: Deterministic repository tests
+        run: swift test --scratch-path "$RUNNER_TEMP/fde-tests"

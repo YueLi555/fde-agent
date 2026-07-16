@@ -1,0 +1,8 @@
+{
+  "name": "synthetic-legacy-order-service",
+  "version": "0.0.0-demo",
+  "private": true,
+  "description": "Dependency-free synthetic fixture for static inspection",
+  "dependencies": {},
+  "devDependencies": {}
+}
