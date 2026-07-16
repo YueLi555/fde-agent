@@ -206,19 +206,11 @@ private struct SandboxStatusCard: View {
     }
 
     private var sourceStatus: String {
-        switch snapshot.sourceUnchanged {
-        case true: "UNCHANGED"
-        case false: "CHANGED"
-        case nil: "CHECKING"
-        }
+        sandboxSourceStatus(for: snapshot)
     }
 
     private var sourceColor: Color {
-        switch snapshot.sourceUnchanged {
-        case true: .green
-        case false: .orange
-        case nil: .secondary
-        }
+        sandboxSourceColor(for: snapshot)
     }
 
     private func abbreviated(_ value: String?) -> String {
@@ -236,6 +228,22 @@ private struct SandboxStatusCard: View {
                 .foregroundStyle(color)
                 .lineLimit(1)
         }
+    }
+}
+
+func sandboxSourceStatus(for snapshot: SandboxActivitySnapshot) -> String {
+    switch snapshot.sourceUnchanged {
+    case .some(true): "UNCHANGED"
+    case .some(false): "CHANGED"
+    case .none: "UNKNOWN"
+    }
+}
+
+func sandboxSourceColor(for snapshot: SandboxActivitySnapshot) -> Color {
+    switch snapshot.sourceUnchanged {
+    case .some(true): .green
+    case .some(false): .orange
+    case .none: .secondary
     }
 }
 
