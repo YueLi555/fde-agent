@@ -40,6 +40,12 @@ final class AppStore: ObservableObject {
     @Published var latestGlobalExecutionPolicy: GlobalExecutionPolicy?
     @Published var governorDecisions: [GlobalGovernorDecision] = []
     @Published var pendingApprovals: [ApprovalRequest] = []
+    @Published var candidatePatchApprovalConfirmation: CandidatePatchApprovalConfirmation?
+    @Published var isConfirmingCandidatePatchApproval = false
+    @Published var candidatePatchRevertConfirmation: CandidatePatchRevertConfirmation?
+    @Published var isConfirmingCandidatePatchRevert = false
+    @Published var candidatePatchDestructionConfirmation: CandidatePatchSandboxDestructionConfirmation?
+    @Published var isConfirmingCandidatePatchDestruction = false
     @Published var agentBenchmarkSummary = AgentBenchmarkSummary.empty
     @Published var agentCapabilityReport = AgentCapabilityReport.empty
     @Published var engineeringActivity = EngineeringActivitySnapshot.empty
@@ -72,6 +78,7 @@ final class AppStore: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var hasLoaded = false
     private var pendingSubmissionFingerprints: [UUID: Set<UInt64>] = [:]
+    private let appSessionID = UUID()
 
     var selectedWorkspace: Workspace? {
         guard let selectedWorkspaceID else { return workspaces.first }
@@ -335,6 +342,9 @@ final class AppStore: ObservableObject {
     }
 
     func selectWorkspace(_ workspaceID: UUID?) {
+        cancelCandidatePatchApprovalConfirmation()
+        cancelCandidatePatchRevertConfirmation()
+        cancelCandidatePatchDestructionConfirmation()
         let previousWorkspaceID = selectedWorkspaceID
         selectedWorkspaceID = workspaceID
         selectedAgentSessionID = agentSessions.first { $0.workspaceID == workspaceID }?.sessionID
@@ -373,6 +383,9 @@ final class AppStore: ObservableObject {
     }
 
     func selectTask(_ taskID: UUID?) {
+        cancelCandidatePatchApprovalConfirmation()
+        cancelCandidatePatchRevertConfirmation()
+        cancelCandidatePatchDestructionConfirmation()
         selectedTaskID = taskID
         if let taskID,
            let session = agentSessions.first(where: { $0.runtimeTaskID == taskID }) {
@@ -382,6 +395,9 @@ final class AppStore: ObservableObject {
     }
 
     func selectAgentSession(_ sessionID: UUID?) {
+        cancelCandidatePatchApprovalConfirmation()
+        cancelCandidatePatchRevertConfirmation()
+        cancelCandidatePatchDestructionConfirmation()
         selectedAgentSessionID = sessionID
         selectedTaskID = agentSessions.first { $0.sessionID == sessionID }?.runtimeTaskID
         Task { await refreshSelectedTaskDetails() }
@@ -456,7 +472,8 @@ final class AppStore: ObservableObject {
                     input: input,
                     workspace: workspace,
                     session: &session,
-                    runtime: environment.runtime
+                    runtime: environment.runtime,
+                    userMessageID: requestID
                 )
                 agentSessions[index] = session
                 if let task = result.task {
@@ -514,6 +531,13 @@ final class AppStore: ObservableObject {
     }
 
     func approve(_ approval: ApprovalRequest) {
+        if approval.targetKind == .candidatePatchPlan {
+            openCandidatePatchApprovalConfirmation(
+                approval,
+                source: candidatePatchApprovalInvocationSource()
+            )
+            return
+        }
         guard let workspace = selectedWorkspace else { return }
         Task {
             do {
@@ -529,6 +553,297 @@ final class AppStore: ObservableObject {
             } catch {
                 lastError = error.localizedDescription
             }
+        }
+    }
+
+    func confirmCandidatePatchApproval(_ confirmation: CandidatePatchApprovalConfirmation) {
+        guard confirmation == candidatePatchApprovalConfirmation,
+              let workspace = selectedWorkspace,
+              let context = candidatePatchApprovalUIContext(for: confirmation.approvalRequestID) else {
+            lastError = "The Candidate Patch approval is no longer the visible pending request."
+            cancelCandidatePatchApprovalConfirmation()
+            return
+        }
+        let source = candidatePatchApprovalInvocationSource()
+        isConfirmingCandidatePatchApproval = true
+        Task {
+            defer { isConfirmingCandidatePatchApproval = false }
+            do {
+                _ = try await environment.runtime.confirmCandidatePatchApproval(
+                    confirmation,
+                    workspace: workspace,
+                    context: context,
+                    source: source,
+                    reason: "Confirmed from Candidate Patch approval sheet"
+                )
+                candidatePatchApprovalConfirmation = nil
+                if let event = applyApprovalGranted(confirmation.approvalRequestID) {
+                    try await recordInteractionEvent(event, workspace: workspace, taskID: confirmation.taskID)
+                }
+                await refresh()
+            } catch {
+                candidatePatchApprovalConfirmation = nil
+                lastError = error.localizedDescription
+                await refresh()
+            }
+        }
+    }
+
+    func cancelCandidatePatchApprovalConfirmation() {
+        guard let confirmation = candidatePatchApprovalConfirmation else { return }
+        candidatePatchApprovalConfirmation = nil
+        isConfirmingCandidatePatchApproval = false
+        Task {
+            await environment.runtime.cancelCandidatePatchApprovalConfirmation(
+                confirmation.confirmationStepID
+            )
+        }
+    }
+
+    func openCandidatePatchRevertConfirmation(_ snapshot: CandidatePatchActivitySnapshot) {
+        guard candidatePatchRevertConfirmation == nil,
+              let workspace = selectedWorkspace,
+              let patchID = snapshot.patchID.flatMap(CandidatePatchID.init(rawValue:)),
+              let sandboxID = snapshot.sandboxID.flatMap(SandboxID.init(rawValue:)),
+              let authenticatedLocalSessionID = session?.id,
+              session?.workspaceID == workspace.id else {
+            lastError = "The exact Candidate Patch Revert target is not available in the authenticated workspace."
+            return
+        }
+        let source = candidatePatchApprovalInvocationSource()
+        Task {
+            do {
+                let requestingTask: FDETask
+                if let selectedTask,
+                   selectedTask.title == "Phase 2D.1 Candidate Patch Revert",
+                   selectedTask.state == .pendingApproval {
+                    requestingTask = selectedTask
+                } else {
+                    requestingTask = try await environment.runtime.runCandidatePatchRevert(
+                        input: "revert exact Candidate Patch \(patchID.rawValue) in Sandbox \(sandboxID.rawValue)",
+                        workspace: workspace
+                    )
+                }
+                let context = CandidatePatchRevertUIContext(
+                    currentWorkspaceID: workspace.id,
+                    currentTaskID: requestingTask.id,
+                    visiblePatchID: patchID,
+                    visibleSandboxID: sandboxID,
+                    authenticatedLocalSessionID: authenticatedLocalSessionID,
+                    appSessionID: appSessionID
+                )
+                candidatePatchRevertConfirmation = try await environment.runtime
+                    .beginCandidatePatchRevertConfirmation(
+                        patchID: patchID,
+                        sandboxID: sandboxID,
+                        workspace: workspace,
+                        context: context,
+                        source: source
+                    )
+                await refresh()
+            } catch {
+                candidatePatchRevertConfirmation = nil
+                lastError = error.localizedDescription
+                await refresh()
+            }
+        }
+    }
+
+    func confirmCandidatePatchRevert(_ confirmation: CandidatePatchRevertConfirmation) {
+        guard confirmation == candidatePatchRevertConfirmation,
+              let workspace = selectedWorkspace,
+              let authenticatedLocalSessionID = session?.id else {
+            lastError = "The Candidate Patch Revert confirmation is no longer current."
+            cancelCandidatePatchRevertConfirmation()
+            return
+        }
+        let context = CandidatePatchRevertUIContext(
+            currentWorkspaceID: workspace.id,
+            currentTaskID: confirmation.requestingTaskID,
+            visiblePatchID: confirmation.binding.patchID,
+            visibleSandboxID: confirmation.binding.sandboxID,
+            authenticatedLocalSessionID: authenticatedLocalSessionID,
+            appSessionID: appSessionID
+        )
+        let source = candidatePatchApprovalInvocationSource()
+        isConfirmingCandidatePatchRevert = true
+        Task {
+            defer { isConfirmingCandidatePatchRevert = false }
+            do {
+                _ = try await environment.runtime.confirmCandidatePatchRevert(
+                    confirmation,
+                    workspace: workspace,
+                    context: context,
+                    source: source
+                )
+                candidatePatchRevertConfirmation = nil
+                await refresh()
+            } catch {
+                candidatePatchRevertConfirmation = nil
+                lastError = error.localizedDescription
+                await refresh()
+            }
+        }
+    }
+
+    func cancelCandidatePatchRevertConfirmation() {
+        guard let confirmation = candidatePatchRevertConfirmation else { return }
+        candidatePatchRevertConfirmation = nil
+        isConfirmingCandidatePatchRevert = false
+        Task {
+            await environment.runtime.cancelCandidatePatchRevertConfirmation(
+                confirmation.confirmationStepID
+            )
+            await refresh()
+        }
+    }
+
+    func openCandidatePatchDestructionConfirmation(_ snapshot: CandidatePatchActivitySnapshot) {
+        guard candidatePatchDestructionConfirmation == nil,
+              let workspace = selectedWorkspace,
+              let taskID = selectedTaskID,
+              let patchID = snapshot.patchID.flatMap(CandidatePatchID.init(rawValue:)),
+              let sandboxID = snapshot.sandboxID.flatMap(SandboxID.init(rawValue:)),
+              let authenticatedLocalSessionID = session?.id,
+              session?.workspaceID == workspace.id else {
+            lastError = "The reverted Candidate Patch Sandbox is not available for separate destruction."
+            return
+        }
+        let context = CandidatePatchRevertUIContext(
+            currentWorkspaceID: workspace.id,
+            currentTaskID: taskID,
+            visiblePatchID: patchID,
+            visibleSandboxID: sandboxID,
+            authenticatedLocalSessionID: authenticatedLocalSessionID,
+            appSessionID: appSessionID
+        )
+        let source = candidatePatchApprovalInvocationSource()
+        Task {
+            do {
+                candidatePatchDestructionConfirmation = try await environment.runtime
+                    .beginCandidatePatchSandboxDestructionConfirmation(
+                        patchID: patchID,
+                        sandboxID: sandboxID,
+                        workspace: workspace,
+                        context: context,
+                        source: source
+                    )
+                await refresh()
+            } catch {
+                candidatePatchDestructionConfirmation = nil
+                lastError = error.localizedDescription
+                await refresh()
+            }
+        }
+    }
+
+    func confirmCandidatePatchDestruction(
+        _ confirmation: CandidatePatchSandboxDestructionConfirmation
+    ) {
+        guard confirmation == candidatePatchDestructionConfirmation,
+              let workspace = selectedWorkspace,
+              let authenticatedLocalSessionID = session?.id else {
+            lastError = "The Sandbox destruction confirmation is no longer current."
+            cancelCandidatePatchDestructionConfirmation()
+            return
+        }
+        let context = CandidatePatchRevertUIContext(
+            currentWorkspaceID: workspace.id,
+            currentTaskID: confirmation.requestingTaskID,
+            visiblePatchID: confirmation.binding.patchID,
+            visibleSandboxID: confirmation.binding.sandboxID,
+            authenticatedLocalSessionID: authenticatedLocalSessionID,
+            appSessionID: appSessionID
+        )
+        let source = candidatePatchApprovalInvocationSource()
+        isConfirmingCandidatePatchDestruction = true
+        Task {
+            defer { isConfirmingCandidatePatchDestruction = false }
+            do {
+                _ = try await environment.runtime.confirmCandidatePatchSandboxDestruction(
+                    confirmation,
+                    workspace: workspace,
+                    context: context,
+                    source: source
+                )
+                candidatePatchDestructionConfirmation = nil
+                await refresh()
+            } catch {
+                candidatePatchDestructionConfirmation = nil
+                lastError = error.localizedDescription
+                await refresh()
+            }
+        }
+    }
+
+    func cancelCandidatePatchDestructionConfirmation() {
+        guard let confirmation = candidatePatchDestructionConfirmation else { return }
+        candidatePatchDestructionConfirmation = nil
+        isConfirmingCandidatePatchDestruction = false
+        Task {
+            await environment.runtime.cancelCandidatePatchSandboxDestructionConfirmation(
+                confirmation.confirmationStepID
+            )
+            await refresh()
+        }
+    }
+
+    private func openCandidatePatchApprovalConfirmation(
+        _ approval: ApprovalRequest,
+        source: CandidatePatchApprovalSource
+    ) {
+        guard candidatePatchApprovalConfirmation == nil,
+              let workspace = selectedWorkspace,
+              let context = candidatePatchApprovalUIContext(for: approval.id) else {
+            lastError = "The Candidate Patch approval is not the current visible pending request."
+            return
+        }
+        Task {
+            do {
+                candidatePatchApprovalConfirmation = try await environment.runtime
+                    .beginCandidatePatchApprovalConfirmation(
+                        approval.id,
+                        workspace: workspace,
+                        context: context,
+                        source: source
+                    )
+            } catch {
+                candidatePatchApprovalConfirmation = nil
+                lastError = error.localizedDescription
+                await refresh()
+            }
+        }
+    }
+
+    private func candidatePatchApprovalUIContext(
+        for approvalRequestID: UUID
+    ) -> CandidatePatchApprovalUIContext? {
+        guard let workspaceID = selectedWorkspace?.id,
+              let taskID = selectedTaskID,
+              let authenticatedUserSessionID = session?.id,
+              session?.workspaceID == workspaceID,
+              selectedTaskPendingApprovals.contains(where: {
+                  $0.id == approvalRequestID && $0.targetKind == .candidatePatchPlan
+              }) else {
+            return nil
+        }
+        return CandidatePatchApprovalUIContext(
+            currentWorkspaceID: workspaceID,
+            currentTaskID: taskID,
+            visiblePendingApprovalRequestIDs: selectedTaskPendingApprovals.map(\.id),
+            authenticatedUserSessionID: authenticatedUserSessionID,
+            appSessionID: appSessionID
+        )
+    }
+
+    private func candidatePatchApprovalInvocationSource() -> CandidatePatchApprovalSource {
+        guard let event = NSApp.currentEvent else { return .accessibilityUI }
+        switch event.type {
+        case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+             .otherMouseDown, .otherMouseUp:
+            return .nativeUI
+        default:
+            return .accessibilityUI
         }
     }
 
@@ -555,6 +870,22 @@ final class AppStore: ObservableObject {
         let action = AgentPresentationSanitizer.safeContent(approval.action, fallback: "approval")
         let resource = AgentPresentationSanitizer.safeContent(approval.resource, fallback: "protected action")
         commandText = "Change approach for \(action) on \(resource): "
+    }
+
+    func requestCandidatePatchChanges(_ approval: ApprovalRequest, revisionInstructions: String) {
+        guard let workspace = selectedWorkspace else { return }
+        Task {
+            do {
+                _ = try await environment.runtime.requestChangesApprovalRequest(
+                    approval.id,
+                    workspace: workspace,
+                    revisionInstructions: revisionInstructions
+                )
+                await refresh()
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
     }
 
     func createStubSession() {
@@ -911,7 +1242,8 @@ final class AppStore: ObservableObject {
                     session: &session,
                     runtime: environment.runtime,
                     continuation: continuation,
-                    userMessageAlreadyAppended: true
+                    userMessageAlreadyAppended: true,
+                    userMessageID: requestID
                 )
                 agentSessions[index] = session
                 if let task = result.task {
@@ -1144,7 +1476,11 @@ final class AppStore: ObservableObject {
             return
         }
         activity.kind = .failed
-        if scope == .normalChat {
+        if let persistenceError = error as? PersistenceError,
+           let category = Self.eventStoreFailureCategory(for: persistenceError) {
+            activity.labelOverride = "Event store failure · \(category)"
+            activity.metadata.blockerReason = category
+        } else if scope == .normalChat {
             activity.labelOverride = "Unable to reach the configured AI provider."
             activity.metadata.blockerReason = "the AI provider could not be reached"
         } else {
@@ -1154,6 +1490,10 @@ final class AppStore: ObservableObject {
             )
         }
         conversationActivities[sessionID] = activity
+    }
+
+    static func eventStoreFailureCategory(for error: PersistenceError) -> String? {
+        error.eventStoreFailureCategory?.rawValue
     }
 
     private func endSubmission(_ fingerprint: UInt64, sessionID: UUID) {

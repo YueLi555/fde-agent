@@ -61,13 +61,19 @@ actor RuntimeKernel {
     private let requiresProjectScope: Bool
     private let readOnlyInspectionLimits: ReadOnlyInspectionLimits
     private let sandboxLifecycle: SandboxLifecycleService?
+    private let candidatePatchPlanProvider: (any CandidatePatchPlanRequestProviding)?
+    private let allowsCandidatePatchTestApproval: Bool
     private let readOnlyReadinessValidator = ReadOnlyPlanReadinessValidator()
     private let promptOrchestrator = PromptOrchestrator()
     private let stateMachine = WorkflowStateMachine()
-    private var sequence: Int64 = 0
-    private var sequenceInitialized = false
     private var lastEventIDByTask: [UUID: UUID] = [:]
     private var lastEventIDByWorkspace: [UUID: UUID] = [:]
+    private var pendingCandidatePatches: [UUID: CandidatePatchPendingRuntime] = [:]
+    private var candidatePatchApprovalConfirmations: [UUID: CandidatePatchApprovalConfirmation] = [:]
+    private var pendingCandidatePatchReverts: [UUID: CandidatePatchRevertTarget] = [:]
+    private var candidatePatchRevertConfirmations: [UUID: CandidatePatchRevertConfirmation] = [:]
+    private var pendingCandidatePatchDestructions: [UUID: CandidatePatchSandboxDestructionTarget] = [:]
+    private var candidatePatchDestructionConfirmations: [UUID: CandidatePatchSandboxDestructionConfirmation] = [:]
 
     init(
         persistence: any PersistenceStore,
@@ -101,7 +107,9 @@ actor RuntimeKernel {
         completionPolicy: RuntimeCompletionPolicy = .legacyPermissive,
         requiresProjectScope: Bool = false,
         readOnlyInspectionLimits: ReadOnlyInspectionLimits = .conservative,
-        sandboxLifecycle: SandboxLifecycleService? = nil
+        sandboxLifecycle: SandboxLifecycleService? = nil,
+        candidatePatchPlanProvider: (any CandidatePatchPlanRequestProviding)? = nil,
+        allowsCandidatePatchTestApproval: Bool = false
     ) {
         self.persistence = persistence
         self.eventStream = eventStream ?? InMemoryEventStream(eventBus: eventBus)
@@ -134,6 +142,605 @@ actor RuntimeKernel {
         self.requiresProjectScope = requiresProjectScope
         self.readOnlyInspectionLimits = readOnlyInspectionLimits
         self.sandboxLifecycle = sandboxLifecycle
+        self.allowsCandidatePatchTestApproval = allowsCandidatePatchTestApproval
+        self.candidatePatchPlanProvider = candidatePatchPlanProvider
+            ?? PersistedCandidatePatchPlanRequestProvider(persistence: persistence)
+    }
+
+    func runCandidatePatchGeneration(input: String, workspace: Workspace) async throws -> FDETask {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw RuntimeKernelError.emptyInput }
+        var task = FDETask(
+            id: UUID(),
+            workspaceID: workspace.id,
+            title: "Phase 2D.1 Candidate Patch",
+            rawInput: trimmed,
+            state: .created,
+            plan: [],
+            riskScore: 0,
+            failureProbability: 0,
+            performanceScore: 0,
+            createdAt: Date(),
+            updatedAt: Date()
+        )
+        try await record(
+            type: .taskCreated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Candidate Patch task created",
+            payload: [
+                "state": task.state.rawValue,
+                "intent_type": MissionIntentType.candidatePatchGeneration.rawValue,
+                "mission_semantic": MissionExecutionSemantic.candidatePatchGeneration.rawValue,
+                "mission_workspace_scope": MissionWorkspaceScope.legacyOnly.rawValue,
+                "generic_tool_execution_enabled": "false",
+                "generated_tests_available": "false"
+            ].merging(runtimeStatePayload(mission: .understand, task: task.state)) { current, _ in current },
+            initialTask: task
+        )
+        task.plan = CandidatePatchActivityPhase.generationPhases.map { phase in
+            PlanStep(
+                id: "candidate-patch-\(phase.rawValue.lowercased().replacingOccurrences(of: " ", with: "-"))",
+                title: phase.rawValue,
+                intent: "Run an app-managed Candidate Patch lifecycle step without shell, Git, build, test, or deployment execution.",
+                kind: .reasoning,
+                toolCallID: nil,
+                requiresApproval: phase == .waitingForHumanApproval
+            )
+        }
+        try stateMachine.transition(&task, to: .planned)
+        try stateMachine.transition(&task, to: .running)
+        try await persistence.saveTask(task)
+
+        var snapshot = CandidatePatchActivitySnapshot.empty
+        do {
+            try await recordCandidatePatchActivity(.understandingRequestedChange, snapshot: snapshot, workspace: workspace, task: task)
+            try await recordCandidatePatchActivity(.loadingGroundedAssessment, snapshot: snapshot, workspace: workspace, task: task)
+            guard let lifecycle = sandboxLifecycle,
+                  let provider = candidatePatchPlanProvider else {
+                throw CandidatePatchRuntimeError.runtimeUnavailable
+            }
+            try await recordCandidatePatchActivity(.validatingPlanningPreconditions, snapshot: snapshot, workspace: workspace, task: task)
+            let request = try await provider.planRequest(for: trimmed, workspace: workspace, lifecycle: lifecycle)
+            try await recordCandidatePatchActivity(.preparingCandidatePatchPlan, snapshot: snapshot, workspace: workspace, task: task)
+            let service = CandidatePatchService(lifecycle: lifecycle)
+            let plan = try service.preparePlan(request)
+            var manifest = try service.loadManifest(sandboxID: plan.sandboxID, patchID: plan.patchID)
+            snapshot = CandidatePatchActivitySnapshot(plan: plan)
+
+            let approvalID = UUID()
+            var renderedPlan = plan
+            renderedPlan.approvalRequestID = approvalID
+            let approval = ApprovalRequest(
+                id: approvalID,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                stepID: "candidate-patch-plan-revision-\(plan.revision)",
+                toolCallID: nil,
+                targetKind: .candidatePatchPlan,
+                action: "Approve Candidate Patch plan",
+                resource: "Candidate Patch \(plan.patchID.rawValue) with reserved Safe Sandbox \(plan.sandboxID.rawValue)",
+                riskLevel: riskSeverity(plan.risk),
+                state: .pending,
+                requestedByRole: workspace.role,
+                decidedByRole: nil,
+                decisionReason: nil,
+                requestedAt: Date(),
+                decidedAt: nil,
+                expiresAt: nil,
+                metadata: [
+                    "workspace_id": workspace.id.uuidString,
+                    "task_id": task.id.uuidString,
+                    "approval_request_id": approvalID.uuidString,
+                    "candidate_patch_id": plan.patchID.rawValue,
+                    "sandbox_id": plan.sandboxID.rawValue,
+                    "sandbox_root": "",
+                    "source_snapshot_id": plan.sourceSnapshotID,
+                    "assessment_id": plan.assessmentID,
+                    "normalized_requested_capability_id": plan.requestedCapabilityID,
+                    "canonical_legacy_root": plan.legacyIntegrityBaseline.canonicalLegacyRoot,
+                    "plan_id": plan.planID.uuidString,
+                    "plan_revision": String(plan.revision),
+                    "files_planned": String(plan.operations.count),
+                    "prohibited_actions": plan.prohibitedActions.joined(separator: " | "),
+                    "candidate_patch_plan_summary": renderedPlan.markdown
+                ]
+            )
+            manifest = try service.recordApprovalRequest(
+                sandboxID: plan.sandboxID,
+                patchID: plan.patchID,
+                planID: plan.planID,
+                approvalRequestID: approval.id
+            )
+            snapshot = CandidatePatchActivitySnapshot(plan: manifest.plan)
+            _ = try await approvalQueue.enqueue(approval)
+            pendingCandidatePatches[approval.id] = CandidatePatchPendingRuntime(
+                approvalRequestID: approval.id,
+                taskID: task.id,
+                workspaceID: workspace.id,
+                sandboxID: plan.sandboxID,
+                patchID: plan.patchID
+            )
+            try stateMachine.transition(&task, to: .pendingApproval)
+            try await persistence.saveTask(task)
+            try await record(
+                type: .humanApprovalRequested,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: "Candidate Patch plan requires explicit human approval",
+                payload: snapshot.eventPayload.merging([
+                    "state": task.state.rawValue,
+                    "approval_request_id": approval.id.uuidString,
+                    "candidate_patch_activity_phase": CandidatePatchActivityPhase.waitingForHumanApproval.rawValue,
+                    "runtime_owned_activity": "true",
+                    "manifest_backed": "true",
+                    "plan_state_location": "app_managed_outside_legacy_and_sandbox",
+                    "detail": manifest.plan.markdown,
+                    "actual_result": manifest.plan.markdown,
+                    "workspace_mutation_count": "0",
+                    "legacy_writes": "0",
+                    "sandbox_writes": "0",
+                    "patch_files_created": "0",
+                    "build_test_executions": "0",
+                    "shell_calls": "0",
+                    "git_operations": "0",
+                    "deployment_operations": "0",
+                    "unified_diff_exists": "false",
+                    "sandbox_readiness_checked": "false"
+                ]) { current, _ in current }
+                .merging(runtimeStatePayload(mission: .waitingHuman, task: task.state, tool: .pendingApproval)) { current, _ in current }
+            )
+            return task
+        } catch {
+            try stateMachine.transition(&task, to: .failed)
+            task.failureProbability = 1
+            try await persistence.saveTask(task)
+            let code = candidatePatchFailureCode(error)
+            try? await recordCandidatePatchActivity(.candidatePatchBlocked, snapshot: snapshot, workspace: workspace, task: task)
+            try await record(
+                type: .stateUpdated,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: "Candidate Patch generation failed closed",
+                payload: [
+                    "state": task.state.rawValue,
+                    "intent_type": MissionIntentType.candidatePatchGeneration.rawValue,
+                    "failure_category": code.rawValue,
+                    "blocker_reason": code.rawValue,
+                    "workspace_mutation_count": "0",
+                    "legacy_writes": "0",
+                    "sandbox_writes": "0",
+                    "patch_files_created": "0",
+                    "build_or_test_executed": "false",
+                    "shell_calls": "0",
+                    "git_operations": "0",
+                    "deployment_operations": "0",
+                    "git_or_deployment_action_occurred": "false",
+                    "generated_tests_available": "false"
+                ].merging(runtimeStatePayload(mission: .failed, task: task.state, tool: .failed)) { current, _ in current }
+            )
+            return task
+        }
+    }
+
+    func runCandidatePatchRevert(input: String, workspace: Workspace) async throws -> FDETask {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw RuntimeKernelError.emptyInput }
+        var task = FDETask(
+            id: UUID(),
+            workspaceID: workspace.id,
+            title: "Phase 2D.1 Candidate Patch Revert",
+            rawInput: trimmed,
+            state: .created,
+            plan: [],
+            riskScore: 0,
+            failureProbability: 0,
+            performanceScore: 0,
+            createdAt: Date(),
+            updatedAt: Date()
+        )
+        try await record(
+            type: .taskCreated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Candidate Patch Revert task created",
+            payload: [
+                "state": task.state.rawValue,
+                "intent_type": MissionIntentType.candidatePatchRevert.rawValue,
+                "mission_semantic": MissionExecutionSemantic.candidatePatchRevert.rawValue,
+                "generic_tool_execution_enabled": "false",
+                "patch_plan_created": "false",
+                "patch_application_approval_created": "false",
+                "sandbox_created": "false",
+                "unified_diff_applied": "false"
+            ].merging(runtimeStatePayload(mission: .understand, task: task.state)) { current, _ in current },
+            initialTask: task
+        )
+        task.plan = CandidatePatchActivityPhase.revertPhases.map { phase in
+            PlanStep(
+                id: "candidate-patch-revert-\(phase.rawValue.lowercased().replacingOccurrences(of: " ", with: "-"))",
+                title: phase.rawValue,
+                intent: "Run the exact-bound app-managed Candidate Patch Revert lifecycle without Build, Test, Shell, Git, deployment, credential, or Sandbox-creation operations.",
+                kind: .reasoning,
+                toolCallID: nil,
+                requiresApproval: phase == .revertConfirmationRequired
+            )
+        }
+        try stateMachine.transition(&task, to: .planned)
+        try stateMachine.transition(&task, to: .running)
+        try await persistence.saveTask(task)
+
+        guard let lifecycle = sandboxLifecycle else {
+            try stateMachine.transition(&task, to: .failed)
+            try await persistence.saveTask(task)
+            return task
+        }
+        let service = CandidatePatchService(lifecycle: lifecycle)
+        do {
+            try await recordCandidatePatchRevertActivity(
+                .locatingAppliedPatch,
+                snapshot: .empty,
+                workspace: workspace,
+                task: task
+            )
+            let target = try service.locateRevertTarget(workspaceID: workspace.id, request: trimmed)
+            _ = try service.prepareRevert(binding: target.binding)
+            var snapshot = CandidatePatchActivitySnapshot(
+                manifest: try service.loadManifest(
+                    sandboxID: target.binding.sandboxID,
+                    patchID: target.binding.patchID
+                )
+            )
+            try await recordCandidatePatchRevertActivity(
+                .validatingRevertBinding,
+                snapshot: snapshot,
+                workspace: workspace,
+                task: task
+            )
+            try await recordCandidatePatchRevertActivity(
+                .verifyingCurrentPostimages,
+                snapshot: snapshot,
+                workspace: workspace,
+                task: task
+            )
+            try await recordCandidatePatchRevertActivity(
+                .confirmingOriginalLegacyUnchanged,
+                snapshot: snapshot,
+                workspace: workspace,
+                task: task
+            )
+            snapshot.projectionState = .revertConfirmationRequired
+            pendingCandidatePatchReverts[task.id] = target
+            try stateMachine.transition(&task, to: .pendingApproval)
+            try await persistence.saveTask(task)
+            try await recordCandidatePatchRevertActivity(
+                .revertConfirmationRequired,
+                snapshot: snapshot,
+                workspace: workspace,
+                task: task,
+                extraPayload: [
+                    "manifest_id": target.binding.manifestID,
+                    "source_task_id": target.binding.taskID.uuidString,
+                    "plan_id": target.binding.planID.uuidString,
+                    "plan_revision": String(target.binding.planRevision),
+                    "source_snapshot_id": target.binding.sourceSnapshotID,
+                    "canonical_legacy_root": target.binding.canonicalLegacyRoot,
+                    "files_to_restore": target.filesToRestore.joined(separator: " | "),
+                    "files_to_remove": target.filesToRemove.joined(separator: " | "),
+                    "explicit_revert_confirmation_required": "true",
+                    "patch_plan_created": "false",
+                    "patch_application_approval_created": "false",
+                    "sandbox_created": "false",
+                    "unified_diff_applied": "false"
+                ]
+            )
+            return task
+        } catch let error as CandidatePatchError where error.code == .revertSelectionAmbiguous {
+            let choices = (try? service.revertTargets(workspaceID: workspace.id)) ?? []
+            try stateMachine.transition(&task, to: .blocked)
+            try await persistence.saveTask(task)
+            try await record(
+                type: .stateUpdated,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: "Candidate Patch Revert requires exact Patch selection",
+                payload: [
+                    "state": task.state.rawValue,
+                    "intent_type": MissionIntentType.candidatePatchRevert.rawValue,
+                    "lifecycle_event": "CANDIDATE_PATCH_REVERT_DISAMBIGUATION_REQUIRED",
+                    "candidate_patch_projection_state": CandidatePatchProjectionState.revertConfirmationRequired.rawValue,
+                    "candidate_patch_choices": choices.map {
+                        "\($0.binding.patchID.rawValue.prefix(8))… / \($0.binding.sandboxID.rawValue.prefix(8))…"
+                    }.joined(separator: " | "),
+                    "selection_required": "true",
+                    "patch_plan_created": "false",
+                    "patch_application_approval_created": "false",
+                    "sandbox_created": "false",
+                    "build_or_test_executed": "false",
+                    "shell_execution_enabled": "false",
+                    "git_or_deployment_action_occurred": "false"
+                ].merging(runtimeStatePayload(mission: .blocked, task: task.state, tool: .failed)) { current, _ in current }
+            )
+            return task
+        } catch {
+            try stateMachine.transition(&task, to: .failed)
+            task.failureProbability = 1
+            try await persistence.saveTask(task)
+            let code = candidatePatchFailureCode(error)
+            try await record(
+                type: .stateUpdated,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: "Candidate Patch Revert failed closed",
+                payload: [
+                    "state": task.state.rawValue,
+                    "intent_type": MissionIntentType.candidatePatchRevert.rawValue,
+                    "failure_category": code.rawValue,
+                    "patch_plan_created": "false",
+                    "patch_application_approval_created": "false",
+                    "sandbox_created": "false",
+                    "build_or_test_executed": "false",
+                    "shell_execution_enabled": "false",
+                    "git_or_deployment_action_occurred": "false"
+                ].merging(runtimeStatePayload(mission: .failed, task: task.state, tool: .failed)) { current, _ in current }
+            )
+            return task
+        }
+    }
+
+    func runCandidatePatchSandboxDestroy(input: String, workspace: Workspace) async throws -> FDETask {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw RuntimeKernelError.emptyInput }
+        var task = FDETask(
+            id: UUID(),
+            workspaceID: workspace.id,
+            title: "Candidate Patch Sandbox Destruction",
+            rawInput: trimmed,
+            state: .created,
+            plan: [],
+            riskScore: 0,
+            failureProbability: 0,
+            performanceScore: 0,
+            createdAt: Date(),
+            updatedAt: Date()
+        )
+        try await record(
+            type: .taskCreated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Candidate Patch Sandbox destruction task created",
+            payload: [
+                "state": task.state.rawValue,
+                "intent_type": MissionIntentType.candidatePatchSandboxDestroy.rawValue,
+                "mission_semantic": MissionExecutionSemantic.candidatePatchSandboxDestroy.rawValue,
+                "revert_task_created": "false",
+                "patch_plan_created": "false",
+                "patch_application_approval_created": "false",
+                "sandbox_created": "false"
+            ].merging(runtimeStatePayload(mission: .understand, task: task.state)) { current, _ in current },
+            initialTask: task
+        )
+        task.plan = [PlanStep(
+            id: "candidate-patch-sandbox-destruction-confirmation",
+            title: CandidatePatchActivityPhase.sandboxDestructionConfirmationRequired.rawValue,
+            intent: "Validate and destroy only the exact Sandbox bound to an already-reverted Candidate Patch after separate explicit confirmation.",
+            kind: .reasoning,
+            toolCallID: nil,
+            requiresApproval: true
+        )]
+        try stateMachine.transition(&task, to: .planned)
+        try stateMachine.transition(&task, to: .running)
+        try await persistence.saveTask(task)
+
+        guard let lifecycle = sandboxLifecycle else {
+            try stateMachine.transition(&task, to: .failed)
+            try await persistence.saveTask(task)
+            return task
+        }
+        let service = CandidatePatchService(lifecycle: lifecycle)
+        do {
+            let target = try service.locateSandboxDestructionTarget(
+                workspaceID: workspace.id,
+                request: trimmed
+            )
+            _ = try service.prepareSandboxDestruction(binding: target.binding)
+            var snapshot = CandidatePatchActivitySnapshot(manifest: try service.loadManifest(
+                sandboxID: target.binding.sandboxID,
+                patchID: target.binding.patchID
+            ))
+            snapshot.projectionState = .sandboxDestructionConfirmationRequired
+            pendingCandidatePatchDestructions[task.id] = target
+            try stateMachine.transition(&task, to: .pendingApproval)
+            try await persistence.saveTask(task)
+            try await recordCandidatePatchRevertActivity(
+                .sandboxDestructionConfirmationRequired,
+                snapshot: snapshot,
+                workspace: workspace,
+                task: task,
+                intentType: .candidatePatchSandboxDestroy,
+                extraPayload: [
+                    "manifest_id": target.binding.manifestID,
+                    "plan_id": target.binding.planID.uuidString,
+                    "plan_revision": String(target.binding.planRevision),
+                    "source_snapshot_id": target.binding.sourceSnapshotID,
+                    "canonical_legacy_root": target.binding.canonicalLegacyRoot,
+                    "explicit_destruction_confirmation_required": "true",
+                    "revert_task_created": "false",
+                    "patch_plan_created": "false",
+                    "patch_application_approval_created": "false",
+                    "sandbox_created": "false",
+                    "build_or_test_executed": "false",
+                    "shell_execution_enabled": "false",
+                    "git_or_deployment_action_occurred": "false"
+                ]
+            )
+            return task
+        } catch {
+            try stateMachine.transition(&task, to: .failed)
+            task.failureProbability = 1
+            try await persistence.saveTask(task)
+            let code = candidatePatchFailureCode(error)
+            try await record(
+                type: .stateUpdated,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: "Candidate Patch Sandbox destruction failed closed",
+                payload: [
+                    "state": task.state.rawValue,
+                    "intent_type": MissionIntentType.candidatePatchSandboxDestroy.rawValue,
+                    "failure_category": code.rawValue,
+                    "revert_task_created": "false",
+                    "patch_plan_created": "false",
+                    "patch_application_approval_created": "false",
+                    "sandbox_created": "false",
+                    "build_or_test_executed": "false",
+                    "shell_execution_enabled": "false",
+                    "git_or_deployment_action_occurred": "false"
+                ].merging(runtimeStatePayload(mission: .failed, task: task.state, tool: .failed)) { current, _ in current }
+            )
+            return task
+        }
+    }
+
+    private func recordCandidatePatchActivity(
+        _ phase: CandidatePatchActivityPhase,
+        snapshot: CandidatePatchActivitySnapshot,
+        workspace: Workspace,
+        task: FDETask
+    ) async throws {
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: phase.rawValue,
+            payload: snapshot.eventPayload.merging([
+                "state": task.state.rawValue,
+                "lifecycle_event": "CANDIDATE_PATCH_ACTIVITY",
+                "candidate_patch_activity_phase": phase.rawValue,
+                "intent_type": MissionIntentType.candidatePatchGeneration.rawValue,
+                "workspace_identity": "sandbox",
+                "runtime_owned_activity": "true",
+                "shell_execution_enabled": "false",
+                "git_operations_enabled": "false",
+                "build_test_execution_enabled": "false",
+                "generated_tests_available": "false"
+            ]) { current, _ in current }
+            .merging(runtimeStatePayload(mission: .execute, task: task.state, tool: .running)) { current, _ in current }
+        )
+    }
+
+    private func recordCandidatePatchRevertActivity(
+        _ phase: CandidatePatchActivityPhase,
+        snapshot: CandidatePatchActivitySnapshot,
+        workspace: Workspace,
+        task: FDETask,
+        intentType: MissionIntentType = .candidatePatchRevert,
+        extraPayload: [String: String] = [:]
+    ) async throws {
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: phase.rawValue,
+            payload: snapshot.eventPayload.merging([
+                "state": task.state.rawValue,
+                "lifecycle_event": intentType == .candidatePatchSandboxDestroy
+                    ? "CANDIDATE_PATCH_SANDBOX_DESTRUCTION_ACTIVITY"
+                    : "CANDIDATE_PATCH_REVERT_ACTIVITY",
+                "candidate_patch_activity_phase": phase.rawValue,
+                "intent_type": intentType.rawValue,
+                "workspace_identity": "sandbox",
+                "runtime_owned_activity": "true",
+                "shell_execution_enabled": "false",
+                "git_operations_enabled": "false",
+                "build_test_execution_enabled": "false",
+                "credential_access_enabled": "false",
+                "generated_tests_available": "false"
+            ]) { current, _ in current }
+            .merging(extraPayload) { current, _ in current }
+            .merging(runtimeStatePayload(
+                mission: phase == .revertConfirmationRequired
+                    || phase == .sandboxDestructionConfirmationRequired ? .waitingHuman : .execute,
+                task: task.state,
+                tool: phase == .revertConfirmationRequired
+                    || phase == .sandboxDestructionConfirmationRequired ? .pendingApproval : .running
+            )) { current, _ in current }
+        )
+    }
+
+    private func persistCandidatePatchAssessmentContext(
+        report: FDEAIIntegrationAssessmentReport,
+        finalizationMode: CandidatePatchAssessmentFinalizationMode,
+        workspace: Workspace,
+        task: FDETask
+    ) async throws {
+        guard let rootPath = workspace.localProjectRoot?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rootPath.isEmpty else {
+            throw RuntimeKernelError.projectRootRequired
+        }
+        let canonicalRoot = try SandboxFileSystem.canonicalExistingDirectory(
+            URL(fileURLWithPath: rootPath, isDirectory: true)
+        )
+        let sourceSnapshot = try SourceSnapshotBuilder().build(root: canonicalRoot)
+        let context = CandidatePatchAssessmentContext(
+            assessmentID: "assessment-\(task.id.uuidString.lowercased())",
+            generatedAt: Date(),
+            sourceSnapshotID: sourceSnapshot.snapshotID,
+            canonicalLegacyRoot: sourceSnapshot.canonicalSourceRoot,
+            report: report,
+            finalizationMode: finalizationMode
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let encoded = try encoder.encode(context)
+        guard let contextJSON = String(data: encoded, encoding: .utf8) else {
+            throw CandidatePatchError.blocked(.assessmentEvidenceMissing)
+        }
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Grounded AI integration assessment persisted for Candidate Patch handoff",
+            payload: [
+                "lifecycle_event": "AI_ASSESSMENT_PERSISTED",
+                "assessment_id": context.assessmentID,
+                "source_snapshot_id": context.sourceSnapshotID,
+                "canonical_legacy_root": context.canonicalLegacyRoot,
+                "normalized_requested_capability_id": context.requestedCapabilityID,
+                "requested_capability_display_label": context.requestedCapabilityDisplayLabel,
+                "compatibility_decision": context.compatibilityDecision.rawValue,
+                "evidence_claim_ids": context.evidenceClaimIDs.joined(separator: " | "),
+                "supported_capabilities": context.supportedCapabilities.joined(separator: " | "),
+                "assessment_blockers": context.blockers.joined(separator: " | "),
+                "unresolved_requirements": context.unresolvedRequirements.joined(separator: " | "),
+                "evidence_paths": context.evidence
+                    .flatMap(\.evidenceReferences)
+                    .map(\.path)
+                    .reduce(into: [String]()) { values, path in
+                        if !values.contains(path) { values.append(path) }
+                    }
+                    .joined(separator: " | "),
+                "assessment_finalization_mode": context.finalizationMode.rawValue,
+                "assessment_validation_status": context.validationStatus.rawValue,
+                "candidate_patch_assessment_context": contextJSON,
+                "workspace_identity": "legacy",
+                "workspace_mutation_count": "0"
+            ].merging(runtimeStatePayload(mission: .complete, task: task.state)) { current, _ in current }
+        )
+    }
+
+    private func riskSeverity(_ risk: CandidatePatchRisk) -> RiskSeverity {
+        switch risk {
+        case .low: .low
+        case .medium: .medium
+        case .high: .high
+        }
+    }
+
+    private func candidatePatchFailureCode(_ error: Error) -> CandidatePatchFailureCode {
+        if let error = error as? CandidatePatchError { return error.code }
+        if error is CandidatePatchRuntimeError { return .assessmentMissing }
+        return .manifestInvalid
     }
 
     func runSafeSandboxAcceptance(input: String, workspace: Workspace) async throws -> FDETask {
@@ -153,7 +760,6 @@ actor RuntimeKernel {
             createdAt: Date(),
             updatedAt: Date()
         )
-        try await persistence.saveTask(task)
         try await record(
             type: .taskCreated,
             workspaceID: workspace.id,
@@ -168,7 +774,8 @@ actor RuntimeKernel {
                 "trusted_workspace_root": workspace.localProjectRoot ?? "",
                 "workspace_identity": "legacy",
                 "phase_2d_1_started": "false"
-            ].merging(runtimeStatePayload(mission: .understand, task: task.state)) { current, _ in current }
+            ].merging(runtimeStatePayload(mission: .understand, task: task.state)) { current, _ in current },
+            initialTask: task
         )
 
         task.plan = SandboxRuntimeActivityPhase.productAcceptancePhases.enumerated().map { index, phase in
@@ -519,7 +1126,6 @@ actor RuntimeKernel {
             updatedAt: Date()
         )
 
-        try await persistence.saveTask(task)
         var taskCreatedPayload: [String: String] = [
             "state": task.state.rawValue,
             "workspace_id": workspace.id.uuidString,
@@ -546,7 +1152,8 @@ actor RuntimeKernel {
             summary: "Task created",
             payload: taskCreatedPayload
                 .merging(runtimeStatePayload(mission: .understand, task: task.state)) { current, _ in current }
-                .merging(workTracePayload(.understanding, summary: "Mission accepted", detail: "Created runtime task and started system understanding.")) { current, _ in current }
+                .merging(workTracePayload(.understanding, summary: "Mission accepted", detail: "Created runtime task and started system understanding.")) { current, _ in current },
+            initialTask: task
         )
 
         let recentTasks = try await persistence.loadTasks(workspaceID: workspace.id)
@@ -1016,7 +1623,7 @@ actor RuntimeKernel {
                         ].merging(runtimeStatePayload(mission: .execute, task: task.state, tool: .authorized)) { current, _ in current }
                     )
                     executableCall.requiresApproval = false
-                case .rejected, .expired:
+                case .rejected, .superseded, .expired:
                     try stateMachine.transition(&task, to: .failed)
                     try await persistence.saveTask(task)
                     try await record(
@@ -1963,6 +2570,9 @@ actor RuntimeKernel {
     @discardableResult
     func approveApprovalRequest(_ requestID: UUID, workspace: Workspace, reason: String) async throws -> ApprovalRequest {
         let request = try await approvalQueue.load(requestID: requestID)
+        if request?.targetKind == .candidatePatchPlan {
+            throw CandidatePatchRuntimeError.approvalConfirmationRequired
+        }
         let decision = authorizationService.authorize(
             .approveRiskyAction,
             workspace: workspace,
@@ -1978,7 +2588,599 @@ actor RuntimeKernel {
             )
             throw AuthorizationError.denied(decision)
         }
-        return try await approvalQueue.approve(requestID: requestID, approverRole: workspace.role, reason: reason)
+        let approved = try await approvalQueue.approve(
+            requestID: requestID,
+            approverRole: workspace.role,
+            reason: reason
+        )
+        return approved
+    }
+
+    func beginCandidatePatchApprovalConfirmation(
+        _ requestID: UUID,
+        workspace: Workspace,
+        context: CandidatePatchApprovalUIContext,
+        source: CandidatePatchApprovalSource,
+        now: Date = Date()
+    ) async throws -> CandidatePatchApprovalConfirmation {
+        let validated = try await validateCandidatePatchApprovalBinding(
+            requestID,
+            workspace: workspace,
+            context: context,
+            source: source
+        )
+        let confirmation = CandidatePatchApprovalConfirmation(
+            confirmationStepID: UUID(),
+            approvalRequestID: validated.request.id,
+            workspaceID: workspace.id,
+            taskID: validated.task.id,
+            planID: validated.manifest.plan.planID,
+            planRevision: validated.manifest.plan.revision,
+            assessmentID: validated.manifest.plan.assessmentID,
+            sourceSnapshotID: validated.manifest.plan.sourceSnapshotID,
+            canonicalLegacyRoot: validated.manifest.plan.legacyIntegrityBaseline.canonicalLegacyRoot,
+            authenticatedUserSessionID: context.authenticatedUserSessionID,
+            appSessionID: context.appSessionID,
+            openingSource: source,
+            affectedRelativePaths: validated.manifest.plan.operations.map(\.relativeCanonicalSandboxPath),
+            capability: validated.manifest.plan.requestedCapabilityID,
+            issuedAt: now
+        )
+        let service = CandidatePatchService(lifecycle: validated.lifecycle)
+        _ = try service.recordApprovalConfirmationOpened(
+            sandboxID: validated.pending.sandboxID,
+            patchID: validated.pending.patchID,
+            confirmation: confirmation,
+            now: now
+        )
+        candidatePatchApprovalConfirmations[confirmation.confirmationStepID] = confirmation
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: validated.task.id,
+            summary: "Candidate Patch approval confirmation opened",
+            payload: [
+                "lifecycle_event": "CANDIDATE_PATCH_APPROVAL_CONFIRMATION_OPENED",
+                "approval_source": source.rawValue,
+                "approval_request_id": requestID.uuidString,
+                "plan_id": confirmation.planID.uuidString,
+                "plan_revision": String(confirmation.planRevision),
+                "confirmation_step_id": confirmation.confirmationStepID.uuidString,
+                "app_session_id": confirmation.appSessionID.uuidString,
+                "controller_path": "AppStore.approve -> RuntimeKernel.beginCandidatePatchApprovalConfirmation",
+                "ui_action": "candidatePatch.approve.openConfirmation",
+                "approval_emitted": "false",
+                "workspace_mutation_count": "0",
+                "legacy_writes": "0",
+                "sandbox_writes": "0",
+                "sandbox_readiness_checked": "false"
+            ]
+        )
+        return confirmation
+    }
+
+    func cancelCandidatePatchApprovalConfirmation(_ confirmationStepID: UUID) {
+        candidatePatchApprovalConfirmations.removeValue(forKey: confirmationStepID)
+    }
+
+    @discardableResult
+    func confirmCandidatePatchApproval(
+        _ confirmation: CandidatePatchApprovalConfirmation,
+        workspace: Workspace,
+        context: CandidatePatchApprovalUIContext,
+        source: CandidatePatchApprovalSource,
+        reason: String,
+        now: Date = Date()
+    ) async throws -> ApprovalRequest {
+        guard let issued = candidatePatchApprovalConfirmations.removeValue(
+            forKey: confirmation.confirmationStepID
+        ), issued == confirmation else {
+            throw CandidatePatchRuntimeError.approvalConfirmationInvalid
+        }
+        let validated = try await validateCandidatePatchApprovalBinding(
+            confirmation.approvalRequestID,
+            workspace: workspace,
+            context: context,
+            source: source
+        )
+        guard confirmation.workspaceID == workspace.id,
+              confirmation.taskID == validated.task.id,
+              confirmation.planID == validated.manifest.plan.planID,
+              confirmation.planRevision == validated.manifest.plan.revision,
+              confirmation.approvalRequestID == validated.request.id,
+              confirmation.assessmentID == validated.manifest.plan.assessmentID,
+              confirmation.sourceSnapshotID == validated.manifest.plan.sourceSnapshotID,
+              confirmation.canonicalLegacyRoot == validated.manifest.plan.legacyIntegrityBaseline.canonicalLegacyRoot,
+              confirmation.authenticatedUserSessionID == context.authenticatedUserSessionID,
+              confirmation.appSessionID == context.appSessionID else {
+            throw CandidatePatchRuntimeError.approvalConfirmationInvalid
+        }
+        let decision = authorizationService.authorize(
+            .approveRiskyAction,
+            workspace: workspace,
+            action: "confirm Candidate Patch plan approval",
+            resource: confirmation.approvalRequestID.uuidString
+        )
+        guard decision.allowed else {
+            try await recordAuthorizationDenied(
+                decision,
+                workspaceID: workspace.id,
+                taskID: validated.task.id,
+                extraPayload: ["approval_request_id": confirmation.approvalRequestID.uuidString]
+            )
+            throw AuthorizationError.denied(decision)
+        }
+        try await validateApprovedCandidatePatchAssessment(validated.manifest.plan, workspace: workspace)
+        let provenance = CandidatePatchApprovalProvenance(
+            source: source,
+            workspaceID: workspace.id,
+            taskID: validated.task.id,
+            planID: confirmation.planID,
+            planRevision: confirmation.planRevision,
+            approvalRequestID: confirmation.approvalRequestID,
+            assessmentID: confirmation.assessmentID,
+            sourceSnapshotID: confirmation.sourceSnapshotID,
+            canonicalLegacyRoot: confirmation.canonicalLegacyRoot,
+            authenticatedUserSessionID: confirmation.authenticatedUserSessionID,
+            appSessionID: confirmation.appSessionID,
+            confirmationStepID: confirmation.confirmationStepID,
+            timestamp: now,
+            controllerPath: "CandidatePatchApprovalConfirmationView.confirm -> AppStore.confirmCandidatePatchApproval -> RuntimeKernel.confirmCandidatePatchApproval",
+            uiAction: "candidatePatch.approve.confirm"
+        )
+        let approved = try await approvalQueue.approve(
+            requestID: confirmation.approvalRequestID,
+            approverRole: workspace.role,
+            reason: reason,
+            metadata: provenance.sanitizedMetadata
+        )
+        try await record(
+            type: .humanApproved,
+            workspaceID: workspace.id,
+            taskID: validated.task.id,
+            summary: "Confirmed Candidate Patch approval recorded",
+            payload: provenance.sanitizedMetadata.merging([
+                "lifecycle_event": "CANDIDATE_PATCH_APPROVAL_CONFIRMED",
+                "approval_confirmation_opened": "true",
+                "approval_confirmation_confirmed": "true"
+            ]) { current, _ in current }
+        )
+        try await applyApprovedCandidatePatch(
+            approved,
+            workspace: workspace,
+            reason: reason,
+            provenance: provenance
+        )
+        return approved
+    }
+
+    @discardableResult
+    func approveCandidatePatchForTest(
+        _ requestID: UUID,
+        workspace: Workspace,
+        reason: String
+    ) async throws -> ApprovalRequest {
+        guard allowsCandidatePatchTestApproval,
+              let request = try await approvalQueue.load(requestID: requestID),
+              let taskID = request.taskID else {
+            throw CandidatePatchRuntimeError.approvalSourceInvalid
+        }
+        let context = CandidatePatchApprovalUIContext(
+            currentWorkspaceID: workspace.id,
+            currentTaskID: taskID,
+            visiblePendingApprovalRequestIDs: [requestID],
+            authenticatedUserSessionID: UUID(),
+            appSessionID: UUID()
+        )
+        let confirmation = try await beginCandidatePatchApprovalConfirmation(
+            requestID,
+            workspace: workspace,
+            context: context,
+            source: .testFixture
+        )
+        return try await confirmCandidatePatchApproval(
+            confirmation,
+            workspace: workspace,
+            context: context,
+            source: .testFixture,
+            reason: reason
+        )
+    }
+
+    func beginCandidatePatchRevertConfirmation(
+        patchID: CandidatePatchID,
+        sandboxID: SandboxID,
+        workspace: Workspace,
+        context: CandidatePatchRevertUIContext,
+        source: CandidatePatchApprovalSource,
+        now: Date = Date()
+    ) async throws -> CandidatePatchRevertConfirmation {
+        guard source != .replay,
+              context.currentWorkspaceID == workspace.id,
+              context.visiblePatchID == patchID,
+              context.visibleSandboxID == sandboxID,
+              let lifecycle = sandboxLifecycle else {
+            throw CandidatePatchRuntimeError.approvalSourceInvalid
+        }
+        let service = CandidatePatchService(lifecycle: lifecycle)
+        let target: CandidatePatchRevertTarget
+        let requestingTaskID: UUID
+        if let pending = pendingCandidatePatchReverts[context.currentTaskID],
+           pending.binding.patchID == patchID,
+           pending.binding.sandboxID == sandboxID {
+            target = pending
+            requestingTaskID = context.currentTaskID
+        } else {
+            target = try service.locateRevertTarget(
+                workspaceID: workspace.id,
+                request: "revert exact Candidate Patch \(patchID.rawValue) in Sandbox \(sandboxID.rawValue)"
+            )
+            requestingTaskID = context.currentTaskID
+        }
+        guard target.binding.authenticatedLocalSessionID == context.authenticatedLocalSessionID else {
+            throw CandidatePatchError.blocked(.authenticatedSessionMismatch)
+        }
+        _ = try service.prepareRevert(binding: target.binding)
+        let confirmation = CandidatePatchRevertConfirmation(
+            confirmationStepID: UUID(),
+            binding: target.binding,
+            requestingTaskID: requestingTaskID,
+            appSessionID: context.appSessionID,
+            openingSource: source,
+            filesToRestore: target.filesToRestore,
+            filesToRemove: target.filesToRemove,
+            issuedAt: now
+        )
+        _ = try service.recordRevertConfirmationOpened(confirmation, now: now)
+        candidatePatchRevertConfirmations[confirmation.confirmationStepID] = confirmation
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: requestingTaskID,
+            summary: "Candidate Patch Revert confirmation opened",
+            payload: [
+                "lifecycle_event": "CANDIDATE_PATCH_REVERT_CONFIRMATION_OPENED",
+                "intent_type": MissionIntentType.candidatePatchRevert.rawValue,
+                "candidate_patch_id": patchID.rawValue,
+                "candidate_patch_sandbox_id": sandboxID.rawValue,
+                "candidate_patch_projection_state": CandidatePatchProjectionState.revertConfirmationRequired.rawValue,
+                "manifest_id": target.binding.manifestID,
+                "plan_id": target.binding.planID.uuidString,
+                "plan_revision": String(target.binding.planRevision),
+                "confirmation_step_id": confirmation.confirmationStepID.uuidString,
+                "ui_action": "candidatePatch.revert.openConfirmation",
+                "controller_path": "AgentConversationView.revert -> AppStore.openCandidatePatchRevertConfirmation -> RuntimeKernel.beginCandidatePatchRevertConfirmation",
+                "sandbox_writes": "0",
+                "legacy_writes": "0",
+                "approval_emitted": "false"
+            ]
+        )
+        return confirmation
+    }
+
+    func cancelCandidatePatchRevertConfirmation(_ confirmationStepID: UUID) async {
+        guard let confirmation = candidatePatchRevertConfirmations.removeValue(forKey: confirmationStepID),
+              let lifecycle = sandboxLifecycle else { return }
+        try? CandidatePatchService(lifecycle: lifecycle).recordRevertConfirmationCancelled(
+            binding: confirmation.binding
+        )
+        if var task = try? await persistence.loadTasks(workspaceID: confirmation.binding.workspaceID)
+            .first(where: { $0.id == confirmation.requestingTaskID }),
+           task.state == .pendingApproval {
+            try? stateMachine.transition(&task, to: .failed)
+            try? await persistence.saveTask(task)
+        }
+        _ = try? await record(
+            type: .stateUpdated,
+            workspaceID: confirmation.binding.workspaceID,
+            taskID: confirmation.requestingTaskID,
+            summary: "Candidate Patch Revert confirmation cancelled",
+            payload: [
+                "lifecycle_event": "CANDIDATE_PATCH_REVERT_CONFIRMATION_CANCELLED",
+                "candidate_patch_id": confirmation.binding.patchID.rawValue,
+                "candidate_patch_sandbox_id": confirmation.binding.sandboxID.rawValue,
+                "candidate_patch_projection_state": CandidatePatchProjectionState.patchReady.rawValue,
+                "sandbox_writes": "0",
+                "legacy_writes": "0"
+            ]
+        )
+        pendingCandidatePatchReverts.removeValue(forKey: confirmation.requestingTaskID)
+    }
+
+    func confirmCandidatePatchRevert(
+        _ confirmation: CandidatePatchRevertConfirmation,
+        workspace: Workspace,
+        context: CandidatePatchRevertUIContext,
+        source: CandidatePatchApprovalSource,
+        now: Date = Date()
+    ) async throws -> CandidatePatchManifest {
+        guard let issued = candidatePatchRevertConfirmations.removeValue(
+            forKey: confirmation.confirmationStepID
+        ), issued == confirmation,
+              source != .replay,
+              confirmation.openingSource == source,
+              confirmation.binding.workspaceID == workspace.id,
+              confirmation.binding.patchID == context.visiblePatchID,
+              confirmation.binding.sandboxID == context.visibleSandboxID,
+              confirmation.binding.authenticatedLocalSessionID == context.authenticatedLocalSessionID,
+              confirmation.appSessionID == context.appSessionID,
+              let lifecycle = sandboxLifecycle else {
+            throw CandidatePatchRuntimeError.approvalConfirmationInvalid
+        }
+        let authorization = authorizationService.authorize(
+            .approveRiskyAction,
+            workspace: workspace,
+            action: "confirm exact-bound Candidate Patch Revert",
+            resource: confirmation.binding.manifestID
+        )
+        guard authorization.allowed else {
+            throw AuthorizationError.denied(authorization)
+        }
+        guard var task = try await persistence.loadTasks(workspaceID: workspace.id)
+            .first(where: { $0.id == confirmation.requestingTaskID }),
+              task.state == .pendingApproval else {
+            throw CandidatePatchRuntimeError.approvalConfirmationInvalid
+        }
+        try stateMachine.transition(&task, to: .running)
+        try await persistence.saveTask(task)
+        let service = CandidatePatchService(lifecycle: lifecycle)
+        _ = try service.prepareRevert(binding: confirmation.binding)
+        var before = CandidatePatchActivitySnapshot(manifest: try service.loadManifest(
+            sandboxID: confirmation.binding.sandboxID,
+            patchID: confirmation.binding.patchID
+        ))
+        before.projectionState = .reverting
+        try await recordCandidatePatchRevertActivity(
+            .revertingCandidatePatch,
+            snapshot: before,
+            workspace: workspace,
+            task: task,
+            extraPayload: [
+                "confirmation_step_id": confirmation.confirmationStepID.uuidString,
+                "ui_action": "candidatePatch.revert.confirm",
+                "controller_path": "CandidatePatchRevertConfirmationView.confirm -> AppStore.confirmCandidatePatchRevert -> RuntimeKernel.confirmCandidatePatchRevert"
+            ]
+        )
+        let manifest = try service.revert(binding: confirmation.binding, now: now)
+        var after = CandidatePatchActivitySnapshot(manifest: manifest)
+        after.projectionState = .reverted
+        try await recordCandidatePatchRevertActivity(
+            .verifyingRestoredHashes,
+            snapshot: after,
+            workspace: workspace,
+            task: task
+        )
+        try await recordCandidatePatchRevertActivity(
+            .candidatePatchReverted,
+            snapshot: after,
+            workspace: workspace,
+            task: task
+        )
+        try stateMachine.transition(&task, to: .completed)
+        try await persistence.saveTask(task)
+        try await record(
+            type: .taskCompleted,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Candidate Patch reverted",
+            payload: after.eventPayload.merging([
+                "state": task.state.rawValue,
+                "intent_type": MissionIntentType.candidatePatchRevert.rawValue,
+                "completion_contract": RuntimeCompletionContractKind.candidatePatchRevert.rawValue,
+                "manifest_backed": "true",
+                "source_integrity": SourceIntegrityState.unchanged.rawValue,
+                "sandbox_destroyed": "false",
+                "audit_preserved": "true",
+                "build_or_test_executed": "false",
+                "shell_execution_enabled": "false",
+                "git_or_deployment_action_occurred": "false",
+                "credential_or_production_action_occurred": "false",
+                "success": "true"
+            ]) { current, _ in current }
+            .merging(runtimeStatePayload(mission: .complete, task: task.state, tool: .succeeded)) { current, _ in current }
+        )
+        pendingCandidatePatchReverts.removeValue(forKey: task.id)
+        return manifest
+    }
+
+    func beginCandidatePatchSandboxDestructionConfirmation(
+        patchID: CandidatePatchID,
+        sandboxID: SandboxID,
+        workspace: Workspace,
+        context: CandidatePatchRevertUIContext,
+        source: CandidatePatchApprovalSource,
+        now: Date = Date()
+    ) async throws -> CandidatePatchSandboxDestructionConfirmation {
+        guard source != .replay,
+              context.currentWorkspaceID == workspace.id,
+              context.visiblePatchID == patchID,
+              context.visibleSandboxID == sandboxID,
+              let lifecycle = sandboxLifecycle else {
+            throw CandidatePatchRuntimeError.approvalSourceInvalid
+        }
+        let service = CandidatePatchService(lifecycle: lifecycle)
+        let target: CandidatePatchSandboxDestructionTarget
+        if let pending = pendingCandidatePatchDestructions[context.currentTaskID],
+           pending.binding.patchID == patchID,
+           pending.binding.sandboxID == sandboxID {
+            target = pending
+        } else {
+            target = try service.locateSandboxDestructionTarget(
+                workspaceID: workspace.id,
+                request: "destroy exact reverted Candidate Patch \(patchID.rawValue) Sandbox \(sandboxID.rawValue)"
+            )
+        }
+        let binding = target.binding
+        guard binding.workspaceID == workspace.id,
+              binding.authenticatedLocalSessionID == context.authenticatedLocalSessionID else {
+            throw CandidatePatchError.blocked(.authenticatedSessionMismatch)
+        }
+        _ = try service.prepareSandboxDestruction(binding: binding)
+        let task: FDETask
+        if let existing = try await persistence.loadTasks(workspaceID: workspace.id)
+            .first(where: { $0.id == context.currentTaskID }),
+           pendingCandidatePatchDestructions[context.currentTaskID] != nil,
+           existing.state == .pendingApproval {
+            task = existing
+        } else {
+            var created = FDETask(
+                id: UUID(),
+                workspaceID: workspace.id,
+                title: "Candidate Patch Sandbox Destruction",
+                rawInput: "Destroy reverted Sandbox \(sandboxID.rawValue)",
+                state: .created,
+                plan: [],
+                riskScore: 0,
+                failureProbability: 0,
+                performanceScore: 0,
+                createdAt: now,
+                updatedAt: now
+            )
+            try await record(
+                type: .taskCreated,
+                workspaceID: workspace.id,
+                taskID: created.id,
+                summary: "Separate Sandbox destruction task created",
+                payload: [
+                    "intent_type": MissionIntentType.candidatePatchSandboxDestroy.rawValue,
+                    "candidate_patch_id": patchID.rawValue,
+                    "candidate_patch_sandbox_id": sandboxID.rawValue,
+                    "revert_task_created": "false"
+                ],
+                initialTask: created
+            )
+            created.plan = [PlanStep(
+                id: "sandbox-destruction-confirmation",
+                title: CandidatePatchActivityPhase.sandboxDestructionConfirmationRequired.rawValue,
+                intent: "Destroy only the already-reverted Sandbox after separate explicit confirmation.",
+                kind: .reasoning,
+                toolCallID: nil,
+                requiresApproval: true
+            )]
+            try stateMachine.transition(&created, to: .planned)
+            try stateMachine.transition(&created, to: .running)
+            try stateMachine.transition(&created, to: .pendingApproval)
+            try await persistence.saveTask(created)
+            pendingCandidatePatchDestructions[created.id] = target
+            task = created
+        }
+        let confirmation = CandidatePatchSandboxDestructionConfirmation(
+            confirmationStepID: UUID(),
+            binding: binding,
+            requestingTaskID: task.id,
+            appSessionID: context.appSessionID,
+            openingSource: source,
+            issuedAt: now
+        )
+        _ = try service.recordSandboxDestructionConfirmationOpened(confirmation, now: now)
+        candidatePatchDestructionConfirmations[confirmation.confirmationStepID] = confirmation
+        var snapshot = CandidatePatchActivitySnapshot(manifest: try service.loadManifest(
+            sandboxID: sandboxID,
+            patchID: patchID
+        ))
+        snapshot.projectionState = .sandboxDestructionConfirmationRequired
+        try await recordCandidatePatchRevertActivity(
+            .sandboxDestructionConfirmationRequired,
+            snapshot: snapshot,
+            workspace: workspace,
+            task: task,
+            intentType: .candidatePatchSandboxDestroy,
+            extraPayload: [
+                "ui_action": "candidatePatch.destroySandbox.openConfirmation",
+                "confirmation_step_id": confirmation.confirmationStepID.uuidString
+            ]
+        )
+        return confirmation
+    }
+
+    func cancelCandidatePatchSandboxDestructionConfirmation(_ confirmationStepID: UUID) async {
+        guard let confirmation = candidatePatchDestructionConfirmations.removeValue(
+            forKey: confirmationStepID
+        ), let lifecycle = sandboxLifecycle else { return }
+        try? CandidatePatchService(lifecycle: lifecycle).recordSandboxDestructionConfirmationCancelled(
+            binding: confirmation.binding
+        )
+        if var task = try? await persistence.loadTasks(workspaceID: confirmation.binding.workspaceID)
+            .first(where: { $0.id == confirmation.requestingTaskID }),
+           task.state == .pendingApproval {
+            try? stateMachine.transition(&task, to: .failed)
+            try? await persistence.saveTask(task)
+        }
+        pendingCandidatePatchDestructions.removeValue(forKey: confirmation.requestingTaskID)
+    }
+
+    func confirmCandidatePatchSandboxDestruction(
+        _ confirmation: CandidatePatchSandboxDestructionConfirmation,
+        workspace: Workspace,
+        context: CandidatePatchRevertUIContext,
+        source: CandidatePatchApprovalSource,
+        now: Date = Date()
+    ) async throws -> CandidatePatchManifest {
+        guard let issued = candidatePatchDestructionConfirmations.removeValue(
+            forKey: confirmation.confirmationStepID
+        ), issued == confirmation,
+              source != .replay,
+              confirmation.openingSource == source,
+              confirmation.binding.workspaceID == workspace.id,
+              confirmation.binding.patchID == context.visiblePatchID,
+              confirmation.binding.sandboxID == context.visibleSandboxID,
+              confirmation.binding.authenticatedLocalSessionID == context.authenticatedLocalSessionID,
+              confirmation.appSessionID == context.appSessionID,
+              let lifecycle = sandboxLifecycle else {
+            throw CandidatePatchRuntimeError.approvalConfirmationInvalid
+        }
+        let authorization = authorizationService.authorize(
+            .approveRiskyAction,
+            workspace: workspace,
+            action: "confirm exact-bound reverted Candidate Patch Sandbox destruction",
+            resource: confirmation.binding.manifestID
+        )
+        guard authorization.allowed else {
+            throw AuthorizationError.denied(authorization)
+        }
+        guard var task = try await persistence.loadTasks(workspaceID: workspace.id)
+            .first(where: { $0.id == confirmation.requestingTaskID }),
+              task.state == .pendingApproval else {
+            throw CandidatePatchRuntimeError.approvalConfirmationInvalid
+        }
+        try stateMachine.transition(&task, to: .running)
+        try await persistence.saveTask(task)
+        let service = CandidatePatchService(lifecycle: lifecycle)
+        let manifest = try service.destroyRevertedSandbox(binding: confirmation.binding, now: now)
+        var snapshot = CandidatePatchActivitySnapshot(manifest: manifest)
+        snapshot.projectionState = .sandboxDestroyed
+        try await recordCandidatePatchRevertActivity(
+            .sandboxDestroyed,
+            snapshot: snapshot,
+            workspace: workspace,
+            task: task,
+            intentType: .candidatePatchSandboxDestroy,
+            extraPayload: ["ui_action": "candidatePatch.destroySandbox.confirm"]
+        )
+        try stateMachine.transition(&task, to: .completed)
+        try await persistence.saveTask(task)
+        try await record(
+            type: .taskCompleted,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Reverted Sandbox destroyed",
+            payload: snapshot.eventPayload.merging([
+                "state": task.state.rawValue,
+                "intent_type": MissionIntentType.candidatePatchSandboxDestroy.rawValue,
+                "completion_contract": RuntimeCompletionContractKind.candidatePatchSandboxDestroy.rawValue,
+                "manifest_backed": "true",
+                "sandbox_destroyed": "true",
+                "source_integrity": SourceIntegrityState.unchanged.rawValue,
+                "audit_preserved": "true",
+                "build_or_test_executed": "false",
+                "shell_execution_enabled": "false",
+                "git_or_deployment_action_occurred": "false",
+                "credential_or_production_action_occurred": "false",
+                "success": "true"
+            ]) { current, _ in current }
+        )
+        pendingCandidatePatchDestructions.removeValue(forKey: task.id)
+        return manifest
     }
 
     @discardableResult
@@ -1999,7 +3201,529 @@ actor RuntimeKernel {
             )
             throw AuthorizationError.denied(decision)
         }
-        return try await approvalQueue.reject(requestID: requestID, approverRole: workspace.role, reason: reason)
+        let rejected = try await approvalQueue.reject(
+            requestID: requestID,
+            approverRole: workspace.role,
+            reason: reason
+        )
+        if rejected.targetKind == .candidatePatchPlan {
+            try await rejectCandidatePatch(rejected, workspace: workspace, reason: reason)
+        }
+        return rejected
+    }
+
+    @discardableResult
+    func requestChangesApprovalRequest(
+        _ requestID: UUID,
+        workspace: Workspace,
+        revisionInstructions: String
+    ) async throws -> ApprovalRequest {
+        let instructions = try normalizedCandidatePatchRevisionInstructions(revisionInstructions)
+        guard let request = try await approvalQueue.load(requestID: requestID) else {
+            throw ApprovalQueueError.requestNotFound(requestID)
+        }
+        guard request.targetKind == .candidatePatchPlan,
+              request.state == .pending else {
+            throw CandidatePatchRuntimeError.approvalMetadataInvalid
+        }
+        let authorization = authorizationService.authorize(
+            .approveRiskyAction,
+            workspace: workspace,
+            action: "request Candidate Patch plan changes",
+            resource: requestID.uuidString
+        )
+        guard authorization.allowed else {
+            try await recordAuthorizationDenied(
+                authorization,
+                workspaceID: workspace.id,
+                taskID: request.taskID,
+                extraPayload: ["approval_request_id": requestID.uuidString]
+            )
+            throw AuthorizationError.denied(authorization)
+        }
+        guard let lifecycle = sandboxLifecycle,
+              let provider = candidatePatchPlanProvider else {
+            throw CandidatePatchRuntimeError.runtimeUnavailable
+        }
+        let pending = try candidatePatchPending(from: request)
+        guard var task = try await persistence.loadTasks(workspaceID: workspace.id)
+            .first(where: { $0.id == pending.taskID }) else {
+            throw CandidatePatchRuntimeError.approvalMetadataInvalid
+        }
+        let service = CandidatePatchService(lifecycle: lifecycle)
+        let currentManifest = try service.loadManifest(
+            sandboxID: pending.sandboxID,
+            patchID: pending.patchID
+        )
+        guard currentManifest.status == .awaitingApproval,
+              currentManifest.plan.status == .awaitingApproval,
+              currentManifest.plan.approvalRequestID == request.id,
+              request.metadata["plan_id"] == currentManifest.plan.planID.uuidString,
+              request.metadata["plan_revision"] == String(currentManifest.plan.revision) else {
+            throw CandidatePatchError.blocked(.planRevisionMismatch)
+        }
+
+        _ = try service.recordDecision(
+            sandboxID: pending.sandboxID,
+            patchID: pending.patchID,
+            decision: .requestChanges,
+            decidedBy: workspace.role.rawValue,
+            rationale: instructions.joined(separator: " "),
+            requestedChanges: instructions,
+            approvalRequestID: request.id
+        )
+        _ = try await approvalQueue.supersede(
+            requestID: request.id,
+            approverRole: workspace.role,
+            reason: instructions.joined(separator: " "),
+            metadata: [
+                "candidate_patch_decision": CandidatePatchApprovalDecision.requestChanges.rawValue,
+                "revision_instructions": instructions.joined(separator: " | "),
+                "superseded_plan_id": currentManifest.plan.planID.uuidString
+            ]
+        )
+        pendingCandidatePatches.removeValue(forKey: request.id)
+        try stateMachine.transition(&task, to: .running)
+        try await persistence.saveTask(task)
+
+        var revisionRequest = try await provider.planRequest(
+            for: "Candidate Patch revision requested: \(instructions.joined(separator: " | "))",
+            workspace: workspace,
+            lifecycle: lifecycle
+        )
+        revisionRequest.patchID = pending.patchID
+        revisionRequest.sandboxID = pending.sandboxID
+        revisionRequest.requestedOutcome += " Requested revision: \(instructions.joined(separator: " "))"
+        revisionRequest.proposedOperations = revisionRequest.proposedOperations.map { operation in
+            var revised = operation
+            revised.purpose += " Revision instruction: \(instructions.joined(separator: " "))"
+            return revised
+        }
+        let revisedPlan = try service.preparePlan(revisionRequest)
+        let freshApprovalID = UUID()
+        var renderedRevisedPlan = revisedPlan
+        renderedRevisedPlan.approvalRequestID = freshApprovalID
+        let freshApproval = ApprovalRequest(
+            id: freshApprovalID,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            stepID: "candidate-patch-plan-revision-\(revisedPlan.revision)",
+            toolCallID: nil,
+            targetKind: .candidatePatchPlan,
+            action: "Approve revised Candidate Patch plan",
+            resource: "Candidate Patch \(revisedPlan.patchID.rawValue) in Safe Sandbox \(revisedPlan.sandboxID.rawValue)",
+            riskLevel: riskSeverity(revisedPlan.risk),
+            state: .pending,
+            requestedByRole: workspace.role,
+            decidedByRole: nil,
+            decisionReason: nil,
+            requestedAt: Date(),
+            decidedAt: nil,
+            expiresAt: nil,
+            metadata: [
+                "workspace_id": workspace.id.uuidString,
+                "task_id": task.id.uuidString,
+                "approval_request_id": freshApprovalID.uuidString,
+                "candidate_patch_id": revisedPlan.patchID.rawValue,
+                "sandbox_id": revisedPlan.sandboxID.rawValue,
+                "source_snapshot_id": revisedPlan.sourceSnapshotID,
+                "assessment_id": revisedPlan.assessmentID,
+                "normalized_requested_capability_id": revisedPlan.requestedCapabilityID,
+                "canonical_legacy_root": revisedPlan.legacyIntegrityBaseline.canonicalLegacyRoot,
+                "plan_id": revisedPlan.planID.uuidString,
+                "plan_revision": String(revisedPlan.revision),
+                "original_approval_request_id": request.id.uuidString,
+                "candidate_patch_decision": CandidatePatchApprovalDecision.requestChanges.rawValue,
+                "revision_instructions": instructions.joined(separator: " | "),
+                "superseded_plan_id": currentManifest.plan.planID.uuidString,
+                "revised_plan_id": revisedPlan.planID.uuidString,
+                "fresh_approval_request_id": freshApprovalID.uuidString,
+                "files_planned": String(revisedPlan.operations.count),
+                "prohibited_actions": revisedPlan.prohibitedActions.joined(separator: " | "),
+                "candidate_patch_plan_summary": renderedRevisedPlan.markdown
+            ]
+        )
+        let revisedManifest = try service.recordApprovalRequest(
+            sandboxID: revisedPlan.sandboxID,
+            patchID: revisedPlan.patchID,
+            planID: revisedPlan.planID,
+            approvalRequestID: freshApproval.id
+        )
+        _ = try await approvalQueue.enqueue(freshApproval)
+        pendingCandidatePatches[freshApproval.id] = CandidatePatchPendingRuntime(
+            approvalRequestID: freshApproval.id,
+            taskID: task.id,
+            workspaceID: workspace.id,
+            sandboxID: revisedPlan.sandboxID,
+            patchID: revisedPlan.patchID
+        )
+        try stateMachine.transition(&task, to: .pendingApproval)
+        try await persistence.saveTask(task)
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Candidate Patch changes requested and prior approval superseded",
+            payload: [
+                "state": task.state.rawValue,
+                "lifecycle_event": "CANDIDATE_PATCH_REVISION_REQUESTED",
+                "original_approval_request_id": request.id.uuidString,
+                "candidate_patch_decision": CandidatePatchApprovalDecision.requestChanges.rawValue,
+                "revision_instructions": instructions.joined(separator: " | "),
+                "superseded_plan_id": currentManifest.plan.planID.uuidString,
+                "revised_plan_id": revisedPlan.planID.uuidString,
+                "fresh_approval_request_id": freshApproval.id.uuidString,
+                "workspace_mutation_count": "0"
+            ].merging(CandidatePatchActivitySnapshot(manifest: revisedManifest).eventPayload) { current, _ in current }
+        )
+        try await record(
+            type: .humanApprovalRequested,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Revised Candidate Patch plan requires fresh explicit human approval",
+            payload: CandidatePatchActivitySnapshot(plan: revisedManifest.plan).eventPayload.merging([
+                "state": task.state.rawValue,
+                "approval_request_id": freshApproval.id.uuidString,
+                "original_approval_request_id": request.id.uuidString,
+                "candidate_patch_activity_phase": CandidatePatchActivityPhase.waitingForHumanApproval.rawValue,
+                "runtime_owned_activity": "true",
+                "manifest_backed": "true",
+                "detail": revisedManifest.plan.markdown,
+                "actual_result": revisedManifest.plan.markdown,
+                "workspace_mutation_count": "0",
+                "legacy_writes": "0",
+                "sandbox_writes": "0",
+                "patch_files_created": "0",
+                "build_test_executions": "0",
+                "shell_calls": "0",
+                "git_operations": "0",
+                "deployment_operations": "0",
+                "unified_diff_exists": "false",
+                "sandbox_readiness_checked": "false"
+            ]) { current, _ in current }
+        )
+        return freshApproval
+    }
+
+    private func validateCandidatePatchApprovalBinding(
+        _ requestID: UUID,
+        workspace: Workspace,
+        context: CandidatePatchApprovalUIContext,
+        source: CandidatePatchApprovalSource
+    ) async throws -> (
+        request: ApprovalRequest,
+        pending: CandidatePatchPendingRuntime,
+        manifest: CandidatePatchManifest,
+        task: FDETask,
+        lifecycle: SandboxLifecycleService
+    ) {
+        guard source != .replay,
+              source.isInteractiveUI || (source == .testFixture && allowsCandidatePatchTestApproval),
+              context.currentWorkspaceID == workspace.id,
+              context.visiblyContains(requestID),
+              let lifecycle = sandboxLifecycle,
+              let request = try await approvalQueue.load(requestID: requestID),
+              request.targetKind == .candidatePatchPlan,
+              request.state == .pending,
+              request.workspaceID == workspace.id,
+              request.taskID == context.currentTaskID else {
+            throw CandidatePatchRuntimeError.approvalMetadataInvalid
+        }
+        if source.isInteractiveUI {
+            guard let session = try await persistence.loadSessionMetadata(),
+                  session.userSession.id == context.authenticatedUserSessionID,
+                  session.userSession.state == .signedIn,
+                  session.workspaceSession?.userSessionID == session.userSession.id,
+                  session.workspaceSession?.workspaceID == workspace.id,
+                  session.workspaceSession?.orgID == workspace.orgID,
+                  session.workspaceSession?.role == workspace.role,
+                  session.workspaceSession?.state == .signedIn else {
+                throw CandidatePatchRuntimeError.authenticatedSessionInvalid
+            }
+        }
+        let databasePending = try await approvalQueue.pendingRequests(workspaceID: workspace.id)
+        guard databasePending.contains(where: {
+            $0.id == requestID && $0.taskID == context.currentTaskID && $0.targetKind == .candidatePatchPlan
+        }),
+        let task = try await persistence.loadTasks(workspaceID: workspace.id)
+            .first(where: { $0.id == context.currentTaskID }),
+        task.state == .pendingApproval else {
+            throw CandidatePatchRuntimeError.approvalMetadataInvalid
+        }
+        let pending = try candidatePatchPending(from: request)
+        let service = CandidatePatchService(lifecycle: lifecycle)
+        let manifest = try service.loadManifest(sandboxID: pending.sandboxID, patchID: pending.patchID)
+        let canonicalWorkspaceRoot = try workspace.localProjectRoot.map {
+            try SandboxFileSystem.canonicalExistingDirectory(
+                URL(fileURLWithPath: $0, isDirectory: true)
+            ).path
+        }
+        guard pending.approvalRequestID == request.id,
+              pending.workspaceID == workspace.id,
+              pending.taskID == task.id,
+              manifest.status == .awaitingApproval,
+              manifest.plan.status == .awaitingApproval,
+              manifest.plan.approvalRecord == nil,
+              manifest.plan.approvalRequestID == request.id,
+              request.stepID == "candidate-patch-plan-revision-\(manifest.plan.revision)",
+              request.metadata["candidate_patch_id"] == manifest.patchID.rawValue,
+              request.metadata["sandbox_id"] == manifest.sandboxID.rawValue,
+              request.metadata["plan_id"] == manifest.plan.planID.uuidString,
+              request.metadata["plan_revision"] == String(manifest.plan.revision),
+              request.metadata["assessment_id"] == manifest.plan.assessmentID,
+              request.metadata["source_snapshot_id"] == manifest.plan.sourceSnapshotID,
+              request.metadata["normalized_requested_capability_id"] == manifest.plan.requestedCapabilityID,
+              request.metadata["canonical_legacy_root"] == manifest.plan.legacyIntegrityBaseline.canonicalLegacyRoot,
+              canonicalWorkspaceRoot == manifest.plan.legacyIntegrityBaseline.canonicalLegacyRoot,
+              manifest.plan.assessmentContext?.validationStatus == .validated,
+              manifest.plan.assessmentContext?.assessmentID == manifest.plan.assessmentID,
+              manifest.plan.assessmentContext?.sourceSnapshotID == manifest.plan.sourceSnapshotID,
+              manifest.plan.assessmentContext?.canonicalLegacyRoot == manifest.plan.legacyIntegrityBaseline.canonicalLegacyRoot else {
+            throw CandidatePatchError.blocked(.planRevisionMismatch)
+        }
+        return (request, pending, manifest, task, lifecycle)
+    }
+
+    private func applyApprovedCandidatePatch(
+        _ approval: ApprovalRequest,
+        workspace: Workspace,
+        reason: String,
+        provenance: CandidatePatchApprovalProvenance
+    ) async throws {
+        guard let lifecycle = sandboxLifecycle else {
+            throw CandidatePatchRuntimeError.runtimeUnavailable
+        }
+        let pending = try candidatePatchPending(from: approval)
+        guard var task = try await persistence.loadTasks(workspaceID: workspace.id)
+            .first(where: { $0.id == pending.taskID }) else {
+            throw CandidatePatchRuntimeError.approvalMetadataInvalid
+        }
+        let service = CandidatePatchService(lifecycle: lifecycle)
+        var manifest = try service.loadManifest(sandboxID: pending.sandboxID, patchID: pending.patchID)
+        guard manifest.status == .awaitingApproval,
+              manifest.plan.status == .awaitingApproval,
+              manifest.plan.approvalRequestID == approval.id,
+              approval.metadata["candidate_patch_id"] == manifest.patchID.rawValue,
+              approval.metadata["sandbox_id"] == manifest.sandboxID.rawValue,
+              approval.metadata["plan_id"] == manifest.plan.planID.uuidString,
+              approval.metadata["plan_revision"] == String(manifest.plan.revision),
+              approval.metadata["assessment_id"] == manifest.plan.assessmentID,
+              approval.metadata["source_snapshot_id"] == manifest.plan.sourceSnapshotID,
+              approval.metadata["normalized_requested_capability_id"] == manifest.plan.requestedCapabilityID,
+              approval.metadata["canonical_legacy_root"] == manifest.plan.legacyIntegrityBaseline.canonicalLegacyRoot else {
+            throw CandidatePatchError.blocked(.planRevisionMismatch)
+        }
+        var snapshot = CandidatePatchActivitySnapshot(plan: manifest.plan)
+        try stateMachine.transition(&task, to: .running)
+        try await persistence.saveTask(task)
+        try await recordCandidatePatchActivity(.verifyingApprovedScope, snapshot: snapshot, workspace: workspace, task: task)
+        do {
+            try await validateApprovedCandidatePatchAssessment(manifest.plan, workspace: workspace)
+            try await recordCandidatePatchActivity(.checkingSandboxReadiness, snapshot: snapshot, workspace: workspace, task: task)
+            _ = try service.preflightApprovedPlan(
+                sandboxID: pending.sandboxID,
+                patchID: pending.patchID,
+                planID: manifest.plan.planID,
+                approvalRequestID: approval.id
+            )
+            manifest = try service.recordDecision(
+                sandboxID: pending.sandboxID,
+                patchID: pending.patchID,
+                decision: .approve,
+                decidedBy: workspace.role.rawValue,
+                rationale: reason,
+                approvalRequestID: approval.id,
+                approvalProvenance: provenance
+            )
+            manifest = try service.materializeApprovedImplementation(
+                sandboxID: pending.sandboxID,
+                patchID: pending.patchID
+            )
+            snapshot = CandidatePatchActivitySnapshot(manifest: manifest)
+            try await recordCandidatePatchActivity(.applyingChangeInIsolatedSandbox, snapshot: snapshot, workspace: workspace, task: task)
+            let result = try service.apply(sandboxID: pending.sandboxID, patchID: pending.patchID)
+            manifest = result.manifest
+            snapshot = CandidatePatchActivitySnapshot(manifest: manifest)
+            try await recordCandidatePatchActivity(.verifyingFileHashes, snapshot: snapshot, workspace: workspace, task: task)
+            try await recordCandidatePatchActivity(.buildingUnifiedDiff, snapshot: snapshot, workspace: workspace, task: task)
+            try await recordCandidatePatchActivity(.confirmingOriginalLegacyUnchanged, snapshot: snapshot, workspace: workspace, task: task)
+            try await recordCandidatePatchActivity(.preparingHumanReview, snapshot: snapshot, workspace: workspace, task: task)
+            let review = try service.reviewSummary(sandboxID: pending.sandboxID, patchID: pending.patchID)
+            try await recordCandidatePatchActivity(.candidatePatchReady, snapshot: snapshot, workspace: workspace, task: task)
+            try stateMachine.transition(&task, to: .completed)
+            try await persistence.saveTask(task)
+            try await record(
+                type: .taskCompleted,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: "Candidate Patch ready for human review",
+                payload: snapshot.eventPayload.merging([
+                    "state": task.state.rawValue,
+                    "intent_type": MissionIntentType.candidatePatchGeneration.rawValue,
+                    "completion_contract": RuntimeCompletionContractKind.candidatePatchGeneration.rawValue,
+                    "manifest_backed": "true",
+                    "source_integrity": SourceIntegrityState.unchanged.rawValue,
+                    "build_or_test_executed": "false",
+                    "git_or_deployment_action_occurred": "false",
+                    "generated_tests_available": "false",
+                    "shell_execution_enabled": "false",
+                    "detail": review.markdown,
+                    "actual_result": review.markdown,
+                    "success": "true"
+                ]) { current, _ in current }
+                .merging(runtimeStatePayload(mission: .complete, task: task.state, tool: .succeeded)) { current, _ in current }
+            )
+            pendingCandidatePatches.removeValue(forKey: approval.id)
+        } catch {
+            let code = candidatePatchFailureCode(error)
+            try stateMachine.transition(&task, to: .failed)
+            task.failureProbability = 1
+            try await persistence.saveTask(task)
+            try? await recordCandidatePatchActivity(.candidatePatchBlocked, snapshot: snapshot, workspace: workspace, task: task)
+            try await record(
+                type: .stateUpdated,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: "Approved Candidate Patch failed closed",
+                payload: snapshot.eventPayload.merging([
+                    "state": task.state.rawValue,
+                    "failure_category": code.rawValue,
+                    "blocker_reason": code.rawValue,
+                    "success": "false",
+                    "build_or_test_executed": "false",
+                    "git_or_deployment_action_occurred": "false"
+                ]) { current, _ in current }
+            )
+            throw error
+        }
+    }
+
+    private func rejectCandidatePatch(
+        _ approval: ApprovalRequest,
+        workspace: Workspace,
+        reason: String
+    ) async throws {
+        guard let lifecycle = sandboxLifecycle else {
+            throw CandidatePatchRuntimeError.runtimeUnavailable
+        }
+        let pending = try candidatePatchPending(from: approval)
+        let service = CandidatePatchService(lifecycle: lifecycle)
+        let manifest = try service.recordDecision(
+            sandboxID: pending.sandboxID,
+            patchID: pending.patchID,
+            decision: .reject,
+            decidedBy: workspace.role.rawValue,
+            rationale: reason,
+            approvalRequestID: approval.id
+        )
+        if var task = try await persistence.loadTasks(workspaceID: workspace.id)
+            .first(where: { $0.id == pending.taskID }) {
+            try stateMachine.transition(&task, to: .failed)
+            try await persistence.saveTask(task)
+            try await record(
+                type: .stateUpdated,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: "Candidate Patch plan rejected without Sandbox workspace mutation",
+                payload: CandidatePatchActivitySnapshot(manifest: manifest).eventPayload.merging([
+                    "state": task.state.rawValue,
+                    "candidate_patch_activity_phase": CandidatePatchActivityPhase.candidatePatchBlocked.rawValue,
+                    "failure_category": CandidatePatchStatus.rejected.rawValue,
+                    "workspace_mutation_count": "0",
+                    "build_or_test_executed": "false",
+                    "git_or_deployment_action_occurred": "false"
+                ]) { current, _ in current }
+            )
+        }
+        pendingCandidatePatches.removeValue(forKey: approval.id)
+    }
+
+    private func candidatePatchPending(from approval: ApprovalRequest) throws -> CandidatePatchPendingRuntime {
+        if let pending = pendingCandidatePatches[approval.id] { return pending }
+        guard let taskID = approval.taskID,
+              let rawSandboxID = approval.metadata["sandbox_id"],
+              let sandboxID = SandboxID(rawValue: rawSandboxID),
+              let rawPatchID = approval.metadata["candidate_patch_id"],
+              let patchID = CandidatePatchID(rawValue: rawPatchID) else {
+            throw CandidatePatchRuntimeError.approvalMetadataInvalid
+        }
+        return CandidatePatchPendingRuntime(
+            approvalRequestID: approval.id,
+            taskID: taskID,
+            workspaceID: approval.workspaceID,
+            sandboxID: sandboxID,
+            patchID: patchID
+        )
+    }
+
+    private func validateApprovedCandidatePatchAssessment(
+        _ plan: CandidatePatchPlan,
+        workspace: Workspace
+    ) async throws {
+        let events = try await persistence.loadEvents(workspaceID: workspace.id, taskID: nil)
+        let event = events
+            .filter({ $0.payload["lifecycle_event"] == "AI_ASSESSMENT_PERSISTED" })
+            .sorted(by: { $0.sequence > $1.sequence })
+            .first(where: { $0.payload["assessment_id"] == plan.assessmentID })
+        let assessment: CandidatePatchAssessmentContext
+        if let event {
+            guard event.payload["assessment_validation_status"] == CandidatePatchAssessmentValidationStatus.validated.rawValue,
+                  event.payload["source_snapshot_id"] == plan.sourceSnapshotID,
+                  event.payload["canonical_legacy_root"] == plan.legacyIntegrityBaseline.canonicalLegacyRoot else {
+                throw CandidatePatchError.blocked(.assessmentStale)
+            }
+            guard event.payload["normalized_requested_capability_id"] == plan.requestedCapabilityID else {
+                throw CandidatePatchError.blocked(.assessmentCapabilityMismatch)
+            }
+            guard event.payload["compatibility_decision"] == plan.compatibilityDecision.rawValue,
+                  let json = event.payload["candidate_patch_assessment_context"],
+                  let data = json.data(using: .utf8) else {
+                throw CandidatePatchError.blocked(.assessmentEvidenceMissing)
+            }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            guard let decoded = try? decoder.decode(CandidatePatchAssessmentContext.self, from: data) else {
+                throw CandidatePatchError.blocked(.assessmentEvidenceMissing)
+            }
+            assessment = decoded
+        } else if let embedded = plan.assessmentContext {
+            assessment = embedded
+        } else {
+            throw CandidatePatchError.blocked(.assessmentMissing)
+        }
+        guard assessment.validationStatus == .validated,
+              assessment.assessmentID == plan.assessmentID,
+              assessment.sourceSnapshotID == plan.sourceSnapshotID,
+              assessment.canonicalLegacyRoot == plan.legacyIntegrityBaseline.canonicalLegacyRoot,
+              assessment.requestedCapabilityID == plan.requestedCapabilityID,
+              assessment.compatibilityDecision == plan.compatibilityDecision,
+              !assessment.evidence.filter(\.isGrounded).isEmpty else {
+            throw CandidatePatchError.blocked(.assessmentEvidenceMissing)
+        }
+        if assessment.compatibilityDecision == .no {
+            guard !assessment.blockers.isEmpty,
+                  Set(plan.blockersAddressed).isSubset(of: Set(assessment.blockers)),
+                  !plan.blockersAddressed.isEmpty else {
+                throw CandidatePatchError.blocked(.assessmentVerdictNotEligible)
+            }
+        }
+    }
+
+    private func normalizedCandidatePatchRevisionInstructions(_ value: String) throws -> [String] {
+        let values = value
+            .split(whereSeparator: { $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let combined = values.joined(separator: " ")
+        let ambiguous: Set<String> = [
+            "change", "changes", "change it", "revise", "revision", "fix it", "update it",
+            "修改", "改一下", "调整", "变更"
+        ]
+        guard combined.count >= 8,
+              !ambiguous.contains(combined.lowercased()) else {
+            throw CandidatePatchError.blocked(.invalidApprovalState)
+        }
+        return values
     }
 
     @discardableResult
@@ -2011,6 +3735,24 @@ actor RuntimeKernel {
         payload: [String: String]
     ) async throws -> ExecutionEvent {
         try await record(type: type, workspaceID: workspaceID, taskID: taskID, summary: summary, payload: payload)
+    }
+
+    @discardableResult
+    func recordUserSubmissionAuditEvent(
+        logicalEventID: UUID,
+        workspaceID: UUID,
+        taskID: UUID?,
+        summary: String,
+        payload: [String: String]
+    ) async throws -> ExecutionEvent {
+        try await record(
+            type: .userMessageReceived,
+            workspaceID: workspaceID,
+            taskID: taskID,
+            summary: summary,
+            payload: payload.merging(["client_message_id": logicalEventID.uuidString]) { current, _ in current },
+            eventID: logicalEventID
+        )
     }
 
     private func pauseTaskForUser(
@@ -2781,7 +4523,7 @@ actor RuntimeKernel {
                 type: .stepExecuted,
                 workspaceID: workspace.id,
                 taskID: task.id,
-                summary: "Read-only result: \(executable.step.title)",
+                summary: "Read-only result: \(readOnlyToolPresentationTitle(executable))",
                 payload: readOnlyToolMetadata(executable, iteration: decisionIterations)
                     .merging([
                         "lifecycle_event": "TOOL_RESULT",
@@ -3087,39 +4829,52 @@ actor RuntimeKernel {
                         "provider_stage": "observation_next_action_repair",
                         "repair_attempt": "1",
                         "rejection_reason": rejection.reason.rawValue,
-                        "exact_rejection": AgentPresentationSanitizer.safeContent(rejection.detail, fallback: rejection.reason.rawValue),
+                        "exact_rejection": safeReadOnlyRejectionDetail(rejection),
                         "completed_tool_call_id": executable.toolCall.id,
                         "completed_command_signature": readOnlyCommandSignature(executable),
                         "iteration": String(decisionIterations)
                     ].merging(runtimeStatePayload(mission: .observe, task: task.state, tool: .succeeded)) { current, _ in current }
                 )
                 do {
-                    let repairPrompt = promptOrchestrator.compile(
-                        state: .observe,
-                        input: compactObservation.repairPrompt(rejection: rejection),
-                        context: context,
-                        worldModel: worldModel
-                    )
-                    let repairProviderStartedAt = Date()
-                    let repairTaskSnapshot = task
                     let repaired: ReadOnlyNextAction
-                    do {
-                        repaired = try await withReadOnlyHardDeadline(
-                            deadline: missionTiming.hardDeadline,
-                            stage: "observation_next_action_repair"
-                        ) { [self] in
-                            try await generateReadOnlyObservationDecision(
-                                prompt: repairPrompt,
-                                context: context,
-                                workspace: workspace,
-                                task: repairTaskSnapshot
-                            )
+                    let repairSource: String
+                    if let deterministic = deterministicCanonicalNextActionRepair(
+                        action: action,
+                        rejection: rejection,
+                        missionTarget: missionTarget,
+                        evidence: evidence,
+                        requirements: evidenceRequirements
+                    ) {
+                        repaired = deterministic
+                        repairSource = "bounded_deterministic_repair"
+                    } else {
+                        let repairPrompt = promptOrchestrator.compile(
+                            state: .observe,
+                            input: compactObservation.repairPrompt(rejection: rejection),
+                            context: context,
+                            worldModel: worldModel
+                        )
+                        let repairProviderStartedAt = Date()
+                        let repairTaskSnapshot = task
+                        do {
+                            repaired = try await withReadOnlyHardDeadline(
+                                deadline: missionTiming.hardDeadline,
+                                stage: "observation_next_action_repair"
+                            ) { [self] in
+                                try await generateReadOnlyObservationDecision(
+                                    prompt: repairPrompt,
+                                    context: context,
+                                    workspace: workspace,
+                                    task: repairTaskSnapshot
+                                )
+                            }
+                            acceptedDecisionProviderDuration = Date().timeIntervalSince(repairProviderStartedAt)
+                            missionTiming.observationProvider += acceptedDecisionProviderDuration
+                        } catch {
+                            missionTiming.observationProvider += Date().timeIntervalSince(repairProviderStartedAt)
+                            throw error
                         }
-                        acceptedDecisionProviderDuration = Date().timeIntervalSince(repairProviderStartedAt)
-                        missionTiming.observationProvider += acceptedDecisionProviderDuration
-                    } catch {
-                        missionTiming.observationProvider += Date().timeIntervalSince(repairProviderStartedAt)
-                        throw error
+                        repairSource = "provider_bounded_repair"
                     }
                     action = repaired
                     actionValidation = validateReadOnlyNextAction(
@@ -3140,7 +4895,13 @@ actor RuntimeKernel {
                         attempt: 1,
                         workspace: workspace,
                         task: task,
-                        iteration: decisionIterations
+                        iteration: decisionIterations,
+                        additionalPayload: canonicalPathRepairAuditPayload(
+                            validation: actionValidation,
+                            evidence: evidence,
+                            rejection: rejection,
+                            source: repairSource
+                        )
                     )
                 } catch {
                     if let deadlineError = error as? ReadOnlyMissionDeadlineError,
@@ -3306,6 +5067,8 @@ actor RuntimeKernel {
         }
 
         var aiAssessmentActivity: AIAssessmentActivitySnapshot?
+        var canonicalAssessmentReport: FDEAIIntegrationAssessmentReport?
+        var canonicalAssessmentFinalizationMode: CandidatePatchAssessmentFinalizationMode = .normal
         if assessmentProfile != nil,
            !evidence.isEmpty {
             try await emitAssessmentState(.checkingIntegrationCapabilities, evidenceCount: evidence.count)
@@ -3318,11 +5081,30 @@ actor RuntimeKernel {
                 evidence: evidence
             )
             let architecture = LegacyArchitecture(ledger: ledger, evidence: evidence)
-            let report = LegacyAgentCompatibilityAnalyzer().assess(
+            let responseLanguage = ReadOnlyResponseLanguage(request: effectiveRequest)
+            var report = LegacyAgentCompatibilityAnalyzer().assess(
                 capability: assessmentProfile ?? AgentCapabilityProfile.detect(from: effectiveRequest),
                 evidenceLedger: ledger,
-                legacyArchitecture: architecture
+                legacyArchitecture: architecture,
+                responseLanguage: responseLanguage
             )
+            var semanticValidation = AssessmentSemanticConsistencyValidator.validate(report)
+            if !semanticValidation.isValid {
+                report = AssessmentSemanticConsistencyValidator.repair(report)
+                semanticValidation = AssessmentSemanticConsistencyValidator.validate(report)
+            }
+            guard semanticValidation.isValid else {
+                return try await blockReadOnlyInspection(
+                    task: &task,
+                    workspace: workspace,
+                    reason: .assessmentSemanticInconsistency,
+                    detail: "The assessment report remained semantically inconsistent after deterministic repair: \(semanticValidation.issues.map(\.rawValue).joined(separator: ", ")).",
+                    providerStage: "final_grounded_answer",
+                    providerDiagnostic: ReadOnlyFinalAnswerContractFailure.assessmentSemanticInconsistency.rawValue,
+                    timingPayload: missionTiming.auditPayload(),
+                    evidenceRequirementsPayload: ledger.auditPayload
+                )
+            }
             aiAssessmentActivity = report.activitySnapshot
             try await emitAssessmentState(.designingOperationalWorkflow, evidenceCount: evidence.count)
             try await emitAssessmentState(.preparingValidationPlan, evidenceCount: evidence.count)
@@ -3331,10 +5113,17 @@ actor RuntimeKernel {
                 evidenceCount: evidence.count,
                 completedSnapshot: report.activitySnapshot
             )
-            let rendered = report.markdown()
-            finalAnswer = ReadOnlyResponseLanguage(request: effectiveRequest) == .chinese
-                ? "结论：\(report.verdict.rawValue)。以下为基于静态证据生成的只读 AI Agent 接入评估；未执行测试或修改。\n\n\(rendered)"
-                : rendered
+            canonicalAssessmentReport = report
+            finalAnswer = report.markdown(language: responseLanguage)
+            let finalizationEvents = try await persistence.loadEvents(
+                workspaceID: workspace.id,
+                taskID: task.id
+            )
+            if finalizationEvents.contains(where: {
+                $0.payload["lifecycle_event"] == "GRACEFUL_FINALIZATION_FALLBACK"
+            }) {
+                canonicalAssessmentFinalizationMode = .fallback
+            }
         }
 
         var finalAnswerValidation = ReadOnlyFinalAnswerContract.validate(
@@ -3358,6 +5147,53 @@ actor RuntimeKernel {
                     evidenceRequirementsPayload: finalAnswerValidation.ledger.auditPayload
                 )
             }
+            if let assessmentReport = canonicalAssessmentReport {
+                let fallbackReport = AssessmentSemanticConsistencyValidator.repair(assessmentReport)
+                let fallbackSemanticValidation = AssessmentSemanticConsistencyValidator.validate(fallbackReport)
+                let fallback = fallbackReport.markdown(language: ReadOnlyResponseLanguage(request: effectiveRequest))
+                let fallbackValidation = ReadOnlyFinalAnswerContract.validate(
+                    answer: fallback,
+                    request: effectiveRequest,
+                    requirements: evidenceRequirements,
+                    evidence: evidence,
+                    requireComplete: !partialFinalizationRequired
+                )
+                guard fallbackSemanticValidation.isValid,
+                      isGroundedFinalAnswer(fallback, evidence: evidence, request: effectiveRequest),
+                      fallbackValidation.accepted else {
+                    return try await blockReadOnlyInspection(
+                        task: &task,
+                        workspace: workspace,
+                        reason: .assessmentSemanticInconsistency,
+                        detail: "Neither the normal assessment nor its deterministic grounded fallback passed canonical validation.",
+                        providerStage: "final_grounded_answer_validation",
+                        providerDiagnostic: ReadOnlyFinalAnswerContractFailure.assessmentSemanticInconsistency.rawValue,
+                        timingPayload: missionTiming.auditPayload(),
+                        evidenceRequirementsPayload: fallbackValidation.ledger.auditPayload
+                    )
+                }
+                finalAnswer = fallback
+                finalAnswerValidation = fallbackValidation
+                canonicalAssessmentReport = fallbackReport
+                canonicalAssessmentFinalizationMode = .fallback
+                aiAssessmentActivity = fallbackReport.activitySnapshot
+                let resolution = finalizationResolution ?? ReadOnlyBudgetStopResolution(
+                    decision: partialFinalizationRequired ? .partialWithCurrentEvidence : .completeWithCurrentEvidence,
+                    trigger: .restoredEvidence
+                )
+                finalizationResolution = resolution
+                try await recordDeterministicAnswerFallback(
+                    workspace: workspace,
+                    task: task,
+                    evidence: evidence,
+                    requirements: evidenceRequirements,
+                    resolution: resolution,
+                    diagnostic: "assessment_final_output_validation_failed",
+                    timing: missionTiming,
+                    providerStage: "assessment_final_grounded_answer_validation",
+                    answer: fallback
+                )
+            } else {
             let unsatisfied = evidenceRequirements.unsatisfied(by: evidence)
             let resolution = ReadOnlyBudgetStopResolution(
                 decision: unsatisfied.isEmpty ? .completeWithCurrentEvidence : .partialWithCurrentEvidence,
@@ -3405,6 +5241,28 @@ actor RuntimeKernel {
                 providerStage: "final_grounded_answer_validation",
                 answer: fallback
             )
+            }
+        }
+
+        if let canonicalAssessmentReport {
+            let canonicalMarkdown = canonicalAssessmentReport.markdown(
+                language: ReadOnlyResponseLanguage(request: effectiveRequest)
+            )
+            guard canonicalMarkdown == finalAnswer,
+                  AssessmentSemanticConsistencyValidator.validate(canonicalAssessmentReport).isValid,
+                  finalAnswerValidation.accepted,
+                  isGroundedFinalAnswer(finalAnswer, evidence: evidence, request: effectiveRequest) else {
+                return try await blockReadOnlyInspection(
+                    task: &task,
+                    workspace: workspace,
+                    reason: .assessmentSemanticInconsistency,
+                    detail: "The canonical assessment, visible report, and validation state did not match; no Candidate Patch handoff was persisted.",
+                    providerStage: "canonical_assessment_persistence",
+                    providerDiagnostic: ReadOnlyFinalAnswerContractFailure.assessmentSemanticInconsistency.rawValue,
+                    timingPayload: missionTiming.auditPayload(),
+                    evidenceRequirementsPayload: finalAnswerValidation.ledger.auditPayload
+                )
+            }
         }
 
         if partialFinalizationRequired {
@@ -3424,10 +5282,17 @@ actor RuntimeKernel {
             )
         }
 
+        // Assessment reports contain fourteen auditable sections and can legitimately
+        // exceed the generic inspection event budget. Preserve the complete report
+        // within a bounded assessment-specific envelope so the completion artifact
+        // does not silently omit provenance or late-section blockers.
+        let finalAnswerEventDetail = String(
+            finalAnswer.prefix(aiAssessmentActivity == nil ? 12_000 : 64_000)
+        )
         var preparedPayload: [String: String] = [
             "lifecycle_event": "INSPECTION_COMPLETED",
             "grounded_answer": "true",
-            "final_answer": String(finalAnswer.prefix(12_000)),
+            "final_answer": finalAnswerEventDetail,
             "evidence_count": String(evidence.count),
             "workspace_identity": Array(Set(evidence.map(\.workspaceIdentity))).sorted().joined(separator: " | "),
             "response_language": ReadOnlyResponseLanguage(request: effectiveRequest).rawValue,
@@ -3469,8 +5334,8 @@ actor RuntimeKernel {
             "completion_contract": completionContract.kind.rawValue,
             "grounded_answer": "true",
             "completion_evidence": gate.report,
-            "detail": String(finalAnswer.prefix(12_000)),
-            "actual_result": String(finalAnswer.prefix(12_000)),
+            "detail": finalAnswerEventDetail,
+            "actual_result": finalAnswerEventDetail,
             "success": "true",
             "evidence_count": String(evidence.count),
             "response_language": ReadOnlyResponseLanguage(request: effectiveRequest).rawValue
@@ -3488,6 +5353,14 @@ actor RuntimeKernel {
             summary: "Read-only inspection completed with grounded evidence",
             payload: completionPayload
         )
+        if let canonicalAssessmentReport {
+            try await persistCandidatePatchAssessmentContext(
+                report: canonicalAssessmentReport,
+                finalizationMode: canonicalAssessmentFinalizationMode,
+                workspace: workspace,
+                task: task
+            )
+        }
         return task
     }
 
@@ -3695,6 +5568,29 @@ actor RuntimeKernel {
                 )
             }
             missionTiming.finalization += Date().timeIntervalSince(finalizationStartedAt)
+            let canonicalAssessmentWillRender = MissionIntentParser().parse(request).intentType
+                == .aiAgentCompatibilityAssessment
+            if canonicalAssessmentWillRender,
+               proposed.decision == .finalize,
+               proposed.toolCalls.isEmpty {
+                try await record(
+                    type: .stateUpdated,
+                    workspaceID: workspace.id,
+                    taskID: task.id,
+                    summary: "Assessment finalization signal accepted for canonical rendering",
+                    payload: [
+                        "state": task.state.rawValue,
+                        "lifecycle_event": "AI_ASSESSMENT_FINALIZATION_SIGNAL_ACCEPTED",
+                        "provider_stage": "final_grounded_answer",
+                        "canonical_assessment_render_pending": "true",
+                        "success": "true"
+                    ].merging(runtimeStatePayload(mission: .verifying, task: task.state, tool: .succeeded)) { current, _ in current }
+                )
+                return proposed.finalAnswer?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty == false
+                    ? proposed.finalAnswer!.trimmingCharacters(in: .whitespacesAndNewlines)
+                    : "Canonical assessment rendering pending."
+            }
             let validation = validateReadOnlyNextAction(
                 proposed,
                 workspace: workspace,
@@ -4212,6 +6108,16 @@ actor RuntimeKernel {
         case .backendApplicationAssembly: return "后端应用组装文件"
         case .importantDependencies: return "重要依赖"
         case .inspectedManifestsAndKeyFiles: return "实际读取的 manifest 和关键文件"
+        case .assessmentOrderReadBoundary: return "订单只读数据边界"
+        case .assessmentAPIServiceBoundary: return "API/服务边界"
+        case .assessmentAuthentication: return "身份认证边界"
+        case .assessmentRecordAuthorization: return "记录级授权"
+        case .assessmentPermissionModel: return "权限模型"
+        case .assessmentAuditLogging: return "审计日志"
+        case .assessmentMutationPaths: return "修改路径与只读边界"
+        case .assessmentSensitiveResponseFields: return "敏感响应字段"
+        case .assessmentArchitectureDocumentation: return "相关架构文档"
+        case .assessmentExampleConfiguration: return "相关示例配置"
         }
     }
 
@@ -4569,6 +6475,11 @@ actor RuntimeKernel {
         func add(_ rawPath: String, score: Int) {
             guard let path = canonicalSafeReadOnlyPath(rawPath), !rawPath.hasSuffix("/") else { return }
             var value = score
+            if unsatisfied.contains(.assessmentOrderReadBoundary), isAssessmentOrderPath(path) { value += 1_000 }
+            if unsatisfied.contains(.assessmentAuthentication), isAssessmentAuthPath(path) { value += 950 }
+            if unsatisfied.contains(.assessmentAuditLogging), isAssessmentAuditPath(path) { value += 900 }
+            if unsatisfied.contains(.assessmentArchitectureDocumentation), isAssessmentArchitecturePath(path) { value += 850 }
+            if unsatisfied.contains(.assessmentExampleConfiguration), isAssessmentExampleConfigurationPath(path) { value += 800 }
             if unsatisfied.contains(.projectManifest), isRootManifestPath(path) { value += 500 }
             if unsatisfied.contains(.backendManifest), isBackendManifestPath(path) { value += 450 }
             if unsatisfied.contains(.databaseSchemaOrConfig), isDatabaseEvidencePath(path) { value += 400 }
@@ -4628,6 +6539,11 @@ actor RuntimeKernel {
             }
         )
         let categories: [(ReadOnlyEvidenceRequirementKind, (String) -> Bool)] = [
+            (.assessmentOrderReadBoundary, isAssessmentOrderPath),
+            (.assessmentAuthentication, isAssessmentAuthPath),
+            (.assessmentAuditLogging, isAssessmentAuditPath),
+            (.assessmentArchitectureDocumentation, isAssessmentArchitecturePath),
+            (.assessmentExampleConfiguration, isAssessmentExampleConfigurationPath),
             (.projectManifest, isRootManifestPath),
             (.backendManifest, isBackendManifestPath),
             (.databaseSchemaOrConfig, isDatabaseEvidencePath),
@@ -4637,7 +6553,19 @@ actor RuntimeKernel {
         ]
         for (requirement, predicate) in categories where unsatisfied.contains(requirement) {
             let matching = candidates.filter(predicate)
-            if !matching.isEmpty { return matching }
+            switch requirement {
+            case .assessmentOrderReadBoundary, .assessmentAuthentication,
+                 .assessmentAuditLogging, .assessmentArchitectureDocumentation,
+                 .assessmentExampleConfiguration:
+                // Capability requirements are ordered. An unrelated path must
+                // not conceal that the next required canonical path is absent.
+                return matching
+            default:
+                // Preserve the established generic/frontend Phase 2C behavior:
+                // continue to the next grounded category when this one has no
+                // available candidate yet.
+                if !matching.isEmpty { return matching }
+            }
         }
         return candidates
     }
@@ -4647,6 +6575,99 @@ actor RuntimeKernel {
             return "read_file path \(proposedPath) is ungrounded. No canonical file candidate has been established; inspect/list/search the selected workspace before reading a file."
         }
         return "read_file path \(proposedPath) is ungrounded. Use one exact canonical candidate without changing its directory, basename, or extension: \(candidates.joined(separator: " | "))."
+    }
+
+    private func deterministicCanonicalNextActionRepair(
+        action: ReadOnlyNextAction?,
+        rejection: ReadOnlyNextActionRejection,
+        missionTarget: ReadOnlyMissionTarget,
+        evidence: [ReadOnlyInspectionEvidence],
+        requirements: ReadOnlyEvidenceRequirements
+    ) -> ReadOnlyNextAction? {
+        guard missionTarget.unambiguousWorkspace != nil,
+              let action,
+              action.decision == .tool,
+              action.toolCalls.count == 1,
+              let originalCall = action.toolCalls.first,
+              originalCall.command == "engineering.read_file",
+              rejection.reason == .canonicalSearchPathRequired
+                || (rejection.reason == .nextActionInvalidTool
+                    && rejection.detail.contains("missing required argument path")) else {
+            return nil
+        }
+
+        let grounded = groundedReadOnlyCandidates(evidence: evidence, requirements: requirements)
+        let preferred = preferredGroundedReadOnlyCandidates(
+            grounded,
+            evidence: evidence,
+            requirements: requirements
+        )
+        let proposed = readOnlyArgumentValue("path", in: originalCall.arguments)
+        let matches: [String]
+        if let proposed {
+            let proposedName = URL(fileURLWithPath: proposed).lastPathComponent.lowercased()
+            matches = preferred.filter {
+                URL(fileURLWithPath: $0).lastPathComponent.lowercased() == proposedName
+            }
+        } else {
+            matches = preferred.count == 1 ? preferred : []
+        }
+        guard matches.count == 1, let canonicalPath = matches.first,
+              let workspaceIdentity = missionTarget.unambiguousWorkspace?.rawValue else {
+            return nil
+        }
+
+        var repairedCall = originalCall
+        repairedCall.arguments = ["workspace=\(workspaceIdentity)", "path=\(canonicalPath)"]
+        repairedCall.workingDirectory = nil
+        var repairedAudit = action.audit
+        repairedAudit.sourceContract = "runtime_canonical_path_repair"
+        repairedAudit.normalizationNotes.append("Repaired once from trusted canonical discovery metadata.")
+        return ReadOnlyNextAction(
+            decision: .tool,
+            toolCalls: [repairedCall],
+            reasoningSummary: action.reasoningSummary,
+            audit: repairedAudit
+        )
+    }
+
+    private func canonicalPathRepairAuditPayload(
+        validation: ReadOnlyNextActionValidation,
+        evidence: [ReadOnlyInspectionEvidence],
+        rejection: ReadOnlyNextActionRejection,
+        source: String
+    ) -> [String: String] {
+        guard case .accepted(.tool(let executable)) = validation,
+              executable.toolCall.command == "engineering.read_file" else {
+            return [:]
+        }
+        let path = executable.relativeTargetPath
+        let sources = evidence.filter { item in
+            let facts = item.structuredFacts
+            return facts.discoveredPaths.contains(path)
+                || facts.structureEntries.contains(path)
+                || facts.manifestDerivedPaths.contains(path)
+                || facts.referencedSourcePaths.contains(path)
+                || facts.directoryEntries.contains { $0.canonicalChildRelativePath == path }
+        }
+        guard !sources.isEmpty else { return [:] }
+        return [
+            "canonical_path_repair_count": "1",
+            "canonical_path_repair_source": source,
+            "canonical_path_provenance": "trusted_discovered_metadata",
+            "canonical_path_repaired_to": path,
+            "canonical_path_source_event_ids": sources.map(\.toolResultEventID.uuidString).joined(separator: " | "),
+            "canonical_path_source_tool_call_ids": sources.map(\.toolCallID).joined(separator: " | "),
+            "canonical_path_original_rejection": safeReadOnlyRejectionDetail(rejection)
+        ]
+    }
+
+    private func safeReadOnlyRejectionDetail(_ rejection: ReadOnlyNextActionRejection) -> String {
+        let safe = AgentPresentationSanitizer.safeMarkdownContent(
+            rejection.detail,
+            fallback: rejection.reason.rawValue
+        )
+        return String(safe.prefix(2_000))
     }
 
     private func isManifestPath(_ path: String) -> Bool {
@@ -4697,6 +6718,37 @@ actor RuntimeKernel {
         let value = path.lowercased()
         return !isBackendPath(value)
             && (value.contains("vite.config") || value.contains("webpack") || value.contains("next.config"))
+    }
+
+    private func isAssessmentOrderPath(_ path: String) -> Bool {
+        let value = path.lowercased()
+        return isSourceCandidate(value)
+            && (URL(fileURLWithPath: value).deletingPathExtension().lastPathComponent.contains("order")
+                || value.split(separator: "/").contains("orders"))
+    }
+
+    private func isAssessmentAuthPath(_ path: String) -> Bool {
+        let value = path.lowercased()
+        return isSourceCandidate(value)
+            && ["auth", "authentication", "authorization", "identity", "session"].contains {
+                URL(fileURLWithPath: value).deletingPathExtension().lastPathComponent.contains($0)
+            }
+    }
+
+    private func isAssessmentAuditPath(_ path: String) -> Bool {
+        let value = path.lowercased()
+        return isSourceCandidate(value)
+            && URL(fileURLWithPath: value).deletingPathExtension().lastPathComponent.contains("audit")
+    }
+
+    private func isAssessmentArchitecturePath(_ path: String) -> Bool {
+        let value = path.lowercased()
+        return value == "docs/architecture.md" || value.hasSuffix("/architecture.md")
+    }
+
+    private func isAssessmentExampleConfigurationPath(_ path: String) -> Bool {
+        let value = path.lowercased()
+        return value == "config/app.example.json" || value.hasSuffix("/app.example.json")
     }
 
     private func canonicalSafeReadOnlyPath(_ value: String) -> String? {
@@ -4786,6 +6838,11 @@ actor RuntimeKernel {
         _ path: String,
         manifestDerivedBackendEntries: Set<String> = []
     ) -> String {
+        if isAssessmentOrderPath(path) { return "assessment_order_boundary" }
+        if isAssessmentAuthPath(path) { return "assessment_authentication" }
+        if isAssessmentAuditPath(path) { return "assessment_audit_logging" }
+        if isAssessmentArchitecturePath(path) { return "assessment_architecture" }
+        if isAssessmentExampleConfigurationPath(path) { return "assessment_example_configuration" }
         if isBackendManifestPath(path) { return "backend_manifest" }
         if isRootManifestPath(path) { return "root_manifest" }
         if isDatabaseEvidencePath(path) { return "database" }
@@ -4813,6 +6870,11 @@ actor RuntimeKernel {
             let paths = candidates.filter(matching)
             categories.append(paths.isEmpty ? "\(label) (discover exact path)" : "\(label): \(paths.joined(separator: " | "))")
         }
+        append(.assessmentOrderReadBoundary, "order read/data boundary", matching: isAssessmentOrderPath)
+        append(.assessmentAuthentication, "authentication and permission boundary", matching: isAssessmentAuthPath)
+        append(.assessmentAuditLogging, "audit logging boundary", matching: isAssessmentAuditPath)
+        append(.assessmentArchitectureDocumentation, "architecture documentation", matching: isAssessmentArchitecturePath)
+        append(.assessmentExampleConfiguration, "example configuration", matching: isAssessmentExampleConfigurationPath)
         append(.projectManifest, "root manifest", matching: isRootManifestPath)
         append(.backendManifest, "nested backend manifest", matching: isBackendManifestPath)
         append(.databaseSchemaOrConfig, "database schema/config", matching: isDatabaseEvidencePath)
@@ -4937,20 +6999,20 @@ actor RuntimeKernel {
                     evidence: evidence,
                     requirements: evidenceRequirements
                 )
-                guard groundedCandidates.contains(executable.relativeTargetPath) else {
-                    return reject(
-                        .canonicalSearchPathRequired,
-                        groundedReadRejectionDetail(
-                            proposedPath: executable.relativeTargetPath,
-                            candidates: groundedCandidates
-                        )
-                    )
-                }
                 let preferredCandidates = preferredGroundedReadOnlyCandidates(
                     groundedCandidates,
                     evidence: evidence,
                     requirements: evidenceRequirements
                 )
+                guard groundedCandidates.contains(executable.relativeTargetPath) else {
+                    return reject(
+                        .canonicalSearchPathRequired,
+                        groundedReadRejectionDetail(
+                            proposedPath: executable.relativeTargetPath,
+                            candidates: preferredCandidates
+                        )
+                    )
+                }
                 if !preferredCandidates.isEmpty,
                    !preferredCandidates.contains(executable.relativeTargetPath) {
                     return reject(
@@ -5024,15 +7086,16 @@ actor RuntimeKernel {
         attempt: Int,
         workspace: Workspace,
         task: FDETask,
-        iteration: Int
+        iteration: Int,
+        additionalPayload: [String: String] = [:]
     ) async throws {
         let rejection = validation.rejection
         let lifecycleEvent = attempt == 0 ? "NEXT_ACTION_DECODED" : "NEXT_ACTION_REPAIRED"
         let providerStage = attempt == 0 ? "observation_next_action" : "observation_next_action_repair"
         let exactRejection = rejection.map {
-            AgentPresentationSanitizer.safeContent($0.detail, fallback: $0.reason.rawValue)
+            safeReadOnlyRejectionDetail($0)
         } ?? ""
-        let payload: [String: String] = [
+        var payload: [String: String] = [
             "lifecycle_event": lifecycleEvent,
             "provider_stage": providerStage,
             "repair_attempt": String(attempt),
@@ -5058,6 +7121,7 @@ actor RuntimeKernel {
             "rejection_reason": rejection?.reason.rawValue ?? "",
             "exact_rejection": exactRejection
         ]
+        payload.merge(additionalPayload) { current, _ in current }
         try await record(
             type: .stateUpdated,
             workspaceID: workspace.id,
@@ -5289,6 +7353,24 @@ actor RuntimeKernel {
         return metadata
     }
 
+    private func readOnlyToolPresentationTitle(_ executable: ReadOnlyExecutableStep) -> String {
+        let workspaceLabel = executable.workspaceIdentity.lowercased() == "legacy" ? "Legacy" : "Agent"
+        switch executable.toolCall.command {
+        case "engineering.inspect_project":
+            return "Inspect \(workspaceLabel) workspace project structure"
+        case "engineering.list_directory":
+            return "List \(workspaceLabel) workspace directory · \(executable.relativeTargetPath)"
+        case "engineering.search_files":
+            return "Search \(workspaceLabel) workspace files · \(executable.relativeTargetPath)"
+        case "engineering.search_code":
+            return "Search \(workspaceLabel) workspace source · \(executable.relativeTargetPath)"
+        case "engineering.read_file":
+            return "Read \(workspaceLabel) workspace file · \(executable.relativeTargetPath)"
+        default:
+            return "Inspect \(workspaceLabel) workspace"
+        }
+    }
+
     private func readOnlyArgumentValue(_ key: String, in arguments: [String]) -> String? {
         for raw in arguments {
             let parts = raw.split(separator: "=", maxSplits: 1).map(String.init)
@@ -5428,11 +7510,12 @@ actor RuntimeKernel {
                 toolResultEventID: item.toolResultEventID
             )
         }
-        guard AgentEvidenceClaimGuard().rejectionReason(
+        let claimRejection = AgentEvidenceClaimGuard().rejectionReason(
             for: answer,
             evidence: claimEvidence,
             workspaceID: evidence.first?.workspaceID
-        ) == nil else {
+        )
+        guard claimRejection == nil else {
             return false
         }
         let normalized = answer.lowercased()
@@ -5775,20 +7858,16 @@ actor RuntimeKernel {
         workspaceID: UUID,
         taskID: UUID?,
         summary: String,
-        payload: [String: String]
+        payload: [String: String],
+        eventID requestedEventID: UUID? = nil,
+        initialTask: FDETask? = nil
     ) async throws -> ExecutionEvent {
-        if !sequenceInitialized {
-            sequence = try await persistence.loadMaxEventSequence()
-            sequenceInitialized = true
-        }
-
-        let nextSequence = sequence + 1
         let parentEventID: UUID? = if let taskID {
             lastEventIDByTask[taskID]
         } else {
             lastEventIDByWorkspace[workspaceID]
         }
-        let eventID = UUID()
+        let eventID = requestedEventID ?? UUID()
         let timestamp = Date()
         var enrichedPayload = payload
         enrichedPayload["event_id"] = eventID.uuidString
@@ -5818,20 +7897,23 @@ actor RuntimeKernel {
             correlationID: taskID?.uuidString ?? workspaceID.uuidString
         )
 
-        let event = ExecutionEvent(
+        let pendingEvent = ExecutionEvent(
             id: eventID,
             parentEventID: parentEventID,
             workspaceID: workspaceID,
             taskID: taskID,
             type: type,
-            sequence: nextSequence,
+            sequence: 0,
             timestamp: timestamp,
             summary: summary,
             payload: enrichedPayload,
             metadata: metadata
         )
-        try await persistence.appendEvent(event)
-        sequence = nextSequence
+        let event = try await persistence.appendEvent(
+            pendingEvent,
+            mode: .live,
+            initialTask: initialTask
+        )
         if let taskID {
             lastEventIDByTask[taskID] = event.id
         }

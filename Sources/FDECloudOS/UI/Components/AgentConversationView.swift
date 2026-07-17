@@ -9,7 +9,10 @@ struct AgentConversationView: View {
     var showsHeader = true
     let onApprove: (ApprovalRequest) -> Void
     let onReject: (ApprovalRequest) -> Void
+    var onRequestChanges: ((ApprovalRequest, String) -> Void)? = nil
     let onSelectOption: (UUID, String) -> Void
+    var onCandidatePatchRevert: ((CandidatePatchActivitySnapshot) -> Void)? = nil
+    var onCandidatePatchDestroySandbox: ((CandidatePatchActivitySnapshot) -> Void)? = nil
 
     private var displayItems: [AgentConversationDisplayItem] {
         AgentConversationWorkUnitAdapter.displayItems(
@@ -47,7 +50,11 @@ struct AgentConversationView: View {
                 }
 
                 if let activity, activity.kind.isVisible {
-                    AgentConversationActivityRow(activity: activity)
+                    AgentConversationActivityRow(
+                        activity: activity,
+                        onCandidatePatchRevert: onCandidatePatchRevert,
+                        onCandidatePatchDestroySandbox: onCandidatePatchDestroySandbox
+                    )
                 }
             }
 
@@ -59,7 +66,8 @@ struct AgentConversationView: View {
                 AgentConversationApprovalView(
                     approvals: approvals,
                     onApprove: onApprove,
-                    onReject: onReject
+                    onReject: onReject,
+                    onRequestChanges: onRequestChanges
                 )
             }
         }
@@ -71,6 +79,8 @@ struct AgentConversationView: View {
 private struct AgentConversationActivityRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let activity: AgentConversationActivity
+    let onCandidatePatchRevert: ((CandidatePatchActivitySnapshot) -> Void)?
+    let onCandidatePatchDestroySandbox: ((CandidatePatchActivitySnapshot) -> Void)?
     @State private var pulses = false
 
     var body: some View {
@@ -110,6 +120,14 @@ private struct AgentConversationActivityRow: View {
             if let sandbox = activity.metadata.sandbox {
                 SandboxStatusCard(snapshot: sandbox)
             }
+
+            if let candidatePatch = activity.metadata.candidatePatch {
+                CandidatePatchStatusCard(
+                    snapshot: candidatePatch,
+                    onRevert: onCandidatePatchRevert,
+                    onDestroySandbox: onCandidatePatchDestroySandbox
+                )
+            }
         }
         .frame(maxWidth: 680, alignment: .leading)
         .accessibilityElement(children: .ignore)
@@ -123,9 +141,9 @@ private struct AgentConversationActivityRow: View {
     private var tint: Color {
         switch activity.kind {
         case .failed: return .red
-        case .blocked, .sandboxCreationBlocked: return .orange
+        case .blocked, .sandboxCreationBlocked, .candidatePatchBlocked: return .orange
         case .partial: return .teal
-        case .completed, .sandboxReady: return .green
+        case .completed, .sandboxReady, .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed: return .green
         default: return .accentColor
         }
     }
@@ -133,9 +151,9 @@ private struct AgentConversationActivityRow: View {
     private var terminalSymbol: String {
         switch activity.kind {
         case .failed: return "xmark"
-        case .blocked, .sandboxCreationBlocked: return "exclamationmark"
+        case .blocked, .sandboxCreationBlocked, .candidatePatchBlocked: return "exclamationmark"
         case .partial: return "circle.lefthalf.filled"
-        case .completed, .sandboxReady: return "checkmark"
+        case .completed, .sandboxReady, .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed: return "checkmark"
         default: return "circle.fill"
         }
     }
@@ -153,6 +171,113 @@ private struct AgentConversationActivityRow: View {
         }
         withAnimation(.easeInOut(duration: 0.85).repeatForever(autoreverses: true)) {
             pulses = true
+        }
+    }
+}
+
+private struct CandidatePatchStatusCard: View {
+    let snapshot: CandidatePatchActivitySnapshot
+    let onRevert: ((CandidatePatchActivitySnapshot) -> Void)?
+    let onDestroySandbox: ((CandidatePatchActivitySnapshot) -> Void)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Candidate Patch")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 116), spacing: 8)],
+                alignment: .leading,
+                spacing: 8
+            ) {
+                metric("Patch ID", abbreviated(snapshot.patchID), color: .accentColor)
+                metric("Sandbox ID", abbreviated(snapshot.sandboxID), color: .accentColor)
+                metric(
+                    "Status",
+                    snapshot.projectionState?.rawValue
+                        ?? snapshot.status?.rawValue.uppercased()
+                        ?? "PLANNING",
+                    color: statusColor
+                )
+                metric("Files planned", String(snapshot.filesPlanned), color: .secondary)
+                metric("Files changed", String(snapshot.filesChanged), color: .secondary)
+                metric("Add / delete", "+\(snapshot.additions) / -\(snapshot.deletions)", color: .secondary)
+                metric("Risk", snapshot.risk?.rawValue ?? "UNKNOWN", color: riskColor)
+                metric("Evidence", String(snapshot.evidenceCount), color: .secondary)
+                metric("Source", snapshot.sourceIntegrity?.rawValue.uppercased() ?? "UNKNOWN", color: sourceColor)
+                metric("Approval", snapshot.approvalState?.rawValue ?? "PENDING", color: .purple)
+            }
+            if canRevert, let onRevert {
+                Button {
+                    onRevert(snapshot)
+                } label: {
+                    Label("Revert Candidate Patch", systemImage: "arrow.uturn.backward.circle")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                .accessibilityIdentifier("candidatePatch.revert.openConfirmation")
+            }
+            if canDestroySandbox, let onDestroySandbox {
+                Button(role: .destructive) {
+                    onDestroySandbox(snapshot)
+                } label: {
+                    Label("Destroy reverted Sandbox", systemImage: "trash")
+                }
+                .accessibilityIdentifier("candidatePatch.destroySandbox.openConfirmation")
+            }
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.7)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var statusColor: Color {
+        switch snapshot.status {
+        case .reviewReady, .applied, .reverted: .green
+        case .rejected, .invalid, .stale: .orange
+        default: .accentColor
+        }
+    }
+
+    private var canRevert: Bool {
+        snapshot.projectionState == .patchReady
+            || snapshot.projectionState == .revertConfirmationRequired
+            || snapshot.status == .reviewReady
+            || snapshot.status == .applied
+    }
+
+    private var canDestroySandbox: Bool {
+        guard snapshot.projectionState != .sandboxDestroyed else { return false }
+        return snapshot.projectionState == .reverted
+            || snapshot.projectionState == .sandboxDestructionConfirmationRequired
+            || snapshot.status == .reverted
+    }
+
+    private var riskColor: Color {
+        switch snapshot.risk {
+        case .high: .red
+        case .medium: .orange
+        default: .green
+        }
+    }
+
+    private var sourceColor: Color {
+        snapshot.sourceIntegrity == .unchanged ? .green : .orange
+    }
+
+    private func abbreviated(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "—" }
+        return value.count > 12 ? "\(value.prefix(12))…" : value
+    }
+
+    private func metric(_ label: String, _ value: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            Text(value).font(.caption.weight(.semibold)).foregroundStyle(color).lineLimit(1)
         }
     }
 }
@@ -821,6 +946,8 @@ private struct AgentConversationApprovalView: View {
     let approvals: [ApprovalRequest]
     let onApprove: (ApprovalRequest) -> Void
     let onReject: (ApprovalRequest) -> Void
+    let onRequestChanges: ((ApprovalRequest, String) -> Void)?
+    @State private var revisionInstructions: [UUID: String] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -829,6 +956,7 @@ private struct AgentConversationApprovalView: View {
                 .foregroundStyle(.purple)
 
             ForEach(approvals) { approval in
+                VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .top, spacing: 10) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(approval.action.capitalized)
@@ -838,6 +966,18 @@ private struct AgentConversationApprovalView: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
                             .textSelection(.enabled)
+                        if let plan = approval.metadata["candidate_patch_plan_summary"],
+                           !plan.isEmpty {
+                            ScrollView {
+                                Text(plan)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .textSelection(.enabled)
+                            }
+                            .frame(maxHeight: 240)
+                            .padding(.top, 4)
+                        }
                     }
                     Spacer()
                     Button {
@@ -845,12 +985,52 @@ private struct AgentConversationApprovalView: View {
                     } label: {
                         Label("Reject", systemImage: "xmark.shield")
                     }
+                    .accessibilityLabel("Reject Candidate Patch plan")
+                    .accessibilityIdentifier(
+                        approval.targetKind == .candidatePatchPlan
+                            ? "candidatePatch.reject"
+                            : "approval.reject"
+                    )
                     Button {
                         onApprove(approval)
                     } label: {
                         Label("Approve", systemImage: "checkmark.shield")
                     }
                     .buttonStyle(.borderedProminent)
+                    .accessibilityLabel("Approve Candidate Patch plan")
+                    .accessibilityIdentifier(
+                        approval.targetKind == .candidatePatchPlan
+                            ? "candidatePatch.approve.openConfirmation"
+                            : "approval.approve"
+                    )
+                    .focusable(approval.targetKind != .candidatePatchPlan)
+                }
+                    if approval.targetKind == .candidatePatchPlan, let onRequestChanges {
+                        HStack(spacing: 8) {
+                            TextField(
+                                "Describe the required Candidate Patch revision",
+                                text: Binding(
+                                    get: { revisionInstructions[approval.id, default: ""] },
+                                    set: { revisionInstructions[approval.id] = $0 }
+                                )
+                            )
+                            Button {
+                                onRequestChanges(
+                                    approval,
+                                    revisionInstructions[approval.id, default: ""]
+                                )
+                            } label: {
+                                Label("Request changes", systemImage: "pencil.and.list.clipboard")
+                            }
+                            .accessibilityLabel("Request Candidate Patch plan changes")
+                            .accessibilityIdentifier("candidatePatch.requestChanges")
+                            .disabled(
+                                revisionInstructions[approval.id, default: ""]
+                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                                    .isEmpty
+                            )
+                        }
+                    }
                 }
                 .padding(10)
                 .background(Color.purple.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
@@ -1074,15 +1254,20 @@ extension AgentConversationActivity {
         case .idle: return "Idle"
         case .thinking: return "Thinking"
         case .preparingTask, .compilingContext: return "Understanding"
-        case .planning, .repairingPlan, .validatingPlan: return "Planning"
+        case .planning, .repairingPlan, .validatingPlan, .preparingCandidatePatch: return "Planning"
+        case .waitingCandidatePatchApproval: return "Waiting For Approval"
         case .inspectingProject, .listingDirectory, .searchingFiles, .searchingCode,
              .readingFile, .analyzingEvidence, .validatingLegacySource,
              .confirmingCanonicalLegacyRoot, .checkingLocalSourceAvailability, .creatingSourceSnapshot,
              .creatingIsolatedSandbox, .copyingApprovedSourceFiles, .excludingSensitiveFiles,
-             .destroyingSandbox: return "Working"
+             .destroyingSandbox, .applyingCandidatePatch, .revertingCandidatePatch: return "Working"
         case .verifyingFileHashes, .checkingPathContainment, .confirmingSourceIsolation,
-             .confirmingOriginalLegacyUnchanged, .finalizingSandboxAcceptance:
+             .confirmingOriginalLegacyUnchanged, .finalizingSandboxAcceptance, .buildingUnifiedDiff:
             return "Verifying"
+        case .candidatePatchReady: return "Candidate Patch Ready"
+        case .candidatePatchReverted: return "Candidate Patch Reverted"
+        case .sandboxDestroyed: return "Sandbox Destroyed"
+        case .candidatePatchBlocked: return "Blocked"
         case .sandboxReady: return "Sandbox Ready"
         case .sandboxCreationBlocked: return "Blocked"
         case .preparingFinalAnswer, .preparingPartialAnswer: return "Verifying"
@@ -1097,21 +1282,24 @@ extension AgentConversationActivity {
     var conversationColor: Color {
         switch kind {
         case .idle: return .secondary
-        case .thinking, .preparingTask, .compilingContext, .planning, .repairingPlan, .validatingPlan:
+        case .thinking, .preparingTask, .compilingContext, .planning, .repairingPlan, .validatingPlan,
+             .preparingCandidatePatch:
             return .accentColor
+        case .waitingCandidatePatchApproval:
+            return .purple
         case .inspectingProject, .listingDirectory, .searchingFiles, .searchingCode,
              .readingFile, .analyzingEvidence, .validatingLegacySource,
              .confirmingCanonicalLegacyRoot, .checkingLocalSourceAvailability, .creatingSourceSnapshot,
              .creatingIsolatedSandbox, .copyingApprovedSourceFiles, .excludingSensitiveFiles,
-             .destroyingSandbox:
+             .destroyingSandbox, .applyingCandidatePatch, .revertingCandidatePatch:
             return .blue
         case .preparingFinalAnswer, .preparingPartialAnswer, .verifyingFileHashes,
              .checkingPathContainment, .confirmingSourceIsolation,
-             .confirmingOriginalLegacyUnchanged, .finalizingSandboxAcceptance:
+             .confirmingOriginalLegacyUnchanged, .finalizingSandboxAcceptance, .buildingUnifiedDiff:
             return .teal
-        case .sandboxReady:
+        case .sandboxReady, .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed:
             return .green
-        case .sandboxCreationBlocked:
+        case .sandboxCreationBlocked, .candidatePatchBlocked:
             return .orange
         case .retryingProvider:
             return .purple

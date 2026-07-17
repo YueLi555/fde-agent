@@ -7,6 +7,7 @@ enum AIIntegrationAssessmentLayer {
 
 enum AIAgentCapabilityKind: String, Codable, CaseIterable, Hashable, Sendable {
     case unspecified = "unspecified_ai_agent"
+    case customerSupportOrderLookup = "customer_support_order_lookup"
     case customerSupport = "customer_support_agent"
     case sales = "sales_agent"
     case workflowAutomation = "workflow_automation_agent"
@@ -17,6 +18,7 @@ enum AIAgentCapabilityKind: String, Codable, CaseIterable, Hashable, Sendable {
     var displayName: String {
         switch self {
         case .unspecified: return "Unspecified AI Agent"
+        case .customerSupportOrderLookup: return "Customer Support AI Agent — Read-only Order Lookup"
         case .customerSupport: return "Customer Support Agent"
         case .sales: return "Sales Agent"
         case .workflowAutomation: return "Workflow Automation Agent"
@@ -28,7 +30,21 @@ enum AIAgentCapabilityKind: String, Codable, CaseIterable, Hashable, Sendable {
 
     init(request: String) {
         let value = request.lowercased()
-        if Self.containsAny(value, ["customer support", "customer service", "support agent", "客服"]) {
+        let customerSupport = Self.containsAny(
+            value,
+            ["customer support", "customer-support", "customer service", "support agent", "客服", "客户支持", "客户服务"]
+        )
+        let orderLookup = Self.containsAny(
+            value,
+            [
+                "order query", "order-query", "order lookup", "order-lookup", "look up order",
+                "lookup order", "query order", "read order", "order status", "订单查询", "查询订单",
+                "查订单", "订单查找", "读取订单", "订单状态"
+            ]
+        )
+        if customerSupport && orderLookup {
+            self = .customerSupportOrderLookup
+        } else if customerSupport {
             self = .customerSupport
         } else if Self.containsAny(value, ["sales", "crm", "销售"]) {
             self = .sales
@@ -56,6 +72,7 @@ enum LegacyArchitectureCapability: String, Codable, CaseIterable, Hashable, Send
     case customerHistory = "customer_history"
     case authenticationBoundary = "authentication_boundary"
     case permissionModel = "permission_model"
+    case recordLevelAuthorization = "record_level_authorization"
     case apiServiceLayer = "api_service_layer"
     case databaseAccess = "database_access"
     case knowledgeSource = "knowledge_source"
@@ -65,6 +82,8 @@ enum LegacyArchitectureCapability: String, Codable, CaseIterable, Hashable, Send
     case businessActionAPI = "business_action_api"
     case approvalMechanism = "approval_mechanism"
     case auditLogging = "audit_logging"
+    case readOnlyMutationBoundary = "read_only_mutation_boundary"
+    case sensitiveResponseFieldControls = "sensitive_response_field_controls"
     case frontendSurface = "frontend_surface"
     case sourceCodeAccess = "source_code_access"
 
@@ -88,6 +107,7 @@ struct AgentCapabilityProfile: Codable, Hashable, Sendable {
     var proposesWriteAccess: Bool
 
     var name: String { kind.displayName }
+    var normalizedCapabilityID: String { kind.rawValue }
 
     static func detect(from request: String) -> AgentCapabilityProfile {
         profile(for: AIAgentCapabilityKind(request: request))
@@ -129,6 +149,21 @@ struct AgentCapabilityProfile: Codable, Hashable, Sendable {
                     requirement(.apiServiceLayer, "Mediate access without direct database connectivity."),
                     requirement(.knowledgeSource, critical: false, "Ground support answers in approved content."),
                     requirement(.permissionModel, "Limit each user and agent to permitted records.")
+                ],
+                proposesWriteAccess: false
+            )
+        case .customerSupportOrderLookup:
+            return AgentCapabilityProfile(
+                kind: kind,
+                requiredCapabilities: [
+                    requirement(.orderData, "Expose a bounded read-only order data contract."),
+                    requirement(.apiServiceLayer, "Mediate order lookup through a stable API or service boundary."),
+                    requirement(.authenticationBoundary, "Bind every order lookup to an authenticated identity."),
+                    requirement(.recordLevelAuthorization, "Authorize access to the requested customer or order record."),
+                    requirement(.permissionModel, "Restrict lookup to an approved support role and scope."),
+                    requirement(.auditLogging, "Record customer-order access without sensitive payloads."),
+                    requirement(.readOnlyMutationBoundary, "Keep the requested integration read-only and identify mutation paths."),
+                    requirement(.sensitiveResponseFieldControls, "Return only approved order response fields.")
                 ],
                 proposesWriteAccess: false
             )
@@ -446,23 +481,30 @@ struct LegacyArchitecture: Codable, Hashable, Sendable {
                 ? .extractedConfiguration
                 : .inspectedFile
 
+            func reference(_ fact: String) -> AssessmentEvidenceReference {
+                AssessmentEvidenceReference(
+                    source: source,
+                    path: item.targetPath,
+                    fact: fact,
+                    claimLevel: level,
+                    observationStatus: .directlyRead,
+                    sourceComponent: Self.sourceComponent(for: item.targetPath),
+                    safeEvidenceSummary: fact,
+                    lineRange: Self.lineRange(for: item.output),
+                    fileHash: Self.sha256(item.output),
+                    workspaceSnapshotIdentifier: Self.snapshotIdentifier(for: item.workspaceID),
+                    relatedToolEventID: item.toolResultEventID
+                )
+            }
             func add(_ capability: LegacyArchitectureCapability, _ fact: String) {
-                derived.append(
-                    LegacyArchitectureSignal(
+                derived.append(LegacyArchitectureSignal(capability: capability, evidence: reference(fact)))
+            }
+            func addAbsence(_ capability: LegacyArchitectureCapability, _ reason: String) {
+                derivedAbsences.append(
+                    LegacyArchitectureAbsence(
                         capability: capability,
-                        evidence: AssessmentEvidenceReference(
-                            source: source,
-                            path: item.targetPath,
-                            fact: fact,
-                            claimLevel: level,
-                            observationStatus: .directlyRead,
-                            sourceComponent: Self.sourceComponent(for: item.targetPath),
-                            safeEvidenceSummary: fact,
-                            lineRange: Self.lineRange(for: item.output),
-                            fileHash: Self.sha256(item.output),
-                            workspaceSnapshotIdentifier: Self.snapshotIdentifier(for: item.workspaceID),
-                            relatedToolEventID: item.toolResultEventID
-                        )
+                        reason: reason,
+                        evidence: [reference(reason)]
                     )
                 )
             }
@@ -478,11 +520,15 @@ struct LegacyArchitecture: Codable, Hashable, Sendable {
                 || Self.containsAny(content, ["router.get", "router.post", "app.get(", "app.post(", "@getmapping", "@postmapping", "fastapi("])) {
                 add(.apiServiceLayer, "A service or API boundary is present.")
             }
+            if (isSourceFile && content.contains("export function") && content.contains("order"))
+                || (!isSourceFile && Self.containsAny(content, ["read-only order route", "order service boundary"])) {
+                add(.apiServiceLayer, "A bounded order service or route boundary is present.")
+            }
             if isSourceFile && Self.containsAny(path, ["auth", "session", "identity", "middleware"])
                 && Self.containsAny(content, ["auth", "session", "jwt", "oauth", "principal", "identity"]) {
                 add(.authenticationBoundary, "Authentication or identity handling is present.")
             }
-            if isSourceFile && (Self.containsAny(content, ["permission", "authorize", "authorise", "rbac", "accesscontrol", "requiredrole", "canaccess"])
+            if isSourceFile && (Self.containsAny(content, ["permission", "authorize", "authorise", "rbac", "accesscontrol", "requiredrole", "requirerole", "canaccess"])
                 || path.contains("permission")) {
                 add(.permissionModel, "Authorization or permission checks are present.")
             }
@@ -506,6 +552,28 @@ struct LegacyArchitecture: Codable, Hashable, Sendable {
             if (isSourceFile || isDatabaseSchema) && (content.contains("order")
                 || facts.modelNames.contains(where: { $0.lowercased().contains("order") })) {
                 add(.orderData, "Order data structures are present.")
+            }
+            if isSourceFile,
+               content.contains("listcustomerorders"),
+               content.contains("requirerole"),
+               content.contains("customerid"),
+               !Self.containsAny(content, ["principal.subject === customerid", "principal.subject == customerid", "canreadcustomer", "authorizeorder", "authoriseorder"]) {
+                addAbsence(
+                    .recordLevelAuthorization,
+                    "The inspected order lookup enforces a support role but does not bind the requested customer record to the authenticated principal."
+                )
+            }
+            if isSourceFile,
+               content.contains("ordersummary"),
+               content.contains("customerid"),
+               !Self.containsAny(content, ["redact", "publicordersummary", "allowedfields", "field policy"]) {
+                addAbsence(
+                    .sensitiveResponseFieldControls,
+                    "The inspected order response includes customerID and no field-redaction or response allowlist control is present in that boundary."
+                )
+            }
+            if Self.containsAny(content, ["outboundactionsenabled\": false", "outboundactionsenabled: false", "no business-action api", "read-only order route"]) {
+                add(.readOnlyMutationBoundary, "The inspected configuration or architecture keeps outbound business actions disabled and the order path read-only.")
             }
             if Self.containsAny(content, ["salesforce", "hubspot", "dynamics crm", "crm"])
                 || facts.dependencyFacts.contains(where: { $0.lowercased().contains("salesforce") || $0.lowercased().contains("hubspot") }) {
@@ -543,6 +611,35 @@ struct LegacyArchitecture: Codable, Hashable, Sendable {
 
     func absence(for capability: LegacyArchitectureCapability) -> LegacyArchitectureAbsence? {
         confirmedAbsences.first { $0.capability == capability }
+    }
+
+    func boundedInvestigationEvidence(for capability: LegacyArchitectureCapability) -> [AssessmentEvidenceReference] {
+        let relevant: (String) -> Bool = { rawPath in
+            let path = rawPath.lowercased()
+            switch capability {
+            case .orderData:
+                return path.contains("order") || path.contains("architecture")
+            case .apiServiceLayer:
+                return path.contains("order") || path.contains("route") || path.contains("architecture")
+            case .authenticationBoundary, .permissionModel:
+                return path.contains("auth") || path.contains("order") || path.contains("architecture")
+            case .recordLevelAuthorization:
+                return path.contains("auth") || path.contains("order") || path.contains("architecture")
+            case .auditLogging:
+                return path.contains("audit") || path.contains("architecture") || path.contains("config")
+            case .readOnlyMutationBoundary:
+                return path.contains("order") || path.contains("architecture") || path.contains("config")
+            case .sensitiveResponseFieldControls:
+                return path.contains("order") || path.contains("architecture") || path.contains("config")
+            default:
+                return false
+            }
+        }
+        return Self.uniqueEvidence(
+            evidenceRecords.filter {
+                $0.observationStatus == .directlyRead && relevant($0.path)
+            }
+        )
     }
 
     var isDatabaseOnly: Bool {
@@ -933,6 +1030,7 @@ struct AIAssessmentActivitySnapshot: Codable, Hashable, Sendable {
 
 struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
     var assessmentLayerID: String
+    var responseLanguage: ReadOnlyResponseLanguage
     var executiveSummary: AssessmentClaim
     var legacySystemUnderstanding: [AssessmentClaim]
     var requestedAICapability: AgentCapabilityProfile
@@ -967,6 +1065,14 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
     }
 
     func markdown() -> String {
+        markdown(language: responseLanguage)
+    }
+
+    func markdown(language: ReadOnlyResponseLanguage) -> String {
+        language == .chinese ? chineseMarkdown() : englishMarkdown()
+    }
+
+    private func englishMarkdown() -> String {
         var lines: [String] = [
             "# FDE AI Integration Assessment Report",
             "",
@@ -983,18 +1089,15 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
             "",
             "## 3. Requested AI Capability",
             "",
-            "\(requestedAICapability.name). Required capabilities: \(requestedAICapability.requiredCapabilities.map { $0.capability.displayName }.joined(separator: ", ")).",
+            "- Normalized capability ID: `\(requestedAICapability.normalizedCapabilityID)`",
+            "- Display label: \(requestedAICapability.name)",
+            "- Required capabilities: \(requestedAICapability.requiredCapabilities.map { $0.capability.displayName }.joined(separator: ", "))",
             "",
             "## 4. Compatibility Matrix",
-            "",
-            "| Requirement | Status | Evidence / Unknown |",
-            "|---|---|---|"
+            ""
         ]
-        for entry in compatibilityMatrix.entries {
-            let support = entry.claim.evidence.isEmpty
-                ? entry.claim.unknowns.joined(separator: "; ")
-                : entry.claim.evidence.map(\.path).joined(separator: ", ")
-            lines.append("| \(entry.requirement.capability.displayName) | \(entry.status.rawValue) | \(support) |")
+        for (index, entry) in compatibilityMatrix.entries.enumerated() {
+            lines += matrixCard(entry, index: index + 1, language: .english)
         }
         lines += ["", "## 5. Integration Opportunities", ""]
         if integrationOpportunities.isEmpty {
@@ -1088,9 +1191,182 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
         return lines.joined(separator: "\n")
     }
 
+    private func chineseMarkdown() -> String {
+        let conclusion: String
+        switch verdict {
+        case .yes:
+            conclusion = "静态证据确认了所有必要边界；仍需在后续获批阶段进行运行时验证。"
+        case .partial:
+            conclusion = "已确认部分可支持能力，但仍有被阻断或调查后仍未知的关键要求，当前只能提出受限的只读接入方案。"
+        case .no:
+            conclusion = "现有证据未形成可安全推进的完整接入机会，必须先解决已确认的阻断项。"
+        }
+        var lines: [String] = [
+            "# FDE AI 接入评估报告",
+            "",
+            "## 1. 执行摘要",
+            "",
+            "**\(verdict.rawValue)** — \(conclusion)",
+            claimDetails(executiveSummary, language: .chinese),
+            "",
+            "## 2. Legacy 系统理解",
+            ""
+        ]
+        if legacySystemUnderstanding.isEmpty {
+            lines.append("- 尚无可确认的 Legacy 能力。")
+        } else {
+            lines.append(contentsOf: legacySystemUnderstanding.flatMap { claim in
+                ["- 已确认静态能力：\(claim.evidence.map(\.path).joined(separator: ", "))", "  \(claimDetails(claim, language: .chinese))"]
+            })
+        }
+        lines += [
+            "",
+            "## 3. 请求的 AI 能力",
+            "",
+            "- 规范化能力 ID：`\(requestedAICapability.normalizedCapabilityID)`",
+            "- 显示名称：\(requestedAICapability.name)",
+            "- 明确要求：\(requestedAICapability.requiredCapabilities.map { $0.capability.displayName }.joined(separator: ", "))",
+            "",
+            "## 4. 兼容性矩阵",
+            ""
+        ]
+        for (index, entry) in compatibilityMatrix.entries.enumerated() {
+            lines += matrixCard(entry, index: index + 1, language: .chinese)
+        }
+        lines += ["", "## 5. 接入机会", ""]
+        if integrationOpportunities.isEmpty {
+            lines.append("- 当前没有证据充分的受支持接入机会。")
+        } else {
+            lines.append(contentsOf: integrationOpportunities.map { opportunity in
+                "- **\(opportunity.feature)**：\(opportunity.possibleIntegration.joined(separator: " → "))；置信度 \(opportunity.confidence.rawValue)；证据 \(evidenceList(opportunity.evidence))."
+            })
+        }
+        lines += [
+            "",
+            "## 6. 安全评估",
+            "",
+            "- 数据访问风险：\(securityAssessment.dataAccessRisk.rawValue)",
+            "- 权限风险：\(securityAssessment.permissionRisk.rawValue)",
+            "- 修改风险：\(securityAssessment.modificationRisk.rawValue)",
+            "- 在推进实现或扩大影响前需要人工批准：\(securityAssessment.humanApprovalRequired ? "YES" : "NO")",
+            "",
+            "## 7. 接入阻断项",
+            ""
+        ]
+        if integrationBlockers.blockers.isEmpty {
+            lines.append("- 当前静态证据中没有已确认或未解决的关键阻断项。")
+        } else {
+            lines.append(contentsOf: integrationBlockers.blockers.map { blocker in
+                "- [\(blocker.category.rawValue)] **\(blocker.severity.rawValue)** — \(blocker.requirement.displayName)：\(blocker.reason) 证据：\(evidenceList(blocker.claim.evidence))。"
+            })
+        }
+        lines += [
+            "",
+            "## 8. 推荐架构",
+            "",
+            recommendedArchitecture.dataFlow.joined(separator: " → "),
+            "",
+            "仅建议使用经过身份认证、权限过滤且保持只读的服务边界；不得让 Agent 直接连接数据库或执行 Legacy 修改。",
+            "",
+            "## 9. 验证测试计划",
+            "",
+            "以下测试仅生成，未执行。"
+        ]
+        lines.append(contentsOf: validationTestPlan.tests.map { "- **\($0.name)**：\($0.purpose)；预期：\($0.expectedResult)" })
+        lines += ["", "## 10. 未知项与下一步调查", ""]
+        if unknownsAndNextInvestigationSteps.isEmpty {
+            lines.append("- 未记录额外未知项。")
+        } else {
+            lines.append(contentsOf: unknownsAndNextInvestigationSteps.map { "- \($0)" })
+        }
+        lines += [
+            "",
+            "## 11. 建议的运行流程",
+            "",
+            "该流程仅为静态建议，尚未经过运行时验证。"
+        ]
+        lines.append(contentsOf: expectedAgentWorkflows.map { workflow in
+            "- **\(workflow.capability)** [\(workflow.verificationStatus.rawValue)]：先完成身份认证与记录级授权，再通过只读 Legacy 服务调用；缺少任一边界时必须失败关闭。禁止：\(workflow.prohibitedActions.joined(separator: ", "))。"
+        })
+        lines += ["", "## 12. 预期运行结果", ""]
+        lines.append(contentsOf: expectedOperationalOutcomes.map { outcome in
+            "- **\(outcome.capability)**：\(outcome.compatibility.rawValue)；仍受阻：\(outcome.remainsBlocked.joined(separator: "; "))。"
+        })
+        lines += [
+            "",
+            "## 13. Legacy 阻断与 Agent 固有不确定性",
+            "",
+            "Legacy 阻断必须由已检查证据支持；Agent 固有不确定性不能被误写成 Legacy 事实。"
+        ]
+        lines.append(contentsOf: agentBlackBoxAssessment.legacySideBlockers.map { finding in
+            "- Legacy [\(finding.category.rawValue)] **\(finding.severity.rawValue)** — \(finding.description)；证据：\(evidenceList(finding.evidence))。"
+        })
+        lines.append(contentsOf: agentBlackBoxAssessment.agentSideBlackBoxes.map { finding in
+            "- Agent [\(finding.category.rawValue)] **\(finding.severity.rawValue)** — 固有不确定性；缓解措施：\(finding.mitigation)"
+        })
+        lines += ["", "## 14. 证据来源", ""]
+        if evidenceRecords.isEmpty {
+            lines.append("- 没有可用的实质性 Legacy 证据记录。")
+        } else {
+            lines.append(contentsOf: evidenceRecords.map { evidence in
+                "- \(evidence.id) | path=\(evidence.path) | maturity=\(evidence.claimLevel?.rawValue ?? "not_applicable") | status=\(evidence.observationStatus.rawValue) | component=\(evidence.sourceComponent)"
+            })
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func matrixCard(
+        _ entry: CompatibilityMatrixEntry,
+        index: Int,
+        language: ReadOnlyResponseLanguage
+    ) -> [String] {
+        let unknown = entry.claim.unknowns.isEmpty
+            ? (language == .chinese ? "无" : "None recorded")
+            : entry.claim.unknowns.joined(separator: "; ")
+        if language == .chinese {
+            return [
+                "### 4.\(index) \(entry.requirement.capability.displayName)",
+                "",
+                "- 要求：\(entry.requirement.rationale)",
+                "- 状态：**\(entry.status.rawValue)**",
+                "- 证据：\(evidenceList(entry.claim.evidence))",
+                "- 证据声明 ID：`\(entry.claim.claimID)`",
+                "- 置信度：\(entry.claim.confidence.rawValue)",
+                "- 剩余未知：\(unknown)",
+                ""
+            ]
+        }
+        return [
+            "### 4.\(index) \(entry.requirement.capability.displayName)",
+            "",
+            "- Requirement: \(entry.requirement.rationale)",
+            "- Status: **\(entry.status.rawValue)**",
+            "- Evidence: \(evidenceList(entry.claim.evidence))",
+            "- Evidence claim ID: `\(entry.claim.claimID)`",
+            "- Confidence: \(entry.claim.confidence.rawValue)",
+            "- Remaining unknown: \(unknown)",
+            ""
+        ]
+    }
+
+    private func evidenceList(_ evidence: [AssessmentEvidenceReference]) -> String {
+        evidence.isEmpty
+            ? (responseLanguage == .chinese ? "无直接证据" : "No direct evidence")
+            : evidence.map { "`\($0.id)` (\($0.path))" }.joined(separator: ", ")
+    }
+
     private func claimDetails(_ claim: AssessmentClaim) -> String {
+        claimDetails(claim, language: responseLanguage)
+    }
+
+    private func claimDetails(_ claim: AssessmentClaim, language: ReadOnlyResponseLanguage) -> String {
         let evidence = claim.evidence.isEmpty ? "none confirmed" : claim.evidence.map(\.path).joined(separator: ", ")
         let unknowns = claim.unknowns.isEmpty ? "none recorded" : claim.unknowns.joined(separator: "; ")
+        if language == .chinese {
+            let localizedEvidence = claim.evidence.isEmpty ? "无直接证据" : claim.evidence.map(\.path).joined(separator: ", ")
+            let localizedUnknowns = claim.unknowns.isEmpty ? "无" : unknowns
+            return "证据声明 ID：\(claim.claimID)。证据路径：\(localizedEvidence)。置信度：\(claim.confidence.rawValue)。剩余未知：\(localizedUnknowns)。运行时/构建/测试：\(claim.verificationStatus.runtime.rawValue)/\(claim.verificationStatus.build.rawValue)/\(claim.verificationStatus.test.rawValue)。"
+        }
         return "Claim ID: \(claim.claimID). Evidence: \(evidence). Confidence: \(claim.confidence.rawValue). Unknown: \(unknowns). Runtime: \(claim.verificationStatus.runtime.rawValue). Build: \(claim.verificationStatus.build.rawValue). Test: \(claim.verificationStatus.test.rawValue)."
     }
 
@@ -1103,18 +1379,189 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
     }
 }
 
+enum AssessmentSemanticConsistencyIssue: String, Codable, CaseIterable, Hashable, Sendable {
+    case partialWithoutSupportedEvidence = "partial_without_supported_evidence"
+    case partialWithoutUnresolvedRequirement = "partial_without_unresolved_requirement"
+    case partialWithoutIntegrationOpportunity = "partial_without_integration_opportunity"
+    case unresolvedAuthorizationWithoutBlocker = "unresolved_authorization_without_blocker"
+    case unknownMaterialRequirementWithoutBlocker = "unknown_material_requirement_without_blocker"
+    case noApprovalDespiteUnresolvedImpact = "no_approval_despite_unresolved_impact"
+    case verdictWithoutEvidenceClaims = "verdict_without_evidence_claims"
+    case supportedRequirementWithoutEvidence = "supported_requirement_without_evidence"
+}
+
+struct AssessmentSemanticConsistencyValidation: Hashable, Sendable {
+    var issues: [AssessmentSemanticConsistencyIssue]
+    var isValid: Bool { issues.isEmpty }
+}
+
+enum AssessmentSemanticConsistencyValidator {
+    static func validate(_ report: FDEAIIntegrationAssessmentReport) -> AssessmentSemanticConsistencyValidation {
+        let entries = report.compatibilityMatrix.entries
+        let supported = entries.filter { $0.status == .supported }
+        let unresolved = entries.filter { $0.status != .supported }
+        let usesOrderLookupSafetyProfile = report.requestedAICapability.kind == .customerSupportOrderLookup
+        var issues: [AssessmentSemanticConsistencyIssue] = []
+        if usesOrderLookupSafetyProfile,
+           report.verdict == .partial,
+           (supported.isEmpty || supported.allSatisfy({ $0.claim.evidence.isEmpty })) {
+            issues.append(.partialWithoutSupportedEvidence)
+        }
+        if usesOrderLookupSafetyProfile, report.verdict == .partial, unresolved.isEmpty {
+            issues.append(.partialWithoutUnresolvedRequirement)
+        }
+        if usesOrderLookupSafetyProfile,
+           report.verdict == .partial,
+           report.integrationOpportunities.isEmpty {
+            issues.append(.partialWithoutIntegrationOpportunity)
+        }
+        let authorizationRequirements: Set<LegacyArchitectureCapability> = [
+            .authenticationBoundary, .permissionModel, .recordLevelAuthorization
+        ]
+        let unresolvedAuthorization = entries.filter {
+            authorizationRequirements.contains($0.requirement.capability) && $0.status != .supported
+        }
+        if usesOrderLookupSafetyProfile,
+           unresolvedAuthorization.contains(where: { entry in
+            !report.integrationBlockers.blockers.contains { $0.requirement == entry.requirement.capability }
+        }) {
+            issues.append(.unresolvedAuthorizationWithoutBlocker)
+        }
+        let unknownCritical = entries.filter { $0.requirement.critical && $0.status == .unknown }
+        if usesOrderLookupSafetyProfile,
+           unknownCritical.contains(where: { entry in
+            !report.integrationBlockers.blockers.contains { $0.requirement == entry.requirement.capability }
+        }) {
+            issues.append(.unknownMaterialRequirementWithoutBlocker)
+        }
+        if usesOrderLookupSafetyProfile,
+           !report.securityAssessment.humanApprovalRequired,
+           (!unresolvedAuthorization.isEmpty || report.requestedAICapability.proposesWriteAccess) {
+            issues.append(.noApprovalDespiteUnresolvedImpact)
+        }
+        if usesOrderLookupSafetyProfile,
+           report.verdict != .no,
+           (report.executiveSummary.evidence.isEmpty || report.executiveSummary.claimID.isEmpty) {
+            issues.append(.verdictWithoutEvidenceClaims)
+        }
+        if supported.contains(where: { $0.claim.evidence.isEmpty }) {
+            issues.append(.supportedRequirementWithoutEvidence)
+        }
+        return AssessmentSemanticConsistencyValidation(issues: unique(issues))
+    }
+
+    static func repair(_ input: FDEAIIntegrationAssessmentReport) -> FDEAIIntegrationAssessmentReport {
+        var report = input
+        let entries = report.compatibilityMatrix.entries
+        let supported = entries.filter { $0.status == .supported && !$0.claim.evidence.isEmpty }
+        let unresolved = entries.filter { $0.status != .supported }
+        let usesOrderLookupSafetyProfile = report.requestedAICapability.kind == .customerSupportOrderLookup
+        if usesOrderLookupSafetyProfile {
+            if supported.isEmpty || entries.contains(where: { $0.requirement.critical && $0.status == .blocked }) {
+                report.compatibilityMatrix.verdict = .no
+            } else if unresolved.isEmpty {
+                report.compatibilityMatrix.verdict = .yes
+            } else {
+                report.compatibilityMatrix.verdict = .partial
+            }
+            for entry in entries where entry.requirement.critical && entry.status == .unknown {
+                guard !report.integrationBlockers.blockers.contains(where: { $0.requirement == entry.requirement.capability }) else {
+                    continue
+                }
+                report.integrationBlockers.blockers.append(
+                    IntegrationBlocker(
+                        category: blockerCategory(entry.requirement.capability),
+                        requirement: entry.requirement.capability,
+                        severity: .high,
+                        reason: "Unresolved safety prerequisite: \(entry.claim.statement)",
+                        claim: entry.claim
+                    )
+                )
+            }
+            if report.verdict == .partial, report.integrationOpportunities.isEmpty, !supported.isEmpty {
+                let evidence = uniqueEvidence(supported.flatMap(\.claim.evidence))
+                let claim = AssessmentClaim(
+                    statement: "A supported static subset is confirmed, but unresolved material prerequisites prevent an end-to-end integration claim.",
+                    evidence: evidence,
+                    confidence: .medium,
+                    unknowns: unresolved.map { "\($0.requirement.capability.displayName) remains \($0.status.rawValue)." }
+                )
+                report.integrationOpportunities = [
+                    IntegrationOpportunity(
+                        feature: "Confirmed read-only supported subset",
+                        possibleIntegration: supported.map { $0.requirement.capability.displayName },
+                        confidence: claim.confidence,
+                        evidence: evidence,
+                        claim: claim
+                    )
+                ]
+            }
+        }
+        let unresolvedAuthorization = entries.contains {
+            [.authenticationBoundary, .permissionModel, .recordLevelAuthorization].contains($0.requirement.capability)
+                && $0.status != .supported
+        }
+        if unresolvedAuthorization || report.requestedAICapability.proposesWriteAccess {
+            report.securityAssessment.humanApprovalRequired = true
+        }
+        let summaryEvidence = uniqueEvidence(entries.flatMap(\.claim.evidence))
+        report.executiveSummary = AssessmentClaim(
+            statement: summaryStatement(report.verdict, blockers: report.integrationBlockers.blockers.count),
+            evidence: summaryEvidence,
+            confidence: summaryEvidence.isEmpty ? .unknown : (report.verdict == .yes ? .high : .medium),
+            unknowns: report.unknownsAndNextInvestigationSteps
+        )
+        return report
+    }
+
+    private static func blockerCategory(_ capability: LegacyArchitectureCapability) -> IntegrationBlockerCategory {
+        switch capability {
+        case .authenticationBoundary, .permissionModel, .recordLevelAuthorization,
+             .approvalMechanism, .auditLogging, .sensitiveResponseFieldControls:
+            return .security
+        case .customerData, .orderData, .customerHistory, .databaseAccess, .knowledgeSource:
+            return .data
+        case .apiServiceLayer, .crmIntegration, .communicationChannel, .eventSystem,
+             .businessActionAPI, .readOnlyMutationBoundary, .frontendSurface, .sourceCodeAccess:
+            return .architecture
+        }
+    }
+
+    private static func summaryStatement(_ verdict: AgentIntegrationVerdict, blockers: Int) -> String {
+        switch verdict {
+        case .yes:
+            return "The requested capability has evidence-backed static support; runtime verification remains required."
+        case .partial:
+            return "The requested capability has an evidence-backed supported subset and \(blockers) blocked or unresolved material prerequisite(s)."
+        case .no:
+            return "No safe integration opportunity is confirmed; \(blockers) blocker(s) or missing supported evidence prevent handoff."
+        }
+    }
+
+    private static func unique<T: Hashable>(_ values: [T]) -> [T] {
+        var seen: Set<T> = []
+        return values.filter { seen.insert($0).inserted }
+    }
+
+    private static func uniqueEvidence(_ values: [AssessmentEvidenceReference]) -> [AssessmentEvidenceReference] {
+        var seen: Set<String> = []
+        return values.filter { seen.insert($0.id).inserted }
+    }
+}
+
 struct LegacyAgentCompatibilityAnalyzer: Sendable {
     func assess(
         capability profile: AgentCapabilityProfile,
         evidenceLedger: ReadOnlyFinalizationEvidenceLedger,
-        legacyArchitecture architecture: LegacyArchitecture
+        legacyArchitecture architecture: LegacyArchitecture,
+        responseLanguage: ReadOnlyResponseLanguage = .english
     ) -> FDEAIIntegrationAssessmentReport {
         let entries = profile.requiredCapabilities.map { requirement in
             compatibilityEntry(for: requirement, architecture: architecture)
         }
-        let verdict = verdict(for: entries)
+        let verdict = verdict(for: entries, profile: profile, architecture: architecture)
         let matrix = CompatibilityMatrix(capability: profile, entries: entries, verdict: verdict)
-        let blockers = blockerReport(entries: entries, architecture: architecture)
+        let blockers = blockerReport(entries: entries, architecture: architecture, profile: profile)
         let security = securityAssessment(profile: profile, entries: entries, architecture: architecture)
         let opportunities = integrationOpportunities(profile: profile, entries: entries, architecture: architecture)
         let validation = validationPlan(profile: profile)
@@ -1141,6 +1588,7 @@ struct LegacyAgentCompatibilityAnalyzer: Sendable {
 
         return FDEAIIntegrationAssessmentReport(
             assessmentLayerID: AIIntegrationAssessmentLayer.id,
+            responseLanguage: responseLanguage,
             executiveSummary: summary,
             legacySystemUnderstanding: legacyClaims(architecture: architecture),
             requestedAICapability: profile,
@@ -1201,19 +1649,39 @@ struct LegacyAgentCompatibilityAnalyzer: Sendable {
                 )
             )
         }
+        let investigationEvidence = architecture.boundedInvestigationEvidence(for: requirement.capability)
         return CompatibilityMatrixEntry(
             requirement: requirement,
             status: .unknown,
             claim: AssessmentClaim(
-                statement: "\(requirement.capability.displayName) compatibility is unknown.",
-                evidence: [],
-                confidence: .unknown,
-                unknowns: ["No confirmed supporting signal or evidence-backed absence is recorded."]
+                statement: investigationEvidence.isEmpty
+                    ? "\(requirement.capability.displayName) compatibility requires bounded investigation."
+                    : "\(requirement.capability.displayName) remains unknown after bounded investigation of the available relevant evidence.",
+                evidence: investigationEvidence,
+                confidence: investigationEvidence.isEmpty ? .unknown : .low,
+                unknowns: investigationEvidence.isEmpty
+                    ? ["Remaining investigation required: no relevant bounded evidence was recorded before finalization."]
+                    : ["Unknown after bounded investigation; the inspected evidence neither confirms the control nor proves its absence."]
             )
         )
     }
 
-    private func verdict(for entries: [CompatibilityMatrixEntry]) -> AgentIntegrationVerdict {
+    private func verdict(
+        for entries: [CompatibilityMatrixEntry],
+        profile: AgentCapabilityProfile,
+        architecture: LegacyArchitecture
+    ) -> AgentIntegrationVerdict {
+        guard entries.contains(where: { $0.status == .supported }) else {
+            if profile.kind == .customerSupportOrderLookup {
+                return .no
+            }
+            // Concrete but non-matching architecture evidence (for example a
+            // frontend-only repository) is a bounded PARTIAL result. A profile
+            // with no positive or negative architecture facts remains NO.
+            return architecture.signals.isEmpty && architecture.confirmedAbsences.isEmpty
+                ? .no
+                : .partial
+        }
         if entries.contains(where: { $0.requirement.critical && $0.status == .blocked }) {
             return .no
         }
@@ -1225,7 +1693,8 @@ struct LegacyAgentCompatibilityAnalyzer: Sendable {
 
     private func blockerReport(
         entries: [CompatibilityMatrixEntry],
-        architecture: LegacyArchitecture
+        architecture: LegacyArchitecture,
+        profile: AgentCapabilityProfile
     ) -> IntegrationBlockerReport {
         var blockers = entries.compactMap { entry -> IntegrationBlocker? in
             guard entry.status == .blocked else { return nil }
@@ -1238,6 +1707,20 @@ struct LegacyAgentCompatibilityAnalyzer: Sendable {
                 reason: entry.claim.statement,
                 claim: entry.claim
             )
+        }
+        let lacksConcreteArchitectureFacts = architecture.signals.isEmpty
+            && architecture.confirmedAbsences.isEmpty
+        if profile.kind == .customerSupportOrderLookup || lacksConcreteArchitectureFacts {
+            blockers += entries.compactMap { entry -> IntegrationBlocker? in
+                guard entry.requirement.critical, entry.status == .unknown else { return nil }
+                return IntegrationBlocker(
+                    category: blockerCategory(for: entry.requirement.capability),
+                    requirement: entry.requirement.capability,
+                    severity: .high,
+                    reason: "Unresolved safety prerequisite: \(entry.claim.statement)",
+                    claim: entry.claim
+                )
+            }
         }
         if architecture.isDatabaseOnly,
            !blockers.contains(where: { $0.requirement == .apiServiceLayer }) {
@@ -1262,12 +1745,13 @@ struct LegacyAgentCompatibilityAnalyzer: Sendable {
 
     private func blockerCategory(for capability: LegacyArchitectureCapability) -> IntegrationBlockerCategory {
         switch capability {
-        case .authenticationBoundary, .permissionModel, .approvalMechanism, .auditLogging:
+        case .authenticationBoundary, .permissionModel, .recordLevelAuthorization,
+             .approvalMechanism, .auditLogging, .sensitiveResponseFieldControls:
             return .security
         case .customerData, .orderData, .customerHistory, .databaseAccess, .knowledgeSource:
             return .data
         case .apiServiceLayer, .crmIntegration, .communicationChannel, .eventSystem,
-             .businessActionAPI, .frontendSurface, .sourceCodeAccess:
+             .businessActionAPI, .readOnlyMutationBoundary, .frontendSurface, .sourceCodeAccess:
             return .architecture
         }
     }
@@ -1279,6 +1763,9 @@ struct LegacyAgentCompatibilityAnalyzer: Sendable {
     ) -> AgentSecurityAssessment {
         let permission = entries.first { $0.requirement.capability == .permissionModel }
         let authentication = entries.first { $0.requirement.capability == .authenticationBoundary }
+        let recordAuthorization = entries.first { $0.requirement.capability == .recordLevelAuthorization }
+        let responseFields = entries.first { $0.requirement.capability == .sensitiveResponseFieldControls }
+        let mutationBoundary = entries.first { $0.requirement.capability == .readOnlyMutationBoundary }
         let approval = architecture.evidence(for: .approvalMechanism)
         let dataCapabilities: Set<LegacyArchitectureCapability> = [
             .customerData, .orderData, .customerHistory, .databaseAccess, .knowledgeSource
@@ -1287,18 +1774,24 @@ struct LegacyAgentCompatibilityAnalyzer: Sendable {
         let permissionRisk: AssessmentRiskLevel = permission?.status == .supported
             ? .low
             : (permission?.status == .blocked ? .high : .medium)
-        let dataRisk: AssessmentRiskLevel = accessesData
-            && (permission?.status == .blocked || authentication?.status == .blocked) ? .high : (accessesData ? .medium : .low)
+        let unresolvedDataSafety = [permission, authentication, recordAuthorization, responseFields]
+            .compactMap { $0 }
+            .contains { $0.status != .supported }
+        let dataRisk: AssessmentRiskLevel = accessesData && unresolvedDataSafety ? .high : (accessesData ? .medium : .low)
         let modificationRisk: AssessmentRiskLevel = profile.proposesWriteAccess
             ? (approval.isEmpty ? .high : .medium)
-            : .low
-        let approvalRequired = profile.proposesWriteAccess || dataRisk == .high || permissionRisk == .high
+            : (mutationBoundary?.status == .supported || mutationBoundary == nil ? .low : .medium)
+        let approvalRequired = profile.proposesWriteAccess
+            || dataRisk == .high
+            || permissionRisk == .high
+            || [permission, authentication, recordAuthorization, responseFields].compactMap { $0 }.contains { $0.status != .supported }
         let evidence = uniqueEvidence(
-            [permission, authentication].compactMap { $0?.claim.evidence }.flatMap { $0 }
+            [permission, authentication, recordAuthorization, responseFields, mutationBoundary]
+                .compactMap { $0?.claim.evidence }.flatMap { $0 }
                 + approval
                 + [.userIntent("\(profile.name) proposes write access: \(profile.proposesWriteAccess).")]
         )
-        let unknowns = [permission, authentication].compactMap { entry in
+        let unknowns = [permission, authentication, recordAuthorization, responseFields, mutationBoundary].compactMap { entry in
             entry?.status == .unknown ? "\(entry?.requirement.capability.displayName ?? "Security boundary") is not confirmed." : nil
         }
         return AgentSecurityAssessment(
@@ -1347,6 +1840,13 @@ struct LegacyAgentCompatibilityAnalyzer: Sendable {
             ["Frontend Chat UI", "Agent Adapter", "Legacy API Layer"],
             capabilities: [.frontendSurface, .apiServiceLayer]
         )
+        if profile.kind == .customerSupportOrderLookup {
+            add(
+                "Read-only order lookup service",
+                ["Customer Support Agent", "Permission-aware Adapter", "Legacy Order Service"],
+                capabilities: [.orderData, .apiServiceLayer, .authenticationBoundary, .permissionModel]
+            )
+        }
         add(
             "Read-only governed data access",
             ["AI Agent", "Read-only Service Contract", "Legacy Data Layer"],
@@ -1376,6 +1876,29 @@ struct LegacyAgentCompatibilityAnalyzer: Sendable {
                     )
                 )
             )
+        }
+        if values.isEmpty {
+            let supported = entries.filter { $0.status == .supported && !$0.claim.evidence.isEmpty }
+            if !supported.isEmpty {
+                let evidence = uniqueEvidence(supported.flatMap(\.claim.evidence))
+                let claim = AssessmentClaim(
+                    statement: "A supported static subset is confirmed; unresolved material requirements still prevent an end-to-end integration claim.",
+                    evidence: evidence,
+                    confidence: .medium,
+                    unknowns: entries.filter { $0.status != .supported }.map {
+                        "\($0.requirement.capability.displayName) remains \($0.status.rawValue)."
+                    }
+                )
+                values.append(
+                    IntegrationOpportunity(
+                        feature: "Confirmed read-only supported subset",
+                        possibleIntegration: supported.map { $0.requirement.capability.displayName },
+                        confidence: claim.confidence,
+                        evidence: evidence,
+                        claim: claim
+                    )
+                )
+            }
         }
         return values
     }
@@ -1434,7 +1957,7 @@ struct LegacyAgentCompatibilityAnalyzer: Sendable {
             "unapproved Legacy mutation"
         ]
         switch profile.kind {
-        case .customerSupport:
+        case .customerSupport, .customerSupportOrderLookup:
             trigger = "A customer asks for support, account, or order information."
             decisionBoundary = "Classify the support intent and choose only an evidence-backed read-only lookup; ambiguous identity or action requests must stop."
             expectedOutput = "Return a grounded support answer with permitted customer/order status and a clear uncertainty or escalation notice."

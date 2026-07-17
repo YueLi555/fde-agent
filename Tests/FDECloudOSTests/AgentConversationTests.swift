@@ -370,6 +370,27 @@ final class AgentConversationTests: XCTestCase {
         XCTAssertEqual(reason, "unsupported_evidence_claim:path=package.json")
     }
 
+    func testEvidenceClaimGuardKeepsMultiCharacterExtensionsIntact() {
+        let workspaceID = UUID()
+        let evidence = AgentToolEvidenceContext(
+            toolCallID: "read-architecture",
+            toolName: "engineering.read_file",
+            workspaceID: workspaceID,
+            taskID: nil,
+            workspaceIdentity: "legacy",
+            targetPath: "docs/architecture.md",
+            toolCalledEventID: UUID(),
+            toolResultEventID: UUID()
+        )
+        let reason = AgentEvidenceClaimGuard().rejectionReason(
+            for: "## 实际读取的文件\n\n- 已读取 `docs/architecture.md`。",
+            evidence: [evidence],
+            workspaceID: workspaceID
+        )
+
+        XCTAssertNil(reason)
+    }
+
     private func makeEvent(
         _ type: EventType,
         sequence: Int64,

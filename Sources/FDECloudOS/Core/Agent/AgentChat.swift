@@ -120,6 +120,7 @@ struct AgentRuntimeProfile: Codable, Hashable, Sendable {
             allowedNextStates: stateMachine.allowedNextStates(from: currentState),
             transitionGraph: graph,
             executableIntentTypes: [
+                .candidatePatchGeneration,
                 .safeSandboxAcceptance,
                 .inspectWorkspace,
                 .architectureAnalysis,
@@ -473,6 +474,12 @@ struct StateMachineChatProvider: AgentChatProviding {
     private func capabilitySummary(for profile: AgentRuntimeProfile, chinese: Bool) -> String {
         let capabilities = profile.executableIntentTypes.compactMap { intent -> String? in
             switch intent {
+            case .candidatePatchSandboxDestroy:
+                return chinese ? "销毁已回滚候选补丁的确切 Sandbox" : "destroy the exact Sandbox bound to a reverted Candidate Patch"
+            case .candidatePatchRevert:
+                return chinese ? "安全回滚已应用候选补丁" : "revert exactly bound applied Candidate Patches"
+            case .candidatePatchGeneration:
+                return chinese ? "生成审批后候选补丁" : "generate approval-gated Candidate Patches"
             case .safeSandboxAcceptance:
                 return chinese ? "执行安全沙箱验收" : "run Safe Sandbox acceptance"
             case .aiAgentCompatibilityAssessment:
@@ -668,7 +675,7 @@ struct AgentEvidenceClaimGuard: Sendable {
     }
 
     private func claimedFilePaths(in answer: String) -> [String] {
-        let pattern = #"(?i)(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:json|js|jsx|ts|tsx|swift|py|java|kt|go|rs|rb|php|cs|c|cc|cpp|h|hpp|m|mm|yaml|yml|toml|md|prisma)"#
+        let pattern = #"(?i)(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:prisma|swift|json|jsx|tsx|java|cpp|hpp|yaml|toml|php|yml|js|ts|py|kt|go|rs|rb|cs|cc|mm|md|c|h|m)(?![A-Za-z0-9])"#
         guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
         var seen = Set<String>()
         var values: [String] = []

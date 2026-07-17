@@ -4,6 +4,7 @@ actor InMemoryPersistenceStore: PersistenceStore {
     private var workspaces: [UUID: Workspace] = [:]
     private var tasks: [UUID: FDETask] = [:]
     private var events: [ExecutionEvent] = []
+    private var lastEventSequenceByWorkspace: [UUID: Int64] = [:]
     private var nodes: [String: SystemGraphNode] = [:]
     private var edges: [String: SystemGraphEdge] = [:]
     private var outcomes: [OutcomeMetrics] = []
@@ -17,7 +18,14 @@ actor InMemoryPersistenceStore: PersistenceStore {
     private var sessionMetadata: SessionMetadata?
     private var approvalRequests: [UUID: ApprovalRequest] = [:]
 
-    func initialize() async throws {}
+    func initialize() async throws {
+        for event in events {
+            lastEventSequenceByWorkspace[event.workspaceID] = max(
+                lastEventSequenceByWorkspace[event.workspaceID] ?? 0,
+                event.sequence
+            )
+        }
+    }
 
     func loadWorkspaces() async throws -> [Workspace] {
         workspaces.values.sorted { $0.createdAt < $1.createdAt }
@@ -49,8 +57,56 @@ actor InMemoryPersistenceStore: PersistenceStore {
         tasks[task.id] = task
     }
 
-    func appendEvent(_ event: ExecutionEvent) async throws {
-        events.append(event)
+    func appendEvent(
+        _ event: ExecutionEvent,
+        mode: EventAppendMode,
+        initialTask: FDETask?
+    ) async throws -> ExecutionEvent {
+        if let existing = events.first(where: { $0.id == event.id }) {
+            guard existing.workspaceID == event.workspaceID else {
+                throw PersistenceError.eventDuplicateID
+            }
+            return existing
+        }
+
+        let persistedMax = events.lazy
+            .filter { $0.workspaceID == event.workspaceID }
+            .map(\.sequence)
+            .max() ?? 0
+        let storedSequence: Int64
+        switch mode {
+        case .live:
+            let current = max(lastEventSequenceByWorkspace[event.workspaceID] ?? 0, persistedMax)
+            guard current < Int64.max else { throw PersistenceError.eventTransactionFailed }
+            storedSequence = current + 1
+        case .historicalReplay:
+            guard event.sequence > 0 else { throw PersistenceError.eventTransactionFailed }
+            guard !events.contains(where: {
+                $0.workspaceID == event.workspaceID && $0.sequence == event.sequence
+            }) else {
+                throw PersistenceError.eventSequenceConflict
+            }
+            storedSequence = event.sequence
+        }
+
+        var storedEvent = event
+        storedEvent.sequence = storedSequence
+        if let initialTask {
+            guard initialTask.id == storedEvent.taskID,
+                  initialTask.workspaceID == storedEvent.workspaceID else {
+                throw PersistenceError.eventTransactionFailed
+            }
+        }
+
+        if let initialTask {
+            tasks[initialTask.id] = initialTask
+        }
+        events.append(storedEvent)
+        lastEventSequenceByWorkspace[event.workspaceID] = max(
+            lastEventSequenceByWorkspace[event.workspaceID] ?? 0,
+            storedSequence
+        )
+        return storedEvent
     }
 
     func loadEvents(workspaceID: UUID, taskID: UUID?) async throws -> [ExecutionEvent] {
@@ -64,10 +120,6 @@ actor InMemoryPersistenceStore: PersistenceStore {
                 }
                 return lhs.sequence < rhs.sequence
             }
-    }
-
-    func loadMaxEventSequence() async throws -> Int64 {
-        events.map(\.sequence).max() ?? 0
     }
 
     func saveApprovalRequest(_ request: ApprovalRequest) async throws {

@@ -3,6 +3,9 @@ import Foundation
 protocol AgentRuntimeExecuting: Sendable {
     func submitTask(input: String, workspace: Workspace) async throws -> FDETask
     func runSafeSandboxAcceptance(input: String, workspace: Workspace) async throws -> FDETask
+    func runCandidatePatchGeneration(input: String, workspace: Workspace) async throws -> FDETask
+    func runCandidatePatchRevert(input: String, workspace: Workspace) async throws -> FDETask
+    func runCandidatePatchSandboxDestroy(input: String, workspace: Workspace) async throws -> FDETask
     func recoverTask(taskID: UUID, instruction: String, workspace: Workspace) async throws -> FDETask?
     func requestStepPause(taskID: UUID, reason: String) async
     func resumeTask(taskID: UUID, instruction: String?) async
@@ -10,6 +13,13 @@ protocol AgentRuntimeExecuting: Sendable {
     func stopTask(taskID: UUID, reason: String) async
     func recordAuditEvent(
         type: EventType,
+        workspaceID: UUID,
+        taskID: UUID?,
+        summary: String,
+        payload: [String: String]
+    ) async throws -> ExecutionEvent
+    func recordUserSubmissionAuditEvent(
+        logicalEventID: UUID,
         workspaceID: UUID,
         taskID: UUID?,
         summary: String,
@@ -24,6 +34,30 @@ extension AgentRuntimeExecuting {
     func runSafeSandboxAcceptance(input: String, workspace: Workspace) async throws -> FDETask {
         throw SafeSandboxAcceptanceRuntimeError.runtimeUnavailable
     }
+    func runCandidatePatchGeneration(input: String, workspace: Workspace) async throws -> FDETask {
+        throw CandidatePatchError.blocked(.assessmentMissing)
+    }
+    func runCandidatePatchRevert(input: String, workspace: Workspace) async throws -> FDETask {
+        throw CandidatePatchRuntimeError.runtimeUnavailable
+    }
+    func runCandidatePatchSandboxDestroy(input: String, workspace: Workspace) async throws -> FDETask {
+        throw CandidatePatchRuntimeError.runtimeUnavailable
+    }
+    func recordUserSubmissionAuditEvent(
+        logicalEventID: UUID,
+        workspaceID: UUID,
+        taskID: UUID?,
+        summary: String,
+        payload: [String: String]
+    ) async throws -> ExecutionEvent {
+        try await recordAuditEvent(
+            type: .userMessageReceived,
+            workspaceID: workspaceID,
+            taskID: taskID,
+            summary: summary,
+            payload: payload.merging(["client_message_id": logicalEventID.uuidString]) { current, _ in current }
+        )
+    }
 }
 
 extension RuntimeKernel: AgentRuntimeExecuting {}
@@ -33,6 +67,9 @@ enum AgentRequestRoute: String, Codable, Hashable, Sendable {
     case workspaceQuestion
     case workspaceReadOnlyInvestigation
     case safeSandboxAcceptance
+    case candidatePatchGeneration
+    case candidatePatchRevert
+    case candidatePatchSandboxDestroy
     case executableTask
     case clarificationRequired
     case activeMissionStatusQuery
@@ -106,7 +143,8 @@ struct AgentRuntimeCoordinator: Sendable {
         input: String,
         workspace: Workspace,
         session: inout AgentSession,
-        runtime: any AgentRuntimeExecuting
+        runtime: any AgentRuntimeExecuting,
+        userMessageID: UUID? = nil
     ) async throws -> AgentRuntimeCoordinatorResult {
         session.refreshSelectedWorkspace(workspace)
         let safeInput = AgentPresentationSanitizer.safeMarkdownContent(input, fallback: "User mission")
@@ -128,6 +166,9 @@ struct AgentRuntimeCoordinator: Sendable {
         let missionSemantic = MissionExecutionSemantic(intent: intent)
         let startsRuntime = route == .workspaceReadOnlyInvestigation
             || route == .safeSandboxAcceptance
+            || route == .candidatePatchGeneration
+            || route == .candidatePatchRevert
+            || route == .candidatePatchSandboxDestroy
             || route == .executableTask
             || route == .clarificationRequired
         let shouldAnswerInChat = route == .conversationalChat
@@ -139,13 +180,15 @@ struct AgentRuntimeCoordinator: Sendable {
                 isCapabilityQuestion: isCapabilityQuestion,
                 needsClarification: needsClarification
             )
-        let userEvent = try await runtime.recordAuditEvent(
-            type: .userMessageReceived,
+        let logicalUserEventID = userMessageID ?? UUID()
+        let userEvent = try await runtime.recordUserSubmissionAuditEvent(
+            logicalEventID: logicalUserEventID,
             workspaceID: workspace.id,
             taskID: nil,
             summary: "User mission received",
             payload: [
                 "session_id": session.sessionID.uuidString,
+                "client_message_id": logicalUserEventID.uuidString,
                 "message": safeInput,
                 "intent_type": intent.intentType.rawValue,
                 "intent_confidence": String(intent.confidence),
@@ -210,6 +253,24 @@ struct AgentRuntimeCoordinator: Sendable {
             return .continued(recordedEvents: [userEvent] + evidenceEvents)
         }
 
+        if route == .candidatePatchGeneration {
+            session.setInteractionState(.working)
+            let task = try await runtime.runCandidatePatchGeneration(input: safeInput, workspace: workspace)
+            return .running(task: task, recordedEvents: [userEvent])
+        }
+
+        if route == .candidatePatchRevert {
+            session.setInteractionState(.waitingForApproval)
+            let task = try await runtime.runCandidatePatchRevert(input: safeInput, workspace: workspace)
+            return .running(task: task, recordedEvents: [userEvent])
+        }
+
+        if route == .candidatePatchSandboxDestroy {
+            session.setInteractionState(.waitingForApproval)
+            let task = try await runtime.runCandidatePatchSandboxDestroy(input: safeInput, workspace: workspace)
+            return .running(task: task, recordedEvents: [userEvent])
+        }
+
         if route == .safeSandboxAcceptance {
             session.setInteractionState(.working)
             let task = try await runtime.runSafeSandboxAcceptance(input: safeInput, workspace: workspace)
@@ -249,7 +310,8 @@ struct AgentRuntimeCoordinator: Sendable {
         session: inout AgentSession,
         runtime: any AgentRuntimeExecuting,
         continuation: Bool = false,
-        userMessageAlreadyAppended: Bool = false
+        userMessageAlreadyAppended: Bool = false,
+        userMessageID: UUID? = nil
     ) async throws -> AgentRuntimeCoordinatorResult {
         session.refreshSelectedWorkspace(workspace)
         let interactionStateBeforeReply = session.interactionState
@@ -287,7 +349,12 @@ struct AgentRuntimeCoordinator: Sendable {
         if let activeMissionRoute,
            activeMissionRoute == .activeMissionRetry || activeMissionRoute == .activeMissionResume {
             route = activeMissionRoute
-        } else if requestRoute == .workspaceReadOnlyInvestigation || requestRoute == .executableTask {
+        } else if requestRoute == .workspaceReadOnlyInvestigation
+            || requestRoute == .candidatePatchGeneration
+            || requestRoute == .candidatePatchRevert
+            || requestRoute == .candidatePatchSandboxDestroy
+            || requestRoute == .safeSandboxAcceptance
+            || requestRoute == .executableTask {
             route = requestRoute
         } else {
             route = activeMissionRoute ?? requestRoute
@@ -350,12 +417,14 @@ struct AgentRuntimeCoordinator: Sendable {
         } else {
             event = interactionController.receiveUserReply(reply, session: &session)
         }
-        let recordedUserEvent = try await runtime.recordAuditEvent(
-            type: event.type,
+        let logicalUserEventID = userMessageID ?? UUID()
+        let recordedUserEvent = try await runtime.recordUserSubmissionAuditEvent(
+            logicalEventID: logicalUserEventID,
             workspaceID: workspace.id,
             taskID: includeActiveTaskContext ? session.runtimeTaskID : nil,
             summary: event.summary,
             payload: event.payload.merging([
+                "client_message_id": logicalUserEventID.uuidString,
                 "agent_loop_phase": "resume",
                 "selected_route": route.rawValue,
                 "mission_semantic": missionSemantic.rawValue,
@@ -486,6 +555,26 @@ struct AgentRuntimeCoordinator: Sendable {
                 return .waiting(recordedEvents: recordedEvents)
             }
             return .continued(recordedEvents: recordedEvents)
+        }
+
+        if route == .candidatePatchGeneration {
+            session.setInteractionState(.working)
+            let task = try await runtime.runCandidatePatchGeneration(input: reply, workspace: workspace)
+            return .running(task: task, recordedEvents: [recordedUserEvent])
+        }
+
+
+        if route == .candidatePatchRevert {
+            session.setInteractionState(.waitingForApproval)
+            let task = try await runtime.runCandidatePatchRevert(input: reply, workspace: workspace)
+            return .running(task: task, recordedEvents: [recordedUserEvent])
+        }
+
+
+        if route == .candidatePatchSandboxDestroy {
+            session.setInteractionState(.waitingForApproval)
+            let task = try await runtime.runCandidatePatchSandboxDestroy(input: reply, workspace: workspace)
+            return .running(task: task, recordedEvents: [recordedUserEvent])
         }
 
         if route == .safeSandboxAcceptance {
@@ -739,6 +828,15 @@ struct AgentRuntimeCoordinator: Sendable {
         isExplicitMission: Bool,
         selectedMode: FDEConversationMode
     ) -> AgentRequestRoute {
+        if intent.intentType == .candidatePatchSandboxDestroy {
+            return .candidatePatchSandboxDestroy
+        }
+        if intent.intentType == .candidatePatchRevert {
+            return .candidatePatchRevert
+        }
+        if intent.intentType == .candidatePatchGeneration {
+            return .candidatePatchGeneration
+        }
         if intent.intentType == .safeSandboxAcceptance {
             return .safeSandboxAcceptance
         }
@@ -1458,6 +1556,11 @@ struct AgentMissionClassifier: Sendable {
         if resolvedIntent.intentType == .safeSandboxAcceptance {
             return .executableEngineeringTask
         }
+        if resolvedIntent.intentType == .candidatePatchGeneration
+            || resolvedIntent.intentType == .candidatePatchRevert
+            || resolvedIntent.intentType == .candidatePatchSandboxDestroy {
+            return .executableEngineeringTask
+        }
         if isIdentityQuestion(input) || isCapabilityQuestion(input) || isAgentAbilityQuestion(input) {
             return .fdeCapabilityExplanation
         }
@@ -1551,7 +1654,10 @@ struct AgentMissionClassifier: Sendable {
             return false
         }
         switch resolvedIntent.intentType {
-        case .safeSandboxAcceptance,
+        case .candidatePatchGeneration,
+             .candidatePatchRevert,
+             .candidatePatchSandboxDestroy,
+             .safeSandboxAcceptance,
              .aiAgentCompatibilityAssessment,
              .inspectWorkspace,
              .architectureAnalysis,

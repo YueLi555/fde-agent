@@ -487,12 +487,23 @@ private struct ApprovalRequestRow: View {
                 } label: {
                     Label("Reject", systemImage: "xmark.shield")
                 }
+                .accessibilityIdentifier(
+                    approval.targetKind == .candidatePatchPlan
+                        ? "candidatePatch.reject"
+                        : "approval.reject"
+                )
                 Button {
                     onApprove(approval)
                 } label: {
                     Label("Approve", systemImage: "checkmark.shield")
                 }
                 .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier(
+                    approval.targetKind == .candidatePatchPlan
+                        ? "candidatePatch.approve.openConfirmation"
+                        : "approval.approve"
+                )
+                .focusable(approval.targetKind != .candidatePatchPlan)
             }
         }
         .padding(10)

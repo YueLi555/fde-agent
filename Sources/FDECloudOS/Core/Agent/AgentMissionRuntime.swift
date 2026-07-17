@@ -357,6 +357,7 @@ struct AgentDecisionEngine: Sendable {
 
     private func missionRequiresHumanApproval(_ intent: MissionIntent) -> Bool {
         intent.constraints.contains(.requiresApproval)
+            || intent.intentType == .candidatePatchGeneration
             || intent.intentType == .modifyCode
             || intent.intentType == .createFeature
             || intent.intentType == .refactorCode

@@ -1054,6 +1054,26 @@ struct ReadOnlyFinalizationEvidenceLedger: Codable, Hashable, Sendable {
             return item.toolName == "engineering.read_file" && isBackendApplicationAssembly(path)
         case .inspectedManifestsAndKeyFiles:
             return item.toolName == "engineering.read_file"
+        case .assessmentOrderReadBoundary:
+            return assessmentEvidence(item, paths: ["order"], queries: ["order", "listcustomerorders"])
+        case .assessmentAPIServiceBoundary:
+            return assessmentEvidence(item, paths: ["order", "route", "architecture"], queries: ["route", "controller", "endpoint", "service"])
+        case .assessmentAuthentication:
+            return assessmentEvidence(item, paths: ["auth", "identity", "session"], queries: ["auth", "authenticate", "principal", "session"])
+        case .assessmentRecordAuthorization:
+            return assessmentEvidence(item, paths: ["auth", "order", "architecture"], queries: ["customerid", "orderid", "authorize", "requirerole"])
+        case .assessmentPermissionModel:
+            return assessmentEvidence(item, paths: ["auth", "permission", "order"], queries: ["permission", "role", "rbac", "requirerole"])
+        case .assessmentAuditLogging:
+            return assessmentEvidence(item, paths: ["audit", "architecture", "config"], queries: ["audit", "recordauditevent"])
+        case .assessmentMutationPaths:
+            return assessmentEvidence(item, paths: ["order", "architecture", "config"], queries: ["post", "put", "patch", "delete", "mutation", "outboundactions"])
+        case .assessmentSensitiveResponseFields:
+            return assessmentEvidence(item, paths: ["order", "architecture", "config"], queries: ["ordersummary", "customerid", "redact", "allowedfields"])
+        case .assessmentArchitectureDocumentation:
+            return assessmentEvidence(item, paths: ["docs/architecture", "architecture.md"], queries: ["architecture.md"])
+        case .assessmentExampleConfiguration:
+            return assessmentEvidence(item, paths: ["config/app.example", "app.example.json"], queries: ["app.example.json"])
         }
     }
 
@@ -1094,6 +1114,12 @@ struct ReadOnlyFinalizationEvidenceLedger: Codable, Hashable, Sendable {
             return !facts.dependencyFacts.isEmpty
         case .inspectedManifestsAndKeyFiles:
             return facts.contentRead
+        case .assessmentOrderReadBoundary, .assessmentAPIServiceBoundary,
+             .assessmentAuthentication, .assessmentRecordAuthorization,
+             .assessmentPermissionModel, .assessmentAuditLogging,
+             .assessmentMutationPaths, .assessmentSensitiveResponseFields,
+             .assessmentArchitectureDocumentation, .assessmentExampleConfiguration:
+            return facts.contentRead || isBoundedZeroResultSearch(item)
         }
     }
 
@@ -1136,6 +1162,14 @@ struct ReadOnlyFinalizationEvidenceLedger: Codable, Hashable, Sendable {
                 return extracted.dependencyFacts.map { "dependency=\($0)" }
             case .inspectedManifestsAndKeyFiles:
                 return ["successfully read \(item.targetPath)"]
+            case .assessmentOrderReadBoundary, .assessmentAPIServiceBoundary,
+                 .assessmentAuthentication, .assessmentRecordAuthorization,
+                 .assessmentPermissionModel, .assessmentAuditLogging,
+                 .assessmentMutationPaths, .assessmentSensitiveResponseFields,
+                 .assessmentArchitectureDocumentation, .assessmentExampleConfiguration:
+                return item.toolName == "engineering.read_file"
+                    ? ["bounded assessment evidence read from \(item.targetPath)"]
+                    : ["bounded assessment search completed for \(item.query ?? item.targetPath) with zero results"]
             }
         }
         return unique(facts)
@@ -1266,6 +1300,34 @@ struct ReadOnlyFinalizationEvidenceLedger: Codable, Hashable, Sendable {
         ].contains(name) || path.hasSuffix(".csproj") || path.hasSuffix(".podspec")
     }
 
+    private static func assessmentEvidence(
+        _ item: ReadOnlyInspectionEvidence,
+        paths: [String],
+        queries: [String]
+    ) -> Bool {
+        let path = item.targetPath.lowercased()
+        if item.toolName == "engineering.read_file" {
+            return paths.contains { path.contains($0) }
+        }
+        guard item.toolName == "engineering.search_code" || item.toolName == "engineering.search_files" else {
+            return false
+        }
+        let query = item.query?.lowercased() ?? ""
+        return queries.contains { query.contains($0) }
+    }
+
+    private static func isBoundedZeroResultSearch(_ item: ReadOnlyInspectionEvidence) -> Bool {
+        guard item.toolName == "engineering.search_code" || item.toolName == "engineering.search_files" else {
+            return false
+        }
+        let value = item.output.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return value.isEmpty
+            || value.contains("found 0 match")
+            || value.contains("0 matches")
+            || value.contains("no matches")
+            || value.contains("no files found")
+    }
+
     private static func isBackendPath(_ path: String) -> Bool {
         let segments: Set<String> = ["server", "backend", "api", "service", "services"]
         return path.split(separator: "/").contains { segments.contains(String($0).lowercased()) }
@@ -1310,7 +1372,12 @@ struct ReadOnlyFinalizationEvidenceLedger: Codable, Hashable, Sendable {
                 ? .sourceBehaviorConfirmed
                 : .contentRead
         case .backendApplicationAssembly, .requestedFile, .staticSourceEvidence,
-             .primaryLanguages, .inspectedManifestsAndKeyFiles:
+             .primaryLanguages, .inspectedManifestsAndKeyFiles,
+             .assessmentOrderReadBoundary, .assessmentAPIServiceBoundary,
+             .assessmentAuthentication, .assessmentRecordAuthorization,
+             .assessmentPermissionModel, .assessmentAuditLogging,
+             .assessmentMutationPaths, .assessmentSensitiveResponseFields,
+             .assessmentArchitectureDocumentation, .assessmentExampleConfiguration:
             return .contentRead
         }
     }
@@ -1351,6 +1418,7 @@ enum ReadOnlyFinalAnswerContractFailure: String, Codable, CaseIterable, Hashable
     case missingEvidencePath = "missing_evidence_path"
     case incorrectLanguage = "incorrect_language"
     case contradictoryCompletionState = "contradictory_completion_state"
+    case assessmentSemanticInconsistency = "assessment_semantic_inconsistency"
 }
 
 enum ReadOnlyFinalAnswerContract {

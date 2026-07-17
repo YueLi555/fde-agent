@@ -766,6 +766,7 @@ struct MissionReplayTimelineEngine: Sendable {
         case .pending: return "Approval requested"
         case .approved: return "Approval granted"
         case .rejected: return "Approval rejected"
+        case .superseded: return "Approval superseded"
         case .expired: return "Approval expired"
         }
     }

@@ -2,11 +2,14 @@ import Foundation
 
 enum ApprovalQueueError: LocalizedError {
     case requestNotFound(UUID)
+    case requestNotPending(UUID, ApprovalState)
 
     var errorDescription: String? {
         switch self {
         case .requestNotFound(let id):
             return "Approval request not found: \(id.uuidString)."
+        case .requestNotPending(let id, let state):
+            return "Approval request \(id.uuidString) is \(state.rawValue) and cannot authorize an action."
         }
     }
 }
@@ -46,12 +49,45 @@ actor ApprovalQueue {
         }
     }
 
-    func approve(requestID: UUID, approverRole: UserRole, reason: String) async throws -> ApprovalRequest {
-        try await decide(requestID: requestID, state: .approved, approverRole: approverRole, reason: reason)
+    func approve(
+        requestID: UUID,
+        approverRole: UserRole,
+        reason: String,
+        metadata: [String: String] = [:]
+    ) async throws -> ApprovalRequest {
+        try await decide(
+            requestID: requestID,
+            state: .approved,
+            approverRole: approverRole,
+            reason: reason,
+            metadata: metadata
+        )
     }
 
     func reject(requestID: UUID, approverRole: UserRole, reason: String) async throws -> ApprovalRequest {
         try await decide(requestID: requestID, state: .rejected, approverRole: approverRole, reason: reason)
+    }
+
+    func supersede(
+        requestID: UUID,
+        approverRole: UserRole,
+        reason: String,
+        metadata: [String: String]
+    ) async throws -> ApprovalRequest {
+        guard var request = try await persistence.loadApprovalRequest(id: requestID) else {
+            throw ApprovalQueueError.requestNotFound(requestID)
+        }
+        guard request.state == .pending else {
+            throw ApprovalQueueError.requestNotPending(requestID, request.state)
+        }
+        request.state = .superseded
+        request.decidedByRole = approverRole
+        request.decisionReason = reason
+        request.decidedAt = Date()
+        request.metadata.merge(metadata) { _, new in new }
+        try await persistence.saveApprovalRequest(request)
+        resumeContinuations(for: request)
+        return request
     }
 
     func expirePending(now: Date = Date()) async throws -> [ApprovalRequest] {
@@ -74,16 +110,21 @@ actor ApprovalQueue {
         requestID: UUID,
         state: ApprovalState,
         approverRole: UserRole,
-        reason: String
+        reason: String,
+        metadata: [String: String] = [:]
     ) async throws -> ApprovalRequest {
         guard var request = try await persistence.loadApprovalRequest(id: requestID) else {
             throw ApprovalQueueError.requestNotFound(requestID)
+        }
+        guard request.state == .pending else {
+            throw ApprovalQueueError.requestNotPending(requestID, request.state)
         }
 
         request.state = state
         request.decidedByRole = approverRole
         request.decisionReason = reason
         request.decidedAt = Date()
+        request.metadata.merge(metadata) { _, new in new }
         try await persistence.saveApprovalRequest(request)
         resumeContinuations(for: request)
         return request
