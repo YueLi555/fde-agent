@@ -36,6 +36,15 @@ enum AgentConversationActivityKind: String, Codable, CaseIterable, Hashable, Sen
     case sandboxCreationBlocked
     case destroyingSandbox
     case finalizingSandboxAcceptance
+    case preparingCandidatePatch
+    case waitingCandidatePatchApproval
+    case applyingCandidatePatch
+    case buildingUnifiedDiff
+    case candidatePatchReady
+    case candidatePatchBlocked
+    case revertingCandidatePatch
+    case candidatePatchReverted
+    case sandboxDestroyed
     case preparingFinalAnswer
     case preparingPartialAnswer
     case retryingProvider
@@ -46,17 +55,19 @@ enum AgentConversationActivityKind: String, Codable, CaseIterable, Hashable, Sen
 
     var priority: Int {
         switch self {
-        case .failed: return 20
+        case .failed, .candidatePatchBlocked: return 20
         case .sandboxCreationBlocked: return 19
         case .blocked: return 18
         case .partial: return 17
+        case .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed: return 17
         case .sandboxReady: return 16
         case .completed: return 15
-        case .destroyingSandbox, .finalizingSandboxAcceptance: return 14
+        case .destroyingSandbox, .finalizingSandboxAcceptance, .buildingUnifiedDiff: return 14
         case .preparingFinalAnswer: return 13
         case .preparingPartialAnswer: return 12
         case .retryingProvider: return 11
-        case .confirmingSourceIsolation, .checkingPathContainment, .verifyingFileHashes: return 10
+        case .confirmingSourceIsolation, .checkingPathContainment, .verifyingFileHashes,
+             .applyingCandidatePatch, .revertingCandidatePatch: return 10
         case .confirmingOriginalLegacyUnchanged: return 10
         case .excludingSensitiveFiles, .copyingApprovedSourceFiles, .creatingIsolatedSandbox,
              .creatingSourceSnapshot, .checkingLocalSourceAvailability,
@@ -66,7 +77,8 @@ enum AgentConversationActivityKind: String, Codable, CaseIterable, Hashable, Sen
         case .searchingCode: return 6
         case .searchingFiles: return 5
         case .listingDirectory: return 4
-        case .inspectingProject, .validatingPlan, .repairingPlan, .planning: return 3
+        case .inspectingProject, .validatingPlan, .repairingPlan, .planning,
+             .preparingCandidatePatch, .waitingCandidatePatchApproval: return 3
         case .compilingContext, .preparingTask: return 2
         case .thinking: return 2
         case .idle: return 1
@@ -75,7 +87,8 @@ enum AgentConversationActivityKind: String, Codable, CaseIterable, Hashable, Sen
 
     var isTerminal: Bool {
         switch self {
-        case .blocked, .failed, .partial, .completed, .sandboxReady, .sandboxCreationBlocked:
+        case .blocked, .failed, .partial, .completed, .sandboxReady, .sandboxCreationBlocked,
+             .candidatePatchReady, .candidatePatchBlocked, .candidatePatchReverted, .sandboxDestroyed:
             return true
         default:
             return false
@@ -112,6 +125,7 @@ struct AgentConversationActivityMetadata: Equatable, Sendable {
     var retryAttempt: Int?
     var aiAssessment: AIAssessmentActivitySnapshot?
     var sandbox: SandboxActivitySnapshot?
+    var candidatePatch: CandidatePatchActivitySnapshot?
 
     init(
         dialogID: UUID,
@@ -128,7 +142,8 @@ struct AgentConversationActivityMetadata: Equatable, Sendable {
         blockerReason: String? = nil,
         retryAttempt: Int? = nil,
         aiAssessment: AIAssessmentActivitySnapshot? = nil,
-        sandbox: SandboxActivitySnapshot? = nil
+        sandbox: SandboxActivitySnapshot? = nil,
+        candidatePatch: CandidatePatchActivitySnapshot? = nil
     ) {
         self.dialogID = dialogID
         self.taskID = taskID
@@ -145,6 +160,7 @@ struct AgentConversationActivityMetadata: Equatable, Sendable {
         self.retryAttempt = retryAttempt
         self.aiAssessment = aiAssessment
         self.sandbox = sandbox
+        self.candidatePatch = candidatePatch
     }
 }
 
@@ -219,9 +235,16 @@ enum AgentConversationActivityCopy {
         case .validatingPlan:
             return "Validating the tool plan…"
         case .inspectingProject:
-            return metadata.safeToolName == nil
-                ? "Running a workspace inspection…"
-                : "Inspecting project structure…"
+            switch metadata.workspaceIdentity?.lowercased() {
+            case let value? where value.contains("legacy"):
+                return "Inspecting Legacy workspace project structure…"
+            case let value? where value.contains("agent"):
+                return "Inspecting Agent workspace project structure…"
+            default:
+                return metadata.safeToolName == nil
+                    ? "Running a workspace inspection…"
+                    : "Inspecting project structure…"
+            }
         case .listingDirectory:
             return "Listing project files…"
         case .searchingFiles:
@@ -267,6 +290,24 @@ enum AgentConversationActivityCopy {
             return "Destroying Sandbox…"
         case .finalizingSandboxAcceptance:
             return "Finalizing Sandbox acceptance…"
+        case .preparingCandidatePatch:
+            return "Preparing Candidate Patch plan…"
+        case .waitingCandidatePatchApproval:
+            return "Waiting for human approval"
+        case .applyingCandidatePatch:
+            return "Applying change in isolated Sandbox…"
+        case .buildingUnifiedDiff:
+            return "Building unified diff…"
+        case .candidatePatchReady:
+            return "Candidate Patch ready"
+        case .candidatePatchBlocked:
+            return "Candidate Patch blocked"
+        case .revertingCandidatePatch:
+            return "Reverting Candidate Patch…"
+        case .candidatePatchReverted:
+            return "Candidate Patch reverted"
+        case .sandboxDestroyed:
+            return "Sandbox destroyed"
         case .preparingFinalAnswer:
             return "Preparing grounded findings…"
         case .preparingPartialAnswer:
@@ -561,6 +602,9 @@ struct AgentConversationActivityReducer: Sendable {
         if let sandbox = SandboxActivitySnapshot(eventPayload: event.payload) {
             next.metadata.sandbox = sandbox
         }
+        if let candidatePatch = CandidatePatchActivitySnapshot(eventPayload: event.payload) {
+            next.metadata.candidatePatch = candidatePatch
+        }
         next.labelOverride = nil
 
         if event.payload["partial_completion_state"] == "BLOCKED_WITH_PARTIAL_RESULT" {
@@ -593,6 +637,12 @@ struct AgentConversationActivityReducer: Sendable {
            let phase = SandboxRuntimeActivityPhase(rawValue: rawPhase) {
             next.kind = AgentConversationActivityCopy.sandboxActivity(phase)
             next.labelOverride = "\(phase.rawValue)…"
+            return next
+        }
+        if let rawPhase = event.payload["candidate_patch_activity_phase"],
+           let phase = CandidatePatchActivityPhase(rawValue: rawPhase) {
+            next.kind = candidatePatchActivity(phase)
+            next.labelOverride = phase.rawValue + (phase == .candidatePatchReady || phase == .candidatePatchBlocked ? "" : "…")
             return next
         }
         if lifecycle == "PROVIDER_RETRY_REQUESTED" || event.payload["retry"] == "true" {
@@ -655,6 +705,42 @@ struct AgentConversationActivityReducer: Sendable {
             break
         }
         return next
+    }
+
+    private static func candidatePatchActivity(
+        _ phase: CandidatePatchActivityPhase
+    ) -> AgentConversationActivityKind {
+        switch phase {
+        case .understandingRequestedChange,
+             .loadingGroundedAssessment,
+             .validatingPlanningPreconditions,
+             .checkingSandboxReadiness,
+             .preparingCandidatePatchPlan,
+             .verifyingApprovedScope:
+            return .preparingCandidatePatch
+        case .waitingForHumanApproval:
+            return .waitingCandidatePatchApproval
+        case .applyingChangeInIsolatedSandbox, .verifyingFileHashes,
+             .confirmingOriginalLegacyUnchanged, .preparingHumanReview:
+            return .applyingCandidatePatch
+        case .buildingUnifiedDiff:
+            return .buildingUnifiedDiff
+        case .candidatePatchReady:
+            return .candidatePatchReady
+        case .candidatePatchBlocked:
+            return .candidatePatchBlocked
+        case .revertingCandidatePatch:
+            return .revertingCandidatePatch
+        case .locatingAppliedPatch, .validatingRevertBinding, .verifyingCurrentPostimages,
+             .verifyingRestoredHashes:
+            return .verifyingFileHashes
+        case .revertConfirmationRequired, .sandboxDestructionConfirmationRequired:
+            return .waitingCandidatePatchApproval
+        case .candidatePatchReverted:
+            return .candidatePatchReverted
+        case .sandboxDestroyed:
+            return .sandboxDestroyed
+        }
     }
 
     private static func terminalKind(

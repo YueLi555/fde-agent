@@ -89,6 +89,67 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
         XCTAssertEqual(readiness.executableSteps.first?.toolCall.workingDirectory, fixture.legacy.path)
     }
 
+    func testDotSlashPathNormalizesWithoutChangingCanonicalTarget() throws {
+        let fixture = try makeNodeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.container) }
+        let output = planOutput([
+            toolStep(
+                id: "dot-slash-auth",
+                command: "engineering.read_file",
+                arguments: ["workspace=legacy", "path=./server/src/index.ts"]
+            )
+        ])
+
+        let readiness = ReadOnlyPlanReadinessValidator().validate(
+            output,
+            workspace: fixture.workspace,
+            missionTarget: .legacy
+        )
+
+        XCTAssertTrue(readiness.isReady)
+        let executable = try XCTUnwrap(readiness.executableSteps.first)
+        XCTAssertEqual(executable.relativeTargetPath, "server/src/index.ts")
+        XCTAssertEqual(executable.toolCall.arguments, ["workspace=legacy", "path=server/src/index.ts"])
+        XCTAssertEqual(executable.authorityAudit.modelPath, "./server/src/index.ts")
+        XCTAssertEqual(executable.authorityAudit.normalizedRelativePath, "server/src/index.ts")
+    }
+
+    func testSearchWithoutPathReceivesTrustedCanonicalRootDefaultOnce() throws {
+        let fixture = try makeNodeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.container) }
+        let output = planOutput([
+            toolStep(
+                id: "search-root-default",
+                command: "engineering.search_files",
+                arguments: ["query=order"]
+            )
+        ])
+
+        let readiness = ReadOnlyPlanReadinessValidator().validate(
+            output,
+            workspace: fixture.workspace,
+            missionTarget: .legacy
+        )
+
+        XCTAssertTrue(readiness.isReady)
+        let executable = try XCTUnwrap(readiness.executableSteps.first)
+        XCTAssertEqual(executable.relativeTargetPath, ".")
+        XCTAssertEqual(executable.toolCall.arguments, ["workspace=legacy", "path=.", "query=order"])
+        XCTAssertEqual(executable.runtimeDefaultedArguments, ["path", "workingDirectory", "workspace"])
+        XCTAssertEqual(executable.authorityAudit.trustedRoot, fixture.legacy.path)
+    }
+
+    func testSearchExtractionPreservesExactDiscoveredParentPath() {
+        let facts = ReadOnlySafeFactExtractor.extract(
+            toolName: "engineering.search_files",
+            targetPath: ".",
+            output: "src/orders.ts:0: file path match"
+        )
+
+        XCTAssertEqual(facts.discoveredPaths, ["src/orders.ts"])
+        XCTAssertFalse(facts.discoveredPaths.contains("orders.ts"))
+    }
+
     func testSelectedProjectNameAliasAndLiteralNullWorkingDirectoryUseTrustedLegacyRoot() throws {
         var fixture = try makeSwiftFixture()
         defer { try? FileManager.default.removeItem(at: fixture.container) }
@@ -216,6 +277,23 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
         XCTAssertEqual(
             MissionWorkspaceScope(request: "比较两个项目，但不要分析 Agent"),
             .legacyOnly
+        )
+    }
+
+    func testExactNativeChineseOrderAssessmentSelectsLegacyOnlyBroadScope() {
+        let request = """
+        请评估客户支持 AI Agent 的订单查询能力。
+
+        请只读检查订单数据边界、API、身份验证、记录级授权、权限模型、审计日志、修改路径和敏感字段。
+
+        本次只进行分析，不修改任何文件。
+        """
+
+        XCTAssertEqual(MissionWorkspaceScope(request: request), .legacyOnly)
+        XCTAssertEqual(ReadOnlyMissionTarget(request: request), .legacy)
+        XCTAssertEqual(
+            ReadOnlyInspectionLimits.conservative.budget(for: request, workspaceScope: .legacyOnly).kind,
+            .broadStaticAssessment
         )
     }
 
@@ -754,9 +832,10 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
             completed.payload["ai_assessment_mission_state"],
             AIAssessmentMissionState.finalizingGroundedAssessment.rawValue
         )
-        XCTAssertTrue(completed.payload["detail"]?.contains("Proposed Operational Workflow") == true)
-        XCTAssertTrue(completed.payload["detail"]?.contains("Agent-side Black Boxes") == true)
-        XCTAssertTrue(completed.payload["detail"]?.contains("Evidence Provenance") == true)
+        let detail = try XCTUnwrap(completed.payload["detail"])
+        XCTAssertTrue(detail.contains("Proposed Operational Workflow"))
+        XCTAssertTrue(detail.contains("Agent-side Black Boxes"))
+        XCTAssertTrue(detail.contains("Evidence Provenance"))
     }
 
     func testPersistedFailureShapedPlanRepairsIntoExecutableDefaultedCall() async throws {
@@ -1975,6 +2054,51 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
         XCTAssertFalse(events.contains {
             $0.type == .toolCalled && $0.payload["target_path"] == "index.ts"
         })
+    }
+
+    func testFilenameOnlyReadIsRepairedOnceFromExactCanonicalDiscoveryWithProvenance() async throws {
+        let fixture = try makeNodeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.container) }
+        let answer = "Conclusion: `server/src/index.ts` was successfully read and directly shows the Express backend application. Limitations: static read-only inspection only; no build or test was run."
+
+        let (task, events) = try await runNativeTask(
+            input: "Inspect the exact Legacy backend entry point",
+            fixture: fixture,
+            initial: planOutput([
+                toolStep(
+                    id: "list-backend-source-for-repair",
+                    command: "engineering.list_directory",
+                    arguments: ["path=server/src"]
+                )
+            ]),
+            actions: [
+                nextToolAction(
+                    id: "filename-only-entry",
+                    command: "engineering.read_file",
+                    arguments: ["path=index.ts"]
+                ),
+                nextFinalAction(answer)
+            ]
+        )
+
+        XCTAssertEqual(task.state, .blocked)
+        XCTAssertFalse(events.contains {
+            $0.type == .toolCalled && $0.payload["target_path"] == "index.ts"
+        })
+        XCTAssertTrue(events.contains {
+            $0.type == .toolCalled && $0.payload["target_path"] == "server/src/index.ts"
+        })
+        let rejected = try XCTUnwrap(events.first {
+            $0.payload["rejection_reason"] == PlanReadinessBlocker.canonicalSearchPathRequired.rawValue
+        })
+        XCTAssertTrue(rejected.payload["exact_rejection"]?.contains("server/src/index.ts") == true)
+        let repaired = try XCTUnwrap(events.first {
+            $0.payload["canonical_path_repair_source"] == "bounded_deterministic_repair"
+        })
+        XCTAssertEqual(repaired.payload["canonical_path_repair_count"], "1")
+        XCTAssertEqual(repaired.payload["canonical_path_repaired_to"], "server/src/index.ts")
+        XCTAssertEqual(repaired.payload["canonical_path_provenance"], "trusted_discovered_metadata")
+        XCTAssertFalse(repaired.payload["canonical_path_source_event_ids"]?.isEmpty ?? true)
     }
 
     func testInitialUngroundedReadRepairsToRootObservationWithoutExecutingRead() async throws {

@@ -8,6 +8,13 @@ enum SQLiteValue {
     case null
 }
 
+enum SQLiteFailureKind {
+    case constraint
+    case unavailable
+    case corrupt
+    case other
+}
+
 final class SQLiteConnection {
     private var database: OpaquePointer?
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -20,6 +27,8 @@ final class SQLiteConnection {
             sqlite3_close(database)
             throw PersistenceError.databaseUnavailable(detail)
         }
+        sqlite3_extended_result_codes(database, 1)
+        sqlite3_busy_timeout(database, 5_000)
     }
 
     deinit {
@@ -111,6 +120,20 @@ final class SQLiteConnection {
 
     private var errorMessage: String {
         SQLiteConnection.message(for: database)
+    }
+
+    var failureKind: SQLiteFailureKind {
+        switch sqlite3_errcode(database) {
+        case SQLITE_CONSTRAINT:
+            return .constraint
+        case SQLITE_BUSY, SQLITE_LOCKED, SQLITE_CANTOPEN, SQLITE_IOERR,
+             SQLITE_FULL, SQLITE_READONLY, SQLITE_PERM:
+            return .unavailable
+        case SQLITE_CORRUPT, SQLITE_NOTADB:
+            return .corrupt
+        default:
+            return .other
+        }
     }
 
     private static func message(for database: OpaquePointer?) -> String {

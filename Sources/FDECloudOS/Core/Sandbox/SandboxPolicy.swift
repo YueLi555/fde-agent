@@ -9,6 +9,10 @@ enum SandboxMissionAuthorization: String, Codable, Hashable, Sendable {
 
 enum SandboxWritableOperation: String, Codable, CaseIterable, Hashable, Sendable {
     case candidatePatch
+    case candidatePatchReadText = "candidate_patch_read_text"
+    case candidatePatchCreateText = "candidate_patch_create_text"
+    case candidatePatchReplaceText = "candidate_patch_replace_text"
+    case candidatePatchRevert = "candidate_patch_revert"
     case generatedTest
     case productFileMutation
 }
@@ -43,14 +47,31 @@ struct SandboxRuntimePolicy: Sendable {
 
     /// Phase 2D.0 intentionally exposes no writable product operation.
     static let phase2D0Allowlist: Set<SandboxWritableOperation> = []
+    static let phase2D1Allowlist: Set<SandboxWritableOperation> = [
+        .candidatePatchReadText,
+        .candidatePatchCreateText,
+        .candidatePatchReplaceText,
+        .candidatePatchRevert
+    ]
 
     func authorize(_ request: SandboxWritablePolicyRequest) -> SandboxPolicyDecision {
+        authorize(request, allowlist: Self.phase2D0Allowlist)
+    }
+
+    func authorizePhase2D1(_ request: SandboxWritablePolicyRequest) -> SandboxPolicyDecision {
+        authorize(request, allowlist: Self.phase2D1Allowlist)
+    }
+
+    private func authorize(
+        _ request: SandboxWritablePolicyRequest,
+        allowlist: Set<SandboxWritableOperation>
+    ) -> SandboxPolicyDecision {
         var denials: [SandboxPolicyDenial] = []
         var resolvedTarget: URL?
         if request.mission != .futureApprovedSandboxMutation {
             denials.append(.missionNotAuthorized)
         }
-        if !Self.phase2D0Allowlist.contains(request.operation) {
+        if !allowlist.contains(request.operation) {
             denials.append(.operationUnavailable)
         }
         if request.requiresHumanApproval && !request.humanApprovalSatisfied {

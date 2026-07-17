@@ -4,10 +4,19 @@ enum MissionExecutionSemantic: String, Codable, Hashable, Sendable {
     case conversation = "CONVERSATION"
     case readOnlyWorkspaceInspection = "READ_ONLY_WORKSPACE_INSPECTION"
     case safeSandboxAcceptance = "SAFE_SANDBOX_ACCEPTANCE"
+    case candidatePatchGeneration = "CANDIDATE_PATCH_GENERATION"
+    case candidatePatchRevert = "CANDIDATE_PATCH_REVERT"
+    case candidatePatchSandboxDestroy = "CANDIDATE_PATCH_SANDBOX_DESTROY"
     case engineeringModification = "ENGINEERING_MODIFICATION"
 
     init(intent: MissionIntent) {
         switch intent.intentType {
+        case .candidatePatchSandboxDestroy:
+            self = .candidatePatchSandboxDestroy
+        case .candidatePatchRevert:
+            self = .candidatePatchRevert
+        case .candidatePatchGeneration:
+            self = .candidatePatchGeneration
         case .safeSandboxAcceptance:
             self = .safeSandboxAcceptance
         case .aiAgentCompatibilityAssessment, .inspectWorkspace, .architectureAnalysis, .explainCode, .generateReport:
@@ -73,6 +82,11 @@ enum ReadOnlyMissionTarget: String, Codable, Hashable, Sendable {
         let value = request.lowercased()
         let mentionsLegacy = value.contains("legacy") || value.contains("旧项目") || value.contains("传统项目")
         let mentionsAgent = value.contains("agent") || value.contains("智能体")
+        let explicitlyTargetsAgentWorkspace = [
+            "agent workspace", "agent project", "agent codebase", "agent repository", "agent repo",
+            "agent 工作区", "agent 项目", "agent 代码库", "agent 仓库",
+            "智能体工作区", "智能体项目", "智能体代码库", "智能体仓库"
+        ].contains { value.contains($0) }
         let explicitlyExcludesAgent = [
             "legacy only", "only legacy", "只读取 legacy", "只读 legacy", "只检查 legacy",
             "不要分析 agent", "不要检查 agent", "不要读取 agent", "不分析 agent", "不检查 agent",
@@ -103,10 +117,12 @@ enum ReadOnlyMissionTarget: String, Codable, Hashable, Sendable {
             self = .agent
         } else if mentionsLegacy {
             self = .legacy
-        } else if mentionsAgent {
+        } else if mentionsAgent && explicitlyTargetsAgentWorkspace {
             self = .agent
         } else {
-            // The product's primary/current project is the selected Legacy root.
+            // "AI Agent" commonly names the capability being assessed, not the
+            // Agent source workspace. The selected Legacy project remains the
+            // default unless the request explicitly targets another codebase.
             self = .legacy
         }
     }
@@ -256,6 +272,7 @@ enum PlanReadinessBlocker: String, Codable, Hashable, Sendable {
     case plannerTimeout = "planner_timeout"
     case modelDecisionFailed = "model_decision_failed"
     case ungroundedFinalAnswer = "ungrounded_final_answer"
+    case assessmentSemanticInconsistency = "assessment_semantic_inconsistency"
     case toolExecutionFailed = "tool_execution_failed"
 }
 
@@ -1040,6 +1057,11 @@ struct ReadOnlyInspectionLimits: Hashable, Sendable {
         }
 
         let normalized = request.lowercased()
+        let intent = MissionIntentParser().parse(request)
+        if intent.intentType == .aiAgentCompatibilityAssessment,
+           AgentCapabilityProfile.detect(from: request).kind == .customerSupportOrderLookup {
+            return broadAssessmentBudget.validated()
+        }
         let broadTerms = [
             "architecture", "risk assessment", "security", "performance", "database", "dependency", "dependencies",
             "架构", "风险", "安全", "性能", "数据库", "依赖", "全面", "广泛"
@@ -1304,6 +1326,16 @@ enum ReadOnlyEvidenceRequirementKind: String, Codable, Hashable, Sendable {
     case backendApplicationAssembly = "backend_application_assembly"
     case importantDependencies = "important_dependencies"
     case inspectedManifestsAndKeyFiles = "inspected_manifests_and_key_files"
+    case assessmentOrderReadBoundary = "assessment_order_read_boundary"
+    case assessmentAPIServiceBoundary = "assessment_api_service_boundary"
+    case assessmentAuthentication = "assessment_authentication"
+    case assessmentRecordAuthorization = "assessment_record_authorization"
+    case assessmentPermissionModel = "assessment_permission_model"
+    case assessmentAuditLogging = "assessment_audit_logging"
+    case assessmentMutationPaths = "assessment_mutation_paths"
+    case assessmentSensitiveResponseFields = "assessment_sensitive_response_fields"
+    case assessmentArchitectureDocumentation = "assessment_architecture_documentation"
+    case assessmentExampleConfiguration = "assessment_example_configuration"
 
     var label: String {
         switch self {
@@ -1321,6 +1353,16 @@ enum ReadOnlyEvidenceRequirementKind: String, Codable, Hashable, Sendable {
         case .backendApplicationAssembly: return "backend application assembly"
         case .importantDependencies: return "important dependencies"
         case .inspectedManifestsAndKeyFiles: return "inspected manifests and key files"
+        case .assessmentOrderReadBoundary: return "order read/data boundary"
+        case .assessmentAPIServiceBoundary: return "API/service boundary"
+        case .assessmentAuthentication: return "authentication boundary"
+        case .assessmentRecordAuthorization: return "record-level authorization"
+        case .assessmentPermissionModel: return "permission model"
+        case .assessmentAuditLogging: return "audit logging"
+        case .assessmentMutationPaths: return "mutation paths and read-only boundary"
+        case .assessmentSensitiveResponseFields: return "sensitive response fields"
+        case .assessmentArchitectureDocumentation: return "relevant architecture documentation"
+        case .assessmentExampleConfiguration: return "relevant example configuration"
         }
     }
 
@@ -1350,6 +1392,20 @@ struct ReadOnlyEvidenceRequirements: Hashable, Sendable {
         var values: [ReadOnlyEvidenceRequirementKind]
         if isAIAgentAssessment {
             values = [.projectRoot, .projectStructure, .staticSourceEvidence, .inspectedManifestsAndKeyFiles]
+            if AgentCapabilityProfile.detect(from: requestText).kind == .customerSupportOrderLookup {
+                values += [
+                    .assessmentOrderReadBoundary,
+                    .assessmentAPIServiceBoundary,
+                    .assessmentAuthentication,
+                    .assessmentRecordAuthorization,
+                    .assessmentPermissionModel,
+                    .assessmentAuditLogging,
+                    .assessmentMutationPaths,
+                    .assessmentSensitiveResponseFields,
+                    .assessmentArchitectureDocumentation,
+                    .assessmentExampleConfiguration
+                ]
+            }
         } else if fileExtensions.contains(where: { normalized.contains($0) }) {
             values = [.requestedFile]
         } else if staticTerms.contains(where: { normalized.contains($0) }) {
@@ -1426,7 +1482,12 @@ struct ReadOnlyEvidenceRequirements: Hashable, Sendable {
             case .requestedFile, .projectStructure, .primaryLanguages, .projectManifest,
                  .frontendManifestOrConfig, .frontendConfiguration, .backendManifest,
                  .databaseSchemaOrConfig, .backendEntryPoint, .backendApplicationAssembly, .importantDependencies,
-                 .inspectedManifestsAndKeyFiles:
+                 .inspectedManifestsAndKeyFiles, .assessmentOrderReadBoundary,
+                 .assessmentAPIServiceBoundary, .assessmentAuthentication,
+                 .assessmentRecordAuthorization, .assessmentPermissionModel,
+                 .assessmentAuditLogging, .assessmentMutationPaths,
+                 .assessmentSensitiveResponseFields, .assessmentArchitectureDocumentation,
+                 .assessmentExampleConfiguration:
                 return true
             }
         }
@@ -1507,8 +1568,10 @@ struct ReadOnlyInspectionObservation: Sendable {
 
         AI Agent integration assessment contract:
         - This is assessment-only. Never request mutation, deployment, production access, credentials, or direct agent database access.
-        - Identify the requested AgentCapabilityProfile.
+        - Identify and preserve the explicit normalized AgentCapabilityProfile. A customer-support order-query request is `customer_support_order_lookup` with display label `Customer Support AI Agent — Read-only Order Lookup`; never downgrade an explicit capability to Unspecified AI Agent.
         - Gather static evidence for API/service boundaries, authentication, permissions, relevant data or knowledge, events, approvals, and audit logging when applicable.
+        - For `customer_support_order_lookup`, investigate the order read/data boundary, API/service boundary, authentication, record-level authorization, permission model, audit logging, mutation paths, sensitive response fields, relevant architecture documentation, and relevant example configuration. Discover candidates from the selected workspace and inspect their exact canonical relative paths; never assume fixture-specific paths in production.
+        - UNKNOWN is valid only after a relevant bounded read/search was recorded, no matching evidence exists after bounded search, or the inspection budget is exhausted and the remaining requirement is named explicitly.
         - SUPPORTED requires a successfully read file or extracted configuration. BLOCKED requires evidence of an architectural conflict or a bounded zero-result static search. Otherwise use UNKNOWN.
         - The final answer must be an "FDE AI Integration Assessment Report" with exactly these sections: 1. Executive Summary; 2. Legacy System Understanding; 3. Requested AI Capability; 4. Compatibility Matrix; 5. Integration Opportunities; 6. Security Assessment; 7. Integration Blockers; 8. Recommended Architecture; 9. Validation Test Plan; 10. Unknowns and Next Investigation Steps.
         - Begin the Executive Summary with YES, PARTIAL, or NO. Every conclusion must cite evidence, confidence, and unknowns. Generate validation tests only; do not execute them.

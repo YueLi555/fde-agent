@@ -2,6 +2,9 @@ import Foundation
 
 enum RuntimeCompletionContractKind: String, Codable, Hashable, Sendable {
     case safeSandboxAcceptance = "SAFE_SANDBOX_ACCEPTANCE"
+    case candidatePatchGeneration = "CANDIDATE_PATCH_GENERATION"
+    case candidatePatchRevert = "CANDIDATE_PATCH_REVERT"
+    case candidatePatchSandboxDestroy = "CANDIDATE_PATCH_SANDBOX_DESTROY"
     case planOnly = "PLAN_ONLY"
     case modification = "MODIFICATION"
     case commandExecution = "COMMAND_EXECUTION"
@@ -49,6 +52,12 @@ struct RuntimeCompletionContract: Sendable {
         }
 
         switch intent.intentType {
+        case .candidatePatchSandboxDestroy:
+            kind = .candidatePatchSandboxDestroy
+        case .candidatePatchRevert:
+            kind = .candidatePatchRevert
+        case .candidatePatchGeneration:
+            kind = .candidatePatchGeneration
         case .safeSandboxAcceptance:
             kind = .safeSandboxAcceptance
         case .modifyCode, .createFeature, .refactorCode:
@@ -122,6 +131,56 @@ struct RuntimeCompletionContract: Sendable {
         }
 
         switch kind {
+        case .candidatePatchSandboxDestroy:
+            let completion = orderedEvents.last { event in
+                event.type == .taskCompleted
+                    && event.payload["completion_contract"] == RuntimeCompletionContractKind.candidatePatchSandboxDestroy.rawValue
+            }
+            if completion?.payload["manifest_backed"] != "true"
+                || completion?.payload["candidate_patch_projection_state"] != "SANDBOX_DESTROYED"
+                || completion?.payload["sandbox_destroyed"] != "true" {
+                missing.append("a manifest-backed exact Sandbox destruction result")
+            }
+            if completion?.payload["source_integrity"] != SourceIntegrityState.unchanged.rawValue {
+                missing.append("confirmed unchanged original Legacy integrity")
+            }
+            if completion?.payload["build_or_test_executed"] != "false"
+                || completion?.payload["git_or_deployment_action_occurred"] != "false"
+                || completion?.payload["shell_execution_enabled"] != "false" {
+                missing.append("confirmation that Build, Test, Shell, Git, and deployment actions did not occur")
+            }
+        case .candidatePatchRevert:
+            let completion = orderedEvents.last { event in
+                event.type == .taskCompleted
+                    && event.payload["completion_contract"] == RuntimeCompletionContractKind.candidatePatchRevert.rawValue
+            }
+            if completion?.payload["manifest_backed"] != "true"
+                || completion?.payload["candidate_patch_projection_state"] != "REVERTED" {
+                missing.append("a manifest-backed Candidate Patch Revert result")
+            }
+            if completion?.payload["source_integrity"] != SourceIntegrityState.unchanged.rawValue {
+                missing.append("confirmed unchanged original Legacy integrity")
+            }
+            if completion?.payload["build_or_test_executed"] != "false"
+                || completion?.payload["git_or_deployment_action_occurred"] != "false"
+                || completion?.payload["shell_execution_enabled"] != "false" {
+                missing.append("confirmation that Build, Test, Shell, Git, and deployment actions did not occur")
+            }
+        case .candidatePatchGeneration:
+            let completion = orderedEvents.last { event in
+                event.type == .taskCompleted
+                    && event.payload["completion_contract"] == RuntimeCompletionContractKind.candidatePatchGeneration.rawValue
+            }
+            if completion?.payload["manifest_backed"] != "true" {
+                missing.append("a manifest-backed Candidate Patch review")
+            }
+            if completion?.payload["source_integrity"] != SourceIntegrityState.unchanged.rawValue {
+                missing.append("confirmed unchanged original Legacy integrity")
+            }
+            if completion?.payload["build_or_test_executed"] != "false"
+                || completion?.payload["git_or_deployment_action_occurred"] != "false" {
+                missing.append("confirmation that build, test, Git, and deployment actions did not occur")
+            }
         case .safeSandboxAcceptance:
             let completion = orderedEvents.last { event in
                 event.type == .taskCompleted
@@ -490,6 +549,12 @@ struct RuntimeCompletionContract: Sendable {
             : verificationCommands.map { "- `\($0)` passed with exit status 0" }.joined(separator: "\n")
         let outcome: String
         switch kind {
+        case .candidatePatchSandboxDestroy:
+            outcome = "The exact Sandbox bound to the reverted Candidate Patch was destroyed after separate explicit confirmation; audit history was retained and original Legacy integrity remained unchanged."
+        case .candidatePatchRevert:
+            outcome = "The exact-bound Candidate Patch was reverted inside its existing Sandbox, recorded postimages were checked first, audit history was retained, and Sandbox destruction remained a separate action."
+        case .candidatePatchGeneration:
+            outcome = "Approved candidate changes were applied only in the isolated Sandbox and rendered as a manifest-backed unified diff; build, test, runtime, Git, and deployment behavior remain unverified."
         case .safeSandboxAcceptance:
             outcome = "The isolated Sandbox was created, verified from lifecycle manifests, source integrity was rechecked, and the Sandbox was destroyed without starting Phase 2D.1."
         case .modification:

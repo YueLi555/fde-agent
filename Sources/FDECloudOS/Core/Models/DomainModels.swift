@@ -678,6 +678,7 @@ enum ApprovalState: String, Codable, CaseIterable, Identifiable, Sendable {
     case pending
     case approved
     case rejected
+    case superseded
     case expired
 
     var id: String { rawValue }
@@ -688,6 +689,7 @@ enum ApprovalTargetKind: String, Codable, CaseIterable, Identifiable, Sendable {
     case policyUpdate
     case connectorOperation
     case systemChange
+    case candidatePatchPlan
 
     var id: String { rawValue }
 }

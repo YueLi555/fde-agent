@@ -34,6 +34,33 @@ struct AgentWorkspaceView: View {
                 .padding(.vertical, 12)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .sheet(item: $store.candidatePatchApprovalConfirmation) { confirmation in
+            CandidatePatchApprovalConfirmationView(
+                confirmation: confirmation,
+                isConfirming: store.isConfirmingCandidatePatchApproval,
+                onConfirm: { store.confirmCandidatePatchApproval(confirmation) },
+                onCancel: store.cancelCandidatePatchApprovalConfirmation
+            )
+            .interactiveDismissDisabled()
+        }
+        .sheet(item: $store.candidatePatchRevertConfirmation) { confirmation in
+            CandidatePatchRevertConfirmationView(
+                confirmation: confirmation,
+                isConfirming: store.isConfirmingCandidatePatchRevert,
+                onConfirm: { store.confirmCandidatePatchRevert(confirmation) },
+                onCancel: store.cancelCandidatePatchRevertConfirmation
+            )
+            .interactiveDismissDisabled()
+        }
+        .sheet(item: $store.candidatePatchDestructionConfirmation) { confirmation in
+            CandidatePatchSandboxDestructionConfirmationView(
+                confirmation: confirmation,
+                isConfirming: store.isConfirmingCandidatePatchDestruction,
+                onConfirm: { store.confirmCandidatePatchDestruction(confirmation) },
+                onCancel: store.cancelCandidatePatchDestructionConfirmation
+            )
+            .interactiveDismissDisabled()
+        }
     }
 
     @ViewBuilder
@@ -66,7 +93,10 @@ struct AgentWorkspaceView: View {
                     showsHeader: false,
                     onApprove: store.approve,
                     onReject: store.reject,
-                    onSelectOption: store.selectDecision
+                    onRequestChanges: store.requestCandidatePatchChanges,
+                    onSelectOption: store.selectDecision,
+                    onCandidatePatchRevert: store.openCandidatePatchRevertConfirmation,
+                    onCandidatePatchDestroySandbox: store.openCandidatePatchDestructionConfirmation
                 )
             }
             .frame(maxWidth: 780, alignment: .topLeading)
@@ -74,6 +104,178 @@ struct AgentWorkspaceView: View {
             .padding(.vertical, 22)
             .frame(maxWidth: .infinity, alignment: .top)
         }
+    }
+}
+
+private struct CandidatePatchApprovalConfirmationView: View {
+    let confirmation: CandidatePatchApprovalConfirmation
+    let isConfirming: Bool
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("Confirm Candidate Patch Approval", systemImage: "checkmark.shield")
+                .font(.title3.weight(.semibold))
+
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                GridRow {
+                    Text("Plan")
+                        .foregroundStyle(.secondary)
+                    Text("\(confirmation.shortPlanID)…")
+                        .font(.body.monospaced())
+                }
+                GridRow {
+                    Text("Revision")
+                        .foregroundStyle(.secondary)
+                    Text("\(confirmation.planRevision)")
+                        .font(.body.monospacedDigit())
+                }
+                GridRow {
+                    Text("Capability")
+                        .foregroundStyle(.secondary)
+                    Text(confirmation.capability)
+                        .font(.body.monospaced())
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Affected relative paths")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                ForEach(confirmation.affectedRelativePaths, id: \.self) { path in
+                    Text("• \(path)")
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                }
+            }
+
+            Label(
+                "This change applies only inside the validated Safe Sandbox.",
+                systemImage: "shippingbox.and.arrow.backward"
+            )
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(.purple)
+
+            Text("Build, Test, Git, and Deployment remain disabled.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) {
+                    onCancel()
+                }
+                .accessibilityIdentifier("candidatePatch.approve.cancel")
+
+                Button {
+                    onConfirm()
+                } label: {
+                    Label("Confirm Approval", systemImage: "checkmark.shield.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .focusable(false)
+                .disabled(isConfirming)
+                .accessibilityIdentifier("candidatePatch.approve.confirm")
+            }
+        }
+        .padding(22)
+        .frame(width: 560)
+        .onExitCommand(perform: onCancel)
+    }
+}
+
+private struct CandidatePatchRevertConfirmationView: View {
+    let confirmation: CandidatePatchRevertConfirmation
+    let isConfirming: Bool
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("Confirm Candidate Patch Revert", systemImage: "arrow.uturn.backward.circle")
+                .font(.title3.weight(.semibold))
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                GridRow { Text("Patch ID").foregroundStyle(.secondary); Text(confirmation.binding.patchID.rawValue).font(.body.monospaced()) }
+                GridRow { Text("Plan revision").foregroundStyle(.secondary); Text(String(confirmation.binding.planRevision)).font(.body.monospacedDigit()) }
+                GridRow { Text("Sandbox ID").foregroundStyle(.secondary); Text(confirmation.binding.sandboxID.rawValue).font(.body.monospaced()) }
+            }
+            revertFileList(title: "Files to restore", values: confirmation.filesToRestore)
+            revertFileList(title: "Patch-created files to remove", values: confirmation.filesToRemove)
+            Label("Original Legacy remains unchanged.", systemImage: "checkmark.shield")
+                .foregroundStyle(.green)
+            Label("The complete audit record will be preserved.", systemImage: "doc.text.magnifyingglass")
+            Text("Sandbox destruction is a separate explicit confirmed action.")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel, action: onCancel)
+                    .accessibilityIdentifier("candidatePatch.revert.cancel")
+                Button(action: onConfirm) {
+                    Label("Confirm Revert", systemImage: "arrow.uturn.backward.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                .disabled(isConfirming)
+                .accessibilityIdentifier("candidatePatch.revert.confirm")
+            }
+        }
+        .padding(22)
+        .frame(width: 660)
+        .onExitCommand(perform: onCancel)
+    }
+
+    @ViewBuilder
+    private func revertFileList(title: String, values: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            if values.isEmpty {
+                Text("None").font(.caption.monospaced()).foregroundStyle(.secondary)
+            } else {
+                ForEach(values, id: \.self) { value in
+                    Text("• \(value)").font(.caption.monospaced()).textSelection(.enabled)
+                }
+            }
+        }
+    }
+}
+
+private struct CandidatePatchSandboxDestructionConfirmationView: View {
+    let confirmation: CandidatePatchSandboxDestructionConfirmation
+    let isConfirming: Bool
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("Confirm Sandbox Destruction", systemImage: "trash")
+                .font(.title3.weight(.semibold))
+            Text("Patch \(confirmation.binding.patchID.rawValue)")
+                .font(.body.monospaced())
+                .textSelection(.enabled)
+            Text("Sandbox \(confirmation.binding.sandboxID.rawValue)")
+                .font(.body.monospaced())
+                .textSelection(.enabled)
+            Label("The Candidate Patch is already REVERTED.", systemImage: "checkmark.shield")
+                .foregroundStyle(.green)
+            Label("Sandbox destruction is permanent.", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+            Text("This separate action destroys only the exact bound reverted Sandbox. The original Legacy remains unchanged, all audit records are preserved outside the Sandbox, and no other Patch or Sandbox is affected.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel, action: onCancel)
+                    .accessibilityIdentifier("candidatePatch.destroySandbox.cancel")
+                Button("Destroy Sandbox", role: .destructive, action: onConfirm)
+                    .disabled(isConfirming)
+                    .accessibilityIdentifier("candidatePatch.destroySandbox.confirm")
+            }
+        }
+        .padding(22)
+        .frame(width: 620)
+        .onExitCommand(perform: onCancel)
     }
 }
 
@@ -1057,6 +1259,12 @@ private struct AgentApprovalCard: View {
                     Label("Approve", systemImage: "checkmark.circle")
                 }
                 .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier(
+                    approval.targetKind == .candidatePatchPlan
+                        ? "candidatePatch.approve.openConfirmation"
+                        : "approval.approve"
+                )
+                .focusable(approval.targetKind != .candidatePatchPlan)
 
                 Button {
                     onModify()
@@ -1069,6 +1277,11 @@ private struct AgentApprovalCard: View {
                 } label: {
                     Label("Reject", systemImage: "xmark.circle")
                 }
+                .accessibilityIdentifier(
+                    approval.targetKind == .candidatePatchPlan
+                        ? "candidatePatch.reject"
+                        : "approval.reject"
+                )
             }
         }
         .padding(12)

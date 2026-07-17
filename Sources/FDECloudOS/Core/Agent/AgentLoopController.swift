@@ -228,8 +228,6 @@ actor AgentLoopController {
     private let memoryProvider: any AgentMemoryProvider
     private let configuration: AgentLoopConfiguration
 
-    private var sequence: Int64 = 0
-    private var sequenceInitialized = false
     private var lastEventIDByTask: [UUID: UUID] = [:]
     private var lastEventIDByWorkspace: [UUID: UUID] = [:]
     private var recordedEvents: [ExecutionEvent] = []
@@ -294,8 +292,6 @@ actor AgentLoopController {
             createdAt: Date(),
             updatedAt: Date()
         )
-        try await persistence.saveTask(task)
-
         var missionState = try transition(from: MissionState.idle, to: .understand)
         var toolState = ToolExecutionState.idle
         var activePlan: [PlanStep] = []
@@ -320,7 +316,8 @@ actor AgentLoopController {
                 "state": task.state.rawValue,
                 "agent_loop_controller": "true",
                 "agent_loop_stop_reason": ""
-            ]
+            ],
+            initialTask: task
         )
 
         for iteration in 1...configuration.maxLoopIterations {
@@ -1807,14 +1804,9 @@ actor AgentLoopController {
         taskState: TaskState?,
         toolState: ToolExecutionState,
         iteration: Int,
-        payload: [String: String]
+        payload: [String: String],
+        initialTask: FDETask? = nil
     ) async throws -> ExecutionEvent {
-        if !sequenceInitialized {
-            sequence = try await persistence.loadMaxEventSequence()
-            sequenceInitialized = true
-        }
-
-        let nextSequence = sequence + 1
         let parentEventID: UUID? = if let taskID {
             lastEventIDByTask[taskID]
         } else {
@@ -1839,7 +1831,7 @@ actor AgentLoopController {
             workspaceID: workspaceID,
             taskID: taskID,
             type: type,
-            sequence: nextSequence,
+            sequence: 0,
             timestamp: Date(),
             summary: AgentPresentationSanitizer.safeContent(summary, fallback: type.rawValue),
             payload: enrichedPayload,
@@ -1848,16 +1840,19 @@ actor AgentLoopController {
                 correlationID: taskID?.uuidString ?? workspaceID.uuidString
             )
         )
-        try await persistence.appendEvent(event)
-        sequence = nextSequence
+        let persistedEvent = try await persistence.appendEvent(
+            event,
+            mode: .live,
+            initialTask: initialTask
+        )
         if let taskID {
-            lastEventIDByTask[taskID] = event.id
+            lastEventIDByTask[taskID] = persistedEvent.id
         }
-        lastEventIDByWorkspace[workspaceID] = event.id
-        eventStream.persist(event)
-        eventStream.publish(event)
-        recordedEvents.append(event)
-        return event
+        lastEventIDByWorkspace[workspaceID] = persistedEvent.id
+        eventStream.persist(persistedEvent)
+        eventStream.publish(persistedEvent)
+        recordedEvents.append(persistedEvent)
+        return persistedEvent
     }
 
     private func safeArguments(_ arguments: [String]) -> String {

@@ -186,6 +186,22 @@ final class AgentConversationActivityTests: XCTestCase {
         }
     }
 
+    func testLegacyInspectActivityNeverClaimsAgentWorkspace() {
+        let workspaceID = UUID()
+        let taskID = UUID()
+        var activity = engineeringActivity(taskID: taskID)
+        let inspect = event(.toolCalled, 1, workspaceID, taskID, payload: [
+            "command": "engineering.inspect_project",
+            "workspace_identity": "legacy",
+            "normalized_relative_path": "."
+        ])
+
+        activity = AgentConversationActivityReducer.reduce(activity, event: inspect)
+
+        XCTAssertEqual(activity.label, "Inspecting Legacy workspace project structure…")
+        XCTAssertFalse(activity.label.contains("Agent workspace"))
+    }
+
     func testObservationPendingShowsEvidenceCount() {
         let taskID = UUID()
         let item = event(.stateUpdated, 1, UUID(), taskID, payload: [

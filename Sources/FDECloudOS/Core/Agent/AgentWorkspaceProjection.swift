@@ -156,6 +156,9 @@ struct AgentWorkspaceProjection: Sendable {
         case .rejected:
             title = "Approval rejected"
             status = .failed
+        case .superseded:
+            title = "Approval superseded"
+            status = .completed
         case .expired:
             title = "Approval expired"
             status = .failed

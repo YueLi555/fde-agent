@@ -3,6 +3,9 @@ import Foundation
 enum MissionIntentType: String, Codable, CaseIterable, Identifiable, Sendable {
     case aiAgentCompatibilityAssessment = "AI_AGENT_COMPATIBILITY_ASSESSMENT"
     case safeSandboxAcceptance = "SAFE_SANDBOX_ACCEPTANCE"
+    case candidatePatchGeneration = "CANDIDATE_PATCH_GENERATION"
+    case candidatePatchRevert = "CANDIDATE_PATCH_REVERT"
+    case candidatePatchSandboxDestroy = "CANDIDATE_PATCH_SANDBOX_DESTROY"
     case answerQuestion = "answer_question"
     case inspectWorkspace = "inspect_workspace"
     case architectureAnalysis = "architecture_analysis"
@@ -33,6 +36,10 @@ enum MissionConstraint: String, Codable, CaseIterable, Identifiable, Sendable {
 enum MissionExpectedOutput: String, Codable, CaseIterable, Identifiable, Sendable {
     case aiIntegrationAssessmentReport = "ai_integration_assessment_report"
     case safeSandboxAcceptanceReport = "safe_sandbox_acceptance_report"
+    case candidatePatchPlan = "candidate_patch_plan"
+    case candidatePatchReview = "candidate_patch_review"
+    case candidatePatchRevertReview = "candidate_patch_revert_review"
+    case candidatePatchSandboxDestructionReview = "candidate_patch_sandbox_destruction_review"
     case directAnswer = "direct_answer"
     case workspaceSummary = "workspace_summary"
     case architectureSummary = "architecture_summary"
@@ -140,6 +147,15 @@ struct MissionIntentParser: MissionIntentParsing {
     }
 
     private func classify(_ normalized: String) -> MissionIntentType {
+        if let primaryCandidatePatchAction = primaryCandidatePatchAction(normalized) {
+            return primaryCandidatePatchAction
+        }
+        if isCandidatePatchRevert(normalized) {
+            return .candidatePatchRevert
+        }
+        if isCandidatePatchGeneration(normalized) {
+            return .candidatePatchGeneration
+        }
         if isSafeSandboxAcceptance(normalized) {
             return .safeSandboxAcceptance
         }
@@ -265,6 +281,218 @@ struct MissionIntentParser: MissionIntentParsing {
         return explicitPhase || sandboxAction || isolatedSandboxRequest
     }
 
+    private func isCandidatePatchGeneration(_ normalized: String) -> Bool {
+        let explicitlyProhibitsCandidatePatch = containsAny(
+            normalized,
+            [
+                "do not generate a candidate patch", "don't generate a candidate patch",
+                "no candidate patch", "without a candidate patch",
+                "不要生成 candidate patch", "不要生成候选修改", "不要生成候选补丁",
+                "不生成 candidate patch", "不生成候选修改", "不生成候选补丁"
+            ]
+        )
+        if explicitlyProhibitsCandidatePatch { return false }
+        let explicitCandidatePatch = containsAny(
+            normalized,
+            [
+                "candidate patch", "candidate-patch", "候选修改", "候选补丁", "候选 patch",
+                "生成候选修改", "生成 candidate patch", "candidate changes"
+            ]
+        )
+        let sandboxImplementation = containsAny(normalized, ["sandbox", "沙箱"])
+            && containsAny(
+                normalized,
+                [
+                    "implement the proposed integration", "implement the proposed change",
+                    "implement in an isolated", "implement in the safe", "apply proposed source changes",
+                    "实现建议方案", "实现建议", "实施建议", "实现接入方案", "生成修改"
+                ]
+            )
+        let assessmentBacked = containsAny(
+            normalized,
+            ["phase 2c", "phase2c", "integration assessment", "接入评估", "当前 ai 接入评估"]
+        ) && containsAny(normalized, ["generate", "implement", "apply", "生成", "实现", "实施"])
+        return explicitCandidatePatch || sandboxImplementation || assessmentBacked
+    }
+
+    private func isCandidatePatchRevert(_ normalized: String) -> Bool {
+        let affirmativePhrases = [
+            "回滚刚刚应用的 candidate patch",
+            "撤销这个候选修改",
+            "恢复 patch 修改前的 sandbox",
+            "删除本次 patch 创建的文件",
+            "恢复 preimage",
+            "revert the applied candidate patch",
+            "roll back this patch",
+            "rollback this patch",
+            "undo the sandbox changes",
+            "restore the patch preimages"
+        ]
+        if containsAny(normalized, affirmativePhrases) { return true }
+
+        let revertAction = containsAny(
+            normalized,
+            [
+                "revert", "roll back", "rollback", "undo", "restore preimage", "restore the preimage",
+                "回滚", "撤销", "恢复 preimage", "恢复修改前", "删除本次 patch 创建"
+            ]
+        )
+        let patchObject = containsAny(
+            normalized,
+            [
+                "candidate patch", "candidate-patch", "this patch", "the patch", "sandbox changes",
+                "patch preimage", "候选修改", "候选补丁", "候选 patch", "本次 patch", "sandbox"
+            ]
+        )
+        return revertAction && patchObject
+    }
+
+    private func primaryCandidatePatchAction(_ normalized: String) -> MissionIntentType? {
+        let clauses = normalized
+            .components(separatedBy: CharacterSet(charactersIn: "。！？!?;；"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        var hasAffirmativeDestruction = false
+        var hasAffirmativeRevert = false
+        for clause in clauses {
+            hasAffirmativeDestruction = hasAffirmativeDestruction
+                || isAffirmativeCurrentSandboxDestruction(clause)
+            hasAffirmativeRevert = hasAffirmativeRevert
+                || isAffirmativeCurrentCandidatePatchRevert(clause)
+        }
+        if hasAffirmativeDestruction { return .candidatePatchSandboxDestroy }
+        if hasAffirmativeRevert { return .candidatePatchRevert }
+        return nil
+    }
+
+    private func isAffirmativeCurrentSandboxDestruction(_ clause: String) -> Bool {
+        guard !isNegatedSandboxDestruction(clause),
+              !isConditionalOrFutureSandboxDestruction(clause) else {
+            return false
+        }
+        let affirmativePhrases = [
+            "销毁这个已回滚的 sandbox",
+            "销毁这个已经回滚的 sandbox",
+            "删除这个 safe sandbox",
+            "删除以下 safe sandbox",
+            "销毁 patch 对应的隔离环境",
+            "清理已完成 revert 的 sandbox",
+            "现在清理这个已 revert 的隔离环境",
+            "启动 sandbox_destruction_confirmation_required",
+            "destroy the reverted patch sandbox",
+            "destroy this reverted sandbox",
+            "delete this safe sandbox",
+            "delete the following safe sandbox",
+            "remove the isolated sandbox after revert",
+            "clean up the reverted patch sandbox",
+            "start sandbox destruction confirmation now",
+            "sandbox_destruction_confirmation_required"
+        ]
+        if containsAny(clause, affirmativePhrases) { return true }
+
+        let imperativeDestruction = containsAny(
+            clause,
+            [
+                "please destroy", "destroy this", "destroy the", "delete this", "delete the following",
+                "remove this", "remove the", "clean up this", "clean up the", "cleanup this", "cleanup the",
+                "want to destroy", "start sandbox destruction", "and destroy", "then destroy",
+                "请销毁", "请删除", "请清理", "销毁这个", "销毁以下", "删除这个", "删除以下",
+                "移除这个", "清理这个", "现在清理", "立即销毁", "希望销毁", "要销毁",
+                "并销毁", "然后销毁", "启动 sandbox_destruction"
+            ]
+        )
+        let sandboxObject = containsAny(
+            clause,
+            [
+                "sandbox", "safe sandbox", "isolated sandbox", "isolated environment",
+                "隔离环境", "沙箱"
+            ]
+        )
+        return imperativeDestruction && sandboxObject
+    }
+
+    private func isAffirmativeCurrentCandidatePatchRevert(_ clause: String) -> Bool {
+        guard !isNegatedCandidatePatchRevert(clause),
+              !isConditionalRevertReference(clause) else {
+            return false
+        }
+        let explicitMissionToken = clause.contains("candidate_patch_revert")
+            && containsAny(
+                clause,
+                ["启动", "start", "route to", "流程", "flow", "仅对", "only"]
+            )
+            && !containsAny(
+                clause,
+                ["不要启动", "不得启动", "do not start", "do not route", "must not route"]
+            )
+        let imperativeRevert = containsAny(
+            clause,
+            [
+                "please revert", "revert this", "revert the", "roll back this", "roll back the",
+                "rollback this", "undo the sandbox changes", "restore the patch preimages",
+                "start candidate_patch_revert", "启动专用 candidate_patch_revert", "启动 candidate_patch_revert",
+                "请回滚", "仅对", "回滚这个", "回滚以下", "撤销这个候选修改",
+                "恢复 patch 修改前", "恢复 preimage", "删除本次 patch 创建"
+            ]
+        )
+        let patchObject = explicitMissionToken || containsAny(
+            clause,
+            [
+                "candidate patch", "candidate-patch", "this patch", "the patch", "sandbox changes",
+                "patch preimage", "候选修改", "候选补丁", "候选 patch", "本次 patch", "sandbox"
+            ]
+        )
+        return (explicitMissionToken || imperativeRevert) && patchObject
+    }
+
+    private func isNegatedSandboxDestruction(_ clause: String) -> Bool {
+        containsAny(
+            clause,
+            [
+                "不要销毁", "不要删除", "不得销毁", "不销毁", "未授权销毁",
+                "do not destroy", "don't destroy", "must not destroy", "not destroy",
+                "do not delete", "do not remove", "destruction is not authorized",
+                "destruction not authorized", "not authorized yet", "without destroying"
+            ]
+        )
+    }
+
+    private func isConditionalOrFutureSandboxDestruction(_ clause: String) -> Bool {
+        let destructionMention = containsAny(
+            clause,
+            ["销毁", "删除 sandbox", "destruction", "destroy", "delete the sandbox"]
+        )
+        guard destructionMention else { return false }
+        return containsAny(
+            clause,
+            [
+                "销毁必须在", "成功后进行", "后再单独销毁", "revert 后再", "作为独立操作",
+                "仅在 revert 成功后", "only after revert", "after revert succeeds",
+                "destruction must", "separate later action", "separate action later",
+                "must remain a separate action", "not authorized yet"
+            ]
+        )
+    }
+
+    private func isNegatedCandidatePatchRevert(_ clause: String) -> Bool {
+        containsAny(
+            clause,
+            ["不要回滚", "不得回滚", "不回滚", "do not revert", "don't revert", "must not revert"]
+        )
+    }
+
+    private func isConditionalRevertReference(_ clause: String) -> Bool {
+        let destructionMention = containsAny(clause, ["销毁", "destruction", "destroy", "delete"])
+        guard destructionMention else { return false }
+        return containsAny(
+            clause,
+            [
+                "revert 成功后", "revert 后再", "after revert succeeds", "only after revert",
+                "after the revert succeeds", "once revert succeeds"
+            ]
+        )
+    }
+
     private func isExplicitReadOnlyInspection(_ normalized: String) -> Bool {
         let forbidsMutation = containsAny(
             normalized,
@@ -330,14 +558,17 @@ struct MissionIntentParser: MissionIntentParsing {
             normalized,
             [
                 "ai agent", "ai-agent", "aiagent", "ai assistant", "ai workflow",
-                "customer support agent", "customer service agent", "sales agent", "workflow agent",
+                "customer support", "customer-support", "customer service", "customer-service",
+                "customer support agent", "customer-support agent", "customer service agent",
+                "customer-service agent", "sales agent", "workflow agent",
                 "data analysis agent", "knowledge agent", "developer assistant",
-                "智能体", "ai 助手", "ai 工作流"
+                "智能体", "客服 agent", "客户支持 agent", "客户服务 agent", "ai 助手", "ai 工作流"
             ]
         )
         let asksForAssessment = containsAny(
             normalized,
             [
+                "assess", "assessment", "evaluate", "evaluation", "评估", "评价",
                 "接入", "集成", "可以接", "兼容", "准备好", "阻碍", "阻塞",
                 "integrate", "integration", "connect", "support", "compatible", "compatibility",
                 "ready", "readiness", "blocker", "preventing"
@@ -375,6 +606,12 @@ struct MissionIntentParser: MissionIntentParsing {
         }
 
         switch intentType {
+        case .candidatePatchSandboxDestroy:
+            values.append(contentsOf: [.allowFileEdits, .requiresApproval, .noNetwork])
+        case .candidatePatchRevert:
+            values.append(contentsOf: [.allowFileEdits, .requiresApproval, .noNetwork])
+        case .candidatePatchGeneration:
+            values.append(contentsOf: [.allowFileEdits, .requiresApproval, .noNetwork])
         case .safeSandboxAcceptance:
             values.append(contentsOf: [.readOnly, .noNetwork, .runVerification])
         case .aiAgentCompatibilityAssessment, .architectureAnalysis, .inspectWorkspace, .answerQuestion, .explainCode, .generateReport:
@@ -392,6 +629,12 @@ struct MissionIntentParser: MissionIntentParsing {
 
     private func expectedOutputs(for intentType: MissionIntentType) -> [MissionExpectedOutput] {
         switch intentType {
+        case .candidatePatchSandboxDestroy:
+            return [.candidatePatchSandboxDestructionReview, .executionReport]
+        case .candidatePatchRevert:
+            return [.candidatePatchRevertReview, .executionReport]
+        case .candidatePatchGeneration:
+            return [.candidatePatchPlan, .candidatePatchReview, .codePatch, .riskAssessment]
         case .safeSandboxAcceptance:
             return [.safeSandboxAcceptanceReport, .executionReport]
         case .aiAgentCompatibilityAssessment:
@@ -434,6 +677,8 @@ struct MissionIntentParser: MissionIntentParsing {
         }
 
         switch intentType {
+        case .candidatePatchGeneration, .candidatePatchRevert, .candidatePatchSandboxDestroy:
+            break
         case .safeSandboxAcceptance:
             break
         case .aiAgentCompatibilityAssessment, .architectureAnalysis:
@@ -501,6 +746,12 @@ struct MissionIntentParser: MissionIntentParsing {
 
     private func normalizedGoal(for input: String, intentType: MissionIntentType) -> String {
         switch intentType {
+        case .candidatePatchSandboxDestroy:
+            return "Destroy one exactly bound reverted Candidate Patch Sandbox after separate explicit confirmation."
+        case .candidatePatchRevert:
+            return "Revert one exactly bound applied Candidate Patch inside its existing Safe Sandbox after explicit confirmation."
+        case .candidatePatchGeneration:
+            return "Generate an approval-gated Candidate Patch only inside the validated Safe Sandbox."
         case .safeSandboxAcceptance:
             return "Create, validate, and destroy an isolated Sandbox without changing the selected Legacy source."
         case .aiAgentCompatibilityAssessment:
@@ -535,6 +786,14 @@ struct MissionIntentParser: MissionIntentParsing {
     private func clarificationQuestion(for intentType: MissionIntentType, language: String) -> String {
         let usesChinese = language == "zh"
         switch intentType {
+        case .candidatePatchSandboxDestroy:
+            return usesChinese
+                ? "请选择要销毁的确切已回滚 Candidate Patch Sandbox。"
+                : "Select the exact reverted Candidate Patch Sandbox to destroy."
+        case .candidatePatchRevert:
+            return usesChinese
+                ? "请选择要回滚的确切 Candidate Patch。"
+                : "Select the exact Candidate Patch to revert."
         case .debugIssue:
             return usesChinese
                 ? "你希望我从哪个报错、异常现象或复现步骤开始排查？"

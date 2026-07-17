@@ -2,13 +2,15 @@ import Foundation
 
 actor SQLitePersistenceStore: PersistenceStore {
     private let connection: SQLiteConnection
+    private var injectedSequenceConflictsRemaining: Int
 
-    init(databaseURL: URL) throws {
+    init(databaseURL: URL, injectedSequenceConflicts: Int = 0) throws {
         try FileManager.default.createDirectory(
             at: databaseURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
         self.connection = try SQLiteConnection(path: databaseURL.path)
+        self.injectedSequenceConflictsRemaining = max(0, injectedSequenceConflicts)
     }
 
     func initialize() async throws {
@@ -25,6 +27,7 @@ actor SQLitePersistenceStore: PersistenceStore {
             event_namespace TEXT,
             local_project_root TEXT,
             local_agent_project_root TEXT,
+            last_event_seq INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
         """)
@@ -36,6 +39,7 @@ actor SQLitePersistenceStore: PersistenceStore {
         try? connection.execute("ALTER TABLE workspaces ADD COLUMN event_namespace TEXT;")
         try? connection.execute("ALTER TABLE workspaces ADD COLUMN local_project_root TEXT;")
         try? connection.execute("ALTER TABLE workspaces ADD COLUMN local_agent_project_root TEXT;")
+        try? connection.execute("ALTER TABLE workspaces ADD COLUMN last_event_seq INTEGER NOT NULL DEFAULT 0;")
 
         try connection.execute("""
         CREATE TABLE IF NOT EXISTS session_metadata (
@@ -89,8 +93,26 @@ actor SQLitePersistenceStore: PersistenceStore {
 
         try? connection.execute("ALTER TABLE events ADD COLUMN parent_event_id TEXT;")
         try connection.execute("CREATE INDEX IF NOT EXISTS idx_events_task ON events(workspace_id, task_id, sequence);")
-        try connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_workspace_sequence ON events(workspace_id, sequence);")
+        do {
+            try connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_workspace_sequence ON events(workspace_id, sequence);")
+        } catch {
+            switch connection.failureKind {
+            case .constraint, .corrupt:
+                throw PersistenceError.eventStoreCorrupt
+            case .unavailable:
+                throw PersistenceError.eventStoreUnavailable
+            case .other:
+                throw PersistenceError.eventTransactionFailed
+            }
+        }
         try backfillEventParents()
+        try connection.execute("""
+        CREATE TABLE IF NOT EXISTS event_sequence_allocators (
+            workspace_id TEXT PRIMARY KEY,
+            last_sequence INTEGER NOT NULL
+        );
+        """)
+        try reconcileEventSequences()
 
         try connection.execute("""
         CREATE TABLE IF NOT EXISTS approval_requests (
@@ -284,12 +306,24 @@ actor SQLitePersistenceStore: PersistenceStore {
     func saveWorkspace(_ workspace: Workspace) async throws {
         try connection.execute(
             """
-            INSERT OR REPLACE INTO workspaces (
+            INSERT INTO workspaces (
                 id, name, org_id, display_name, role, local_data_namespace,
                 policy_namespace, memory_namespace, event_namespace,
                 local_project_root, local_agent_project_root, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                org_id = excluded.org_id,
+                display_name = excluded.display_name,
+                role = excluded.role,
+                local_data_namespace = excluded.local_data_namespace,
+                policy_namespace = excluded.policy_namespace,
+                memory_namespace = excluded.memory_namespace,
+                event_namespace = excluded.event_namespace,
+                local_project_root = excluded.local_project_root,
+                local_agent_project_root = excluded.local_agent_project_root,
+                created_at = excluded.created_at;
             """,
             parameters: [
                 .text(workspace.id.uuidString),
@@ -406,6 +440,10 @@ actor SQLitePersistenceStore: PersistenceStore {
     }
 
     func saveTask(_ task: FDETask) async throws {
+        try upsertTask(task)
+    }
+
+    private func upsertTask(_ task: FDETask) throws {
         try connection.execute(
             """
             INSERT OR REPLACE INTO tasks (
@@ -430,7 +468,103 @@ actor SQLitePersistenceStore: PersistenceStore {
         )
     }
 
-    func appendEvent(_ event: ExecutionEvent) async throws {
+    func appendEvent(
+        _ event: ExecutionEvent,
+        mode: EventAppendMode,
+        initialTask: FDETask?
+    ) async throws -> ExecutionEvent {
+        let maximumAttempts = mode == .live ? 2 : 1
+        var attempt = 0
+        while attempt < maximumAttempts {
+            attempt += 1
+            do {
+                return try appendEventTransaction(event, mode: mode, initialTask: initialTask)
+            } catch PersistenceError.eventSequenceConflict where mode == .live && attempt < maximumAttempts {
+                continue
+            }
+        }
+        throw PersistenceError.eventSequenceConflict
+    }
+
+    private func appendEventTransaction(
+        _ event: ExecutionEvent,
+        mode: EventAppendMode,
+        initialTask: FDETask?
+    ) throws -> ExecutionEvent {
+        do {
+            try connection.execute("BEGIN IMMEDIATE TRANSACTION;")
+        } catch {
+            throw categorizedTransactionError(kind: connection.failureKind)
+        }
+
+        do {
+            if let existing = try loadEvent(id: event.id) {
+                guard existing.workspaceID == event.workspaceID else {
+                    throw PersistenceError.eventDuplicateID
+                }
+                try connection.execute("COMMIT;")
+                return existing
+            }
+
+            let occupiedSequence = mode == .historicalReplay
+                ? try connection.query(
+                    "SELECT id FROM events WHERE workspace_id = ? AND sequence = ? LIMIT 1;",
+                    parameters: [.text(event.workspaceID.uuidString), .int(event.sequence)]
+                ).first
+                : nil
+            if occupiedSequence != nil {
+                throw PersistenceError.eventSequenceConflict
+            }
+
+            let storedSequence: Int64
+            switch mode {
+            case .live:
+                let current = try authoritativeSequence(workspaceID: event.workspaceID)
+                guard current < Int64.max else {
+                    throw PersistenceError.eventTransactionFailed
+                }
+                storedSequence = current + 1
+            case .historicalReplay:
+                guard event.sequence > 0 else {
+                    throw PersistenceError.eventTransactionFailed
+                }
+                storedSequence = event.sequence
+            }
+
+            if injectedSequenceConflictsRemaining > 0 {
+                injectedSequenceConflictsRemaining -= 1
+                throw PersistenceError.eventSequenceConflict
+            }
+
+            var storedEvent = event
+            storedEvent.sequence = storedSequence
+            if let initialTask {
+                guard initialTask.id == storedEvent.taskID,
+                      initialTask.workspaceID == storedEvent.workspaceID else {
+                    throw PersistenceError.eventTransactionFailed
+                }
+                try upsertTask(initialTask)
+            }
+            try insertEvent(storedEvent)
+            let authoritative = max(
+                storedSequence,
+                try authoritativeSequence(workspaceID: storedEvent.workspaceID)
+            )
+            try persistSequenceMetadata(workspaceID: storedEvent.workspaceID, sequence: authoritative)
+            try connection.execute("COMMIT;")
+            return storedEvent
+        } catch {
+            let kind = connection.failureKind
+            try? connection.execute("ROLLBACK;")
+            if let persistenceError = error as? PersistenceError,
+               persistenceError.isSanitizedEventStoreFailure {
+                throw persistenceError
+            }
+            throw categorizedTransactionError(kind: kind)
+        }
+    }
+
+    private func insertEvent(_ event: ExecutionEvent) throws {
         try connection.execute(
             """
             INSERT INTO events (
@@ -481,14 +615,6 @@ actor SQLitePersistenceStore: PersistenceStore {
                 payload: try JSONCoding.decode([String: String].self, from: try required(row, "payload_json"))
             )
         }
-    }
-
-    func loadMaxEventSequence() async throws -> Int64 {
-        let rows = try connection.query("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM events;")
-        guard let row = rows.first else {
-            return 0
-        }
-        return try requiredInt(row, "max_sequence")
     }
 
     func saveApprovalRequest(_ request: ApprovalRequest) async throws {
@@ -917,6 +1043,156 @@ actor SQLitePersistenceStore: PersistenceStore {
         )
         return try rows.map { row in
             try JSONCoding.decode(GlobalGovernorDecision.self, from: try required(row, "decision_json"))
+        }
+    }
+
+    private func loadEvent(id: UUID) throws -> ExecutionEvent? {
+        let rows = try connection.query(
+            "SELECT * FROM events WHERE id = ? LIMIT 1;",
+            parameters: [.text(id.uuidString)]
+        )
+        guard let row = rows.first else { return nil }
+        return try decodeEvent(row)
+    }
+
+    private func decodeEvent(_ row: [String: String?]) throws -> ExecutionEvent {
+        let taskValue = row["task_id"] ?? nil
+        let parentValue = row["parent_event_id"] ?? nil
+        return ExecutionEvent(
+            id: try requiredUUID(row, "id"),
+            parentEventID: parentValue.flatMap(UUID.init(uuidString:)),
+            workspaceID: try requiredUUID(row, "workspace_id"),
+            taskID: taskValue.flatMap(UUID.init(uuidString:)),
+            type: EventType(rawValue: try required(row, "type")) ?? .stateUpdated,
+            sequence: try requiredInt(row, "sequence"),
+            timestamp: DateCodec.decode(try required(row, "timestamp")),
+            summary: try required(row, "summary"),
+            payload: try JSONCoding.decode([String: String].self, from: try required(row, "payload_json"))
+        )
+    }
+
+    private func authoritativeSequence(workspaceID: UUID) throws -> Int64 {
+        let rows = try connection.query(
+            """
+            SELECT MAX(
+                COALESCE((SELECT MAX(sequence) FROM events WHERE workspace_id = ?), 0),
+                COALESCE((SELECT last_event_seq FROM workspaces WHERE id = ?), 0),
+                COALESCE((SELECT last_sequence FROM event_sequence_allocators WHERE workspace_id = ?), 0)
+            ) AS current_sequence;
+            """,
+            parameters: [
+                .text(workspaceID.uuidString),
+                .text(workspaceID.uuidString),
+                .text(workspaceID.uuidString)
+            ]
+        )
+        guard let row = rows.first else { return 0 }
+        let sequence = try requiredInt(row, "current_sequence")
+        guard sequence >= 0 else { throw PersistenceError.eventStoreCorrupt }
+        return sequence
+    }
+
+    private func persistSequenceMetadata(workspaceID: UUID, sequence: Int64) throws {
+        try connection.execute(
+            """
+            INSERT INTO event_sequence_allocators (workspace_id, last_sequence)
+            VALUES (?, ?)
+            ON CONFLICT(workspace_id) DO UPDATE SET
+                last_sequence = MAX(event_sequence_allocators.last_sequence, excluded.last_sequence);
+            """,
+            parameters: [.text(workspaceID.uuidString), .int(sequence)]
+        )
+        try connection.execute(
+            "UPDATE workspaces SET last_event_seq = MAX(last_event_seq, ?) WHERE id = ?;",
+            parameters: [.int(sequence), .text(workspaceID.uuidString)]
+        )
+    }
+
+    private func reconcileEventSequences() throws {
+        do {
+            try connection.execute("BEGIN IMMEDIATE TRANSACTION;")
+        } catch {
+            throw categorizedTransactionError(kind: connection.failureKind)
+        }
+
+        do {
+            let integrityRows = try connection.query("PRAGMA quick_check;")
+            guard integrityRows.count == 1,
+                  (integrityRows.first?["quick_check"] ?? nil) == "ok" else {
+                throw PersistenceError.eventStoreCorrupt
+            }
+            let invalidEventCount = try requiredInt(
+                try connection.query("SELECT COUNT(*) AS invalid_count FROM events WHERE sequence < 1;").first ?? [:],
+                "invalid_count"
+            )
+            let duplicateSequenceCount = try requiredInt(
+                try connection.query(
+                    """
+                    SELECT COUNT(*) AS duplicate_count FROM (
+                        SELECT workspace_id, sequence
+                        FROM events
+                        GROUP BY workspace_id, sequence
+                        HAVING COUNT(*) > 1
+                    );
+                    """
+                ).first ?? [:],
+                "duplicate_count"
+            )
+            let invalidMetadataCount = try requiredInt(
+                try connection.query(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM workspaces WHERE last_event_seq < 0)
+                        + (SELECT COUNT(*) FROM event_sequence_allocators WHERE last_sequence < 0)
+                        AS invalid_count;
+                    """
+                ).first ?? [:],
+                "invalid_count"
+            )
+            guard invalidEventCount == 0,
+                  duplicateSequenceCount == 0,
+                  invalidMetadataCount == 0 else {
+                throw PersistenceError.eventStoreCorrupt
+            }
+
+            let workspaceRows = try connection.query(
+                """
+                SELECT id AS workspace_id FROM workspaces
+                UNION
+                SELECT workspace_id FROM events
+                UNION
+                SELECT workspace_id FROM event_sequence_allocators;
+                """
+            )
+            for row in workspaceRows {
+                guard let workspaceID = UUID(uuidString: try required(row, "workspace_id")) else {
+                    throw PersistenceError.eventStoreCorrupt
+                }
+                let sequence = try authoritativeSequence(workspaceID: workspaceID)
+                try persistSequenceMetadata(workspaceID: workspaceID, sequence: sequence)
+            }
+            try connection.execute("COMMIT;")
+        } catch {
+            let kind = connection.failureKind
+            try? connection.execute("ROLLBACK;")
+            if let persistenceError = error as? PersistenceError,
+               persistenceError.isSanitizedEventStoreFailure {
+                throw persistenceError
+            }
+            throw categorizedTransactionError(kind: kind)
+        }
+    }
+
+    private func categorizedTransactionError(kind: SQLiteFailureKind) -> PersistenceError {
+        switch kind {
+        case .constraint:
+            return .eventSequenceConflict
+        case .unavailable:
+            return .eventStoreUnavailable
+        case .corrupt:
+            return .eventStoreCorrupt
+        case .other:
+            return .eventTransactionFailed
         }
     }
 
