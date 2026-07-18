@@ -121,6 +121,7 @@ struct AgentRuntimeProfile: Codable, Hashable, Sendable {
             transitionGraph: graph,
             executableIntentTypes: [
                 .candidatePatchGeneration,
+                .generatedTestPlan,
                 .safeSandboxAcceptance,
                 .inspectWorkspace,
                 .architectureAnalysis,
@@ -480,6 +481,8 @@ struct StateMachineChatProvider: AgentChatProviding {
                 return chinese ? "安全回滚已应用候选补丁" : "revert exactly bound applied Candidate Patches"
             case .candidatePatchGeneration:
                 return chinese ? "生成审批后候选补丁" : "generate approval-gated Candidate Patches"
+            case .generatedTestPlan:
+                return chinese ? "只读准备 Generated Test Plan" : "prepare an exact-bound read-only Generated Test Plan"
             case .safeSandboxAcceptance:
                 return chinese ? "执行安全沙箱验收" : "run Safe Sandbox acceptance"
             case .aiAgentCompatibilityAssessment:

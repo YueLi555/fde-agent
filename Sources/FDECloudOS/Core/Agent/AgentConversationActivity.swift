@@ -45,6 +45,11 @@ enum AgentConversationActivityKind: String, Codable, CaseIterable, Hashable, Sen
     case revertingCandidatePatch
     case candidatePatchReverted
     case sandboxDestroyed
+    case resolvingGeneratedTestEnvironment
+    case generatedTestClarificationRequired
+    case preparingGeneratedTestPlan
+    case generatedTestPlanReviewReady
+    case generatedTestPlanningBlocked
     case preparingFinalAnswer
     case preparingPartialAnswer
     case retryingProvider
@@ -55,11 +60,12 @@ enum AgentConversationActivityKind: String, Codable, CaseIterable, Hashable, Sen
 
     var priority: Int {
         switch self {
-        case .failed, .candidatePatchBlocked: return 20
+        case .failed, .candidatePatchBlocked, .generatedTestPlanningBlocked: return 20
         case .sandboxCreationBlocked: return 19
         case .blocked: return 18
         case .partial: return 17
-        case .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed: return 17
+        case .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed,
+             .generatedTestPlanReviewReady, .generatedTestClarificationRequired: return 17
         case .sandboxReady: return 16
         case .completed: return 15
         case .destroyingSandbox, .finalizingSandboxAcceptance, .buildingUnifiedDiff: return 14
@@ -67,7 +73,7 @@ enum AgentConversationActivityKind: String, Codable, CaseIterable, Hashable, Sen
         case .preparingPartialAnswer: return 12
         case .retryingProvider: return 11
         case .confirmingSourceIsolation, .checkingPathContainment, .verifyingFileHashes,
-             .applyingCandidatePatch, .revertingCandidatePatch: return 10
+             .applyingCandidatePatch, .revertingCandidatePatch, .resolvingGeneratedTestEnvironment: return 10
         case .confirmingOriginalLegacyUnchanged: return 10
         case .excludingSensitiveFiles, .copyingApprovedSourceFiles, .creatingIsolatedSandbox,
              .creatingSourceSnapshot, .checkingLocalSourceAvailability,
@@ -78,7 +84,8 @@ enum AgentConversationActivityKind: String, Codable, CaseIterable, Hashable, Sen
         case .searchingFiles: return 5
         case .listingDirectory: return 4
         case .inspectingProject, .validatingPlan, .repairingPlan, .planning,
-             .preparingCandidatePatch, .waitingCandidatePatchApproval: return 3
+             .preparingCandidatePatch, .waitingCandidatePatchApproval,
+             .preparingGeneratedTestPlan: return 3
         case .compilingContext, .preparingTask: return 2
         case .thinking: return 2
         case .idle: return 1
@@ -88,7 +95,9 @@ enum AgentConversationActivityKind: String, Codable, CaseIterable, Hashable, Sen
     var isTerminal: Bool {
         switch self {
         case .blocked, .failed, .partial, .completed, .sandboxReady, .sandboxCreationBlocked,
-             .candidatePatchReady, .candidatePatchBlocked, .candidatePatchReverted, .sandboxDestroyed:
+             .candidatePatchReady, .candidatePatchBlocked, .candidatePatchReverted, .sandboxDestroyed,
+             .generatedTestClarificationRequired, .generatedTestPlanReviewReady,
+             .generatedTestPlanningBlocked:
             return true
         default:
             return false
@@ -126,6 +135,7 @@ struct AgentConversationActivityMetadata: Equatable, Sendable {
     var aiAssessment: AIAssessmentActivitySnapshot?
     var sandbox: SandboxActivitySnapshot?
     var candidatePatch: CandidatePatchActivitySnapshot?
+    var generatedTest: GeneratedTestActivitySnapshot?
 
     init(
         dialogID: UUID,
@@ -143,7 +153,8 @@ struct AgentConversationActivityMetadata: Equatable, Sendable {
         retryAttempt: Int? = nil,
         aiAssessment: AIAssessmentActivitySnapshot? = nil,
         sandbox: SandboxActivitySnapshot? = nil,
-        candidatePatch: CandidatePatchActivitySnapshot? = nil
+        candidatePatch: CandidatePatchActivitySnapshot? = nil,
+        generatedTest: GeneratedTestActivitySnapshot? = nil
     ) {
         self.dialogID = dialogID
         self.taskID = taskID
@@ -161,6 +172,7 @@ struct AgentConversationActivityMetadata: Equatable, Sendable {
         self.aiAssessment = aiAssessment
         self.sandbox = sandbox
         self.candidatePatch = candidatePatch
+        self.generatedTest = generatedTest
     }
 }
 
@@ -308,6 +320,16 @@ enum AgentConversationActivityCopy {
             return "Candidate Patch reverted"
         case .sandboxDestroyed:
             return "Sandbox destroyed"
+        case .resolvingGeneratedTestEnvironment:
+            return "Resolving grounded test framework and location…"
+        case .generatedTestClarificationRequired:
+            return "Generated Test Plan clarification required"
+        case .preparingGeneratedTestPlan:
+            return "Preparing read-only Generated Test Plan…"
+        case .generatedTestPlanReviewReady:
+            return "Generated Test Plan review ready"
+        case .generatedTestPlanningBlocked:
+            return "Generated Test planning blocked"
         case .preparingFinalAnswer:
             return "Preparing grounded findings…"
         case .preparingPartialAnswer:
@@ -605,7 +627,19 @@ struct AgentConversationActivityReducer: Sendable {
         if let candidatePatch = CandidatePatchActivitySnapshot(eventPayload: event.payload) {
             next.metadata.candidatePatch = candidatePatch
         }
+        if let generatedTest = GeneratedTestActivitySnapshot(eventPayload: event.payload) {
+            next.metadata.generatedTest = generatedTest
+        }
         next.labelOverride = nil
+
+        if let rawPhase = event.payload["generated_test_activity_phase"],
+           let phase = GeneratedTestActivityPhase(rawValue: rawPhase) {
+            next.kind = generatedTestActivity(phase)
+            next.labelOverride = phase.rawValue + (phase == .testPlanReviewReady
+                || phase == .clarificationRequired
+                || phase == .generatedTestPlanningBlocked ? "" : "…")
+            return next
+        }
 
         if event.payload["partial_completion_state"] == "BLOCKED_WITH_PARTIAL_RESULT" {
             next.kind = .partial
@@ -740,6 +774,24 @@ struct AgentConversationActivityReducer: Sendable {
             return .candidatePatchReverted
         case .sandboxDestroyed:
             return .sandboxDestroyed
+        }
+    }
+
+    private static func generatedTestActivity(
+        _ phase: GeneratedTestActivityPhase
+    ) -> AgentConversationActivityKind {
+        switch phase {
+        case .validatingExactPatchBinding, .verifyingCandidatePatchArtifact,
+             .loadingStructuredValidationPlan, .preparingReadOnlyPlan:
+            return .preparingGeneratedTestPlan
+        case .resolvingTestEnvironment:
+            return .resolvingGeneratedTestEnvironment
+        case .clarificationRequired:
+            return .generatedTestClarificationRequired
+        case .testPlanReviewReady:
+            return .generatedTestPlanReviewReady
+        case .generatedTestPlanningBlocked:
+            return .generatedTestPlanningBlocked
         }
     }
 

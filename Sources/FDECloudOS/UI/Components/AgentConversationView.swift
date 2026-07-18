@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -5,6 +6,8 @@ struct AgentConversationView: View {
     let session: AgentSession
     let events: [ExecutionEvent]
     var activity: AgentConversationActivity? = nil
+    var candidatePatchAssets: [CandidatePatchActivitySnapshot] = []
+    var generatedTestAssets: [GeneratedTestActivitySnapshot] = []
     let approvals: [ApprovalRequest]
     var showsHeader = true
     let onApprove: (ApprovalRequest) -> Void
@@ -13,6 +16,7 @@ struct AgentConversationView: View {
     let onSelectOption: (UUID, String) -> Void
     var onCandidatePatchRevert: ((CandidatePatchActivitySnapshot) -> Void)? = nil
     var onCandidatePatchDestroySandbox: ((CandidatePatchActivitySnapshot) -> Void)? = nil
+    var onPlanGeneratedTests: ((CandidatePatchActivitySnapshot) -> Void)? = nil
 
     private var displayItems: [AgentConversationDisplayItem] {
         AgentConversationWorkUnitAdapter.displayItems(
@@ -49,11 +53,27 @@ struct AgentConversationView: View {
                     )
                 }
 
+                ForEach(candidatePatchAssets, id: \.assetID) { snapshot in
+                    CandidatePatchStatusCard(
+                        snapshot: snapshot,
+                        onRevert: onCandidatePatchRevert,
+                        onDestroySandbox: onCandidatePatchDestroySandbox,
+                        onPlanGeneratedTests: onPlanGeneratedTests
+                    )
+                }
+
+                ForEach(generatedTestAssets, id: \.assetID) { snapshot in
+                    GeneratedTestPlanStatusCard(snapshot: snapshot)
+                }
+
                 if let activity, activity.kind.isVisible {
                     AgentConversationActivityRow(
                         activity: activity,
+                        projectedCandidatePatchIDs: Set(candidatePatchAssets.map(\.assetID)),
+                        projectedGeneratedTestIDs: Set(generatedTestAssets.map(\.assetID)),
                         onCandidatePatchRevert: onCandidatePatchRevert,
-                        onCandidatePatchDestroySandbox: onCandidatePatchDestroySandbox
+                        onCandidatePatchDestroySandbox: onCandidatePatchDestroySandbox,
+                        onPlanGeneratedTests: onPlanGeneratedTests
                     )
                 }
             }
@@ -79,8 +99,11 @@ struct AgentConversationView: View {
 private struct AgentConversationActivityRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let activity: AgentConversationActivity
+    let projectedCandidatePatchIDs: Set<String>
+    let projectedGeneratedTestIDs: Set<String>
     let onCandidatePatchRevert: ((CandidatePatchActivitySnapshot) -> Void)?
     let onCandidatePatchDestroySandbox: ((CandidatePatchActivitySnapshot) -> Void)?
+    let onPlanGeneratedTests: ((CandidatePatchActivitySnapshot) -> Void)?
     @State private var pulses = false
 
     var body: some View {
@@ -121,12 +144,21 @@ private struct AgentConversationActivityRow: View {
                 SandboxStatusCard(snapshot: sandbox)
             }
 
-            if let candidatePatch = activity.metadata.candidatePatch {
+            if let candidatePatch = activity.metadata.candidatePatch,
+               !projectedCandidatePatchIDs.contains(candidatePatch.assetID) {
                 CandidatePatchStatusCard(
                     snapshot: candidatePatch,
                     onRevert: onCandidatePatchRevert,
-                    onDestroySandbox: onCandidatePatchDestroySandbox
+                    onDestroySandbox: onCandidatePatchDestroySandbox,
+                    onPlanGeneratedTests: activity.metadata.generatedTest == nil
+                        ? onPlanGeneratedTests
+                        : nil
                 )
+            }
+
+            if let generatedTest = activity.metadata.generatedTest,
+               !projectedGeneratedTestIDs.contains(generatedTest.assetID) {
+                GeneratedTestPlanStatusCard(snapshot: generatedTest)
             }
         }
         .frame(maxWidth: 680, alignment: .leading)
@@ -141,9 +173,11 @@ private struct AgentConversationActivityRow: View {
     private var tint: Color {
         switch activity.kind {
         case .failed: return .red
-        case .blocked, .sandboxCreationBlocked, .candidatePatchBlocked: return .orange
+        case .blocked, .sandboxCreationBlocked, .candidatePatchBlocked,
+             .generatedTestClarificationRequired, .generatedTestPlanningBlocked: return .orange
         case .partial: return .teal
-        case .completed, .sandboxReady, .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed: return .green
+        case .completed, .sandboxReady, .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed,
+             .generatedTestPlanReviewReady: return .green
         default: return .accentColor
         }
     }
@@ -151,9 +185,11 @@ private struct AgentConversationActivityRow: View {
     private var terminalSymbol: String {
         switch activity.kind {
         case .failed: return "xmark"
-        case .blocked, .sandboxCreationBlocked, .candidatePatchBlocked: return "exclamationmark"
+        case .blocked, .sandboxCreationBlocked, .candidatePatchBlocked,
+             .generatedTestClarificationRequired, .generatedTestPlanningBlocked: return "exclamationmark"
         case .partial: return "circle.lefthalf.filled"
-        case .completed, .sandboxReady, .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed: return "checkmark"
+        case .completed, .sandboxReady, .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed,
+             .generatedTestPlanReviewReady: return "checkmark"
         default: return "circle.fill"
         }
     }
@@ -179,6 +215,7 @@ private struct CandidatePatchStatusCard: View {
     let snapshot: CandidatePatchActivitySnapshot
     let onRevert: ((CandidatePatchActivitySnapshot) -> Void)?
     let onDestroySandbox: ((CandidatePatchActivitySnapshot) -> Void)?
+    let onPlanGeneratedTests: ((CandidatePatchActivitySnapshot) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -191,6 +228,9 @@ private struct CandidatePatchStatusCard: View {
                 spacing: 8
             ) {
                 metric("Patch ID", abbreviated(snapshot.patchID), color: .accentColor)
+                metric("Plan ID", abbreviated(snapshot.planID), color: .accentColor)
+                metric("Revision", snapshot.planRevision.map(String.init) ?? "—", color: .secondary)
+                metric("Artifact", abbreviated(snapshot.candidatePatchArtifactSHA256), color: .accentColor)
                 metric("Sandbox ID", abbreviated(snapshot.sandboxID), color: .accentColor)
                 metric(
                     "Status",
@@ -206,6 +246,57 @@ private struct CandidatePatchStatusCard: View {
                 metric("Evidence", String(snapshot.evidenceCount), color: .secondary)
                 metric("Source", snapshot.sourceIntegrity?.rawValue.uppercased() ?? "UNKNOWN", color: sourceColor)
                 metric("Approval", snapshot.approvalState?.rawValue ?? "PENDING", color: .purple)
+            }
+
+            DisclosureGroup("Exact details") {
+                VStack(alignment: .leading, spacing: 7) {
+                    exactDetail("Patch ID", snapshot.patchID)
+                    exactDetail("Source Candidate Patch task ID", snapshot.sourceCandidatePatchTaskID)
+                    exactDetail("Plan ID", snapshot.planID)
+                    exactDetail("Plan revision", snapshot.planRevision.map(String.init))
+                    exactDetail("Manifest ID", snapshot.manifestID)
+                    exactDetail(
+                        "Candidate Patch artifact SHA-256",
+                        snapshot.candidatePatchArtifactSHA256,
+                        truncatesVisibleValue: true
+                    )
+                    exactDetail("Sandbox ID", snapshot.sandboxID)
+                    exactDetail("Source snapshot ID", snapshot.sourceSnapshotID)
+                    exactDetail("Canonical Legacy root", snapshot.canonicalLegacyRoot)
+                    exactDetail("Capability ID", snapshot.capabilityID)
+                    exactDetail("Capability label", snapshot.capabilityDisplayLabel)
+                    exactDetail("Assessment ID", snapshot.assessmentID)
+                    exactDetail("Validation-test-plan digest", snapshot.validationTestPlanSHA256)
+                    exactDetail("Unified Diff SHA-256", snapshot.unifiedDiffSHA256)
+                    exactDetail(
+                        "Lifecycle status",
+                        snapshot.projectionState?.rawValue ?? snapshot.status?.rawValue.uppercased()
+                    )
+                    exactDetail("Approval status", snapshot.approvalState?.rawValue)
+                    exactDetail("Files planned", String(snapshot.filesPlanned))
+                    exactDetail("Files changed", String(snapshot.filesChanged))
+                    exactDetail("Source integrity", snapshot.sourceIntegrity?.rawValue.uppercased())
+                }
+                .padding(.top, 4)
+            }
+            .font(.caption)
+
+            if canPlanGeneratedTests {
+                Button {
+                    onPlanGeneratedTests?(snapshot)
+                } label: {
+                    Label("Prepare Generated Test Plan", systemImage: "checklist")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(snapshot.exactGeneratedTestSourceBinding == nil || onPlanGeneratedTests == nil)
+                .accessibilityIdentifier("generatedTests.plan.exactPatch")
+                if let reason = snapshot.generatedTestActionUnavailableReason {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("generatedTests.plan.bindingUnavailable")
+                }
             }
             if canRevert, let onRevert {
                 Button {
@@ -232,7 +323,8 @@ private struct CandidatePatchStatusCard: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.7)
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("candidatePatch.asset.\(snapshot.assetID)")
     }
 
     private var statusColor: Color {
@@ -248,6 +340,10 @@ private struct CandidatePatchStatusCard: View {
             || snapshot.projectionState == .revertConfirmationRequired
             || snapshot.status == .reviewReady
             || snapshot.status == .applied
+    }
+
+    private var canPlanGeneratedTests: Bool {
+        snapshot.projectionState == .patchReady || snapshot.status == .reviewReady
     }
 
     private var canDestroySandbox: Bool {
@@ -279,6 +375,115 @@ private struct CandidatePatchStatusCard: View {
             Text(label).font(.caption2).foregroundStyle(.secondary)
             Text(value).font(.caption.weight(.semibold)).foregroundStyle(color).lineLimit(1)
         }
+    }
+
+    @ViewBuilder
+    private func exactDetail(
+        _ label: String,
+        _ value: String?,
+        truncatesVisibleValue: Bool = false
+    ) -> some View {
+        let fullValue = value?.isEmpty == false ? value! : "—"
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label)
+                .foregroundStyle(.secondary)
+                .frame(width: 166, alignment: .leading)
+            Text(truncatesVisibleValue ? abbreviated(value) : fullValue)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            if fullValue != "—" {
+                Button {
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(fullValue, forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .buttonStyle(.plain)
+                .help("Copy full \(label)")
+                .accessibilityLabel("Copy full \(label)")
+            }
+        }
+    }
+}
+
+private struct GeneratedTestPlanStatusCard: View {
+    let snapshot: GeneratedTestActivitySnapshot
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Generated Test Plan")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 128), spacing: 8)],
+                alignment: .leading,
+                spacing: 8
+            ) {
+                generatedTestMetric("Patch ID", abbreviated(snapshot.patchID))
+                generatedTestMetric("Artifact", abbreviated(snapshot.candidatePatchArtifactSHA256))
+                generatedTestMetric("Sandbox ID", abbreviated(snapshot.sandboxID))
+                generatedTestMetric("Snapshot", abbreviated(snapshot.sourceSnapshotID))
+                generatedTestMetric("Capability", snapshot.capabilityID ?? "UNKNOWN")
+                generatedTestMetric("Assessment", abbreviated(snapshot.assessmentID))
+                generatedTestMetric("Validation items", String(snapshot.validationPlanItemCount))
+                generatedTestMetric("Framework", snapshot.framework ?? "UNKNOWN")
+                generatedTestMetric("Test location", snapshot.testLocation ?? "UNKNOWN")
+                generatedTestMetric("Scenarios", String(snapshot.scenarioCount))
+                generatedTestMetric("Status", snapshot.status.rawValue)
+            }
+            if !snapshot.proposedTestPaths.isEmpty {
+                Text("Proposed paths: \(snapshot.proposedTestPaths.joined(separator: ", "))")
+                    .font(.caption)
+                    .textSelection(.enabled)
+            }
+            if !snapshot.remainingUnknowns.isEmpty {
+                Text("Remaining unknowns: \(snapshot.remainingUnknowns.joined(separator: " · "))")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+            }
+            if snapshot.framework == nil && snapshot.testLocation == nil {
+                Text("No grounded framework was found. No grounded test location was found.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            Text("No test files were created. Test syntax was not verified. Build was not executed. Tests were not executed. Behavioral correctness was not verified.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Phase 2D.3 is unavailable.")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.7)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("generatedTests.plan.status")
+    }
+
+    private func generatedTestMetric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption.monospaced())
+                .lineLimit(2)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue(value)
+    }
+
+    private func abbreviated(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "—" }
+        return value.count > 12 ? "\(value.prefix(12))…" : value
     }
 }
 
@@ -1254,20 +1459,24 @@ extension AgentConversationActivity {
         case .idle: return "Idle"
         case .thinking: return "Thinking"
         case .preparingTask, .compilingContext: return "Understanding"
-        case .planning, .repairingPlan, .validatingPlan, .preparingCandidatePatch: return "Planning"
+        case .planning, .repairingPlan, .validatingPlan, .preparingCandidatePatch,
+             .preparingGeneratedTestPlan: return "Planning"
         case .waitingCandidatePatchApproval: return "Waiting For Approval"
         case .inspectingProject, .listingDirectory, .searchingFiles, .searchingCode,
              .readingFile, .analyzingEvidence, .validatingLegacySource,
              .confirmingCanonicalLegacyRoot, .checkingLocalSourceAvailability, .creatingSourceSnapshot,
              .creatingIsolatedSandbox, .copyingApprovedSourceFiles, .excludingSensitiveFiles,
-             .destroyingSandbox, .applyingCandidatePatch, .revertingCandidatePatch: return "Working"
+             .destroyingSandbox, .applyingCandidatePatch, .revertingCandidatePatch,
+             .resolvingGeneratedTestEnvironment: return "Working"
         case .verifyingFileHashes, .checkingPathContainment, .confirmingSourceIsolation,
              .confirmingOriginalLegacyUnchanged, .finalizingSandboxAcceptance, .buildingUnifiedDiff:
             return "Verifying"
         case .candidatePatchReady: return "Candidate Patch Ready"
         case .candidatePatchReverted: return "Candidate Patch Reverted"
         case .sandboxDestroyed: return "Sandbox Destroyed"
-        case .candidatePatchBlocked: return "Blocked"
+        case .generatedTestPlanReviewReady: return "Generated Test Plan Ready"
+        case .generatedTestClarificationRequired: return "Clarification Required"
+        case .candidatePatchBlocked, .generatedTestPlanningBlocked: return "Blocked"
         case .sandboxReady: return "Sandbox Ready"
         case .sandboxCreationBlocked: return "Blocked"
         case .preparingFinalAnswer, .preparingPartialAnswer: return "Verifying"
@@ -1283,7 +1492,7 @@ extension AgentConversationActivity {
         switch kind {
         case .idle: return .secondary
         case .thinking, .preparingTask, .compilingContext, .planning, .repairingPlan, .validatingPlan,
-             .preparingCandidatePatch:
+             .preparingCandidatePatch, .preparingGeneratedTestPlan:
             return .accentColor
         case .waitingCandidatePatchApproval:
             return .purple
@@ -1291,15 +1500,18 @@ extension AgentConversationActivity {
              .readingFile, .analyzingEvidence, .validatingLegacySource,
              .confirmingCanonicalLegacyRoot, .checkingLocalSourceAvailability, .creatingSourceSnapshot,
              .creatingIsolatedSandbox, .copyingApprovedSourceFiles, .excludingSensitiveFiles,
-             .destroyingSandbox, .applyingCandidatePatch, .revertingCandidatePatch:
+             .destroyingSandbox, .applyingCandidatePatch, .revertingCandidatePatch,
+             .resolvingGeneratedTestEnvironment:
             return .blue
         case .preparingFinalAnswer, .preparingPartialAnswer, .verifyingFileHashes,
              .checkingPathContainment, .confirmingSourceIsolation,
              .confirmingOriginalLegacyUnchanged, .finalizingSandboxAcceptance, .buildingUnifiedDiff:
             return .teal
-        case .sandboxReady, .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed:
+        case .sandboxReady, .candidatePatchReady, .candidatePatchReverted, .sandboxDestroyed,
+             .generatedTestPlanReviewReady:
             return .green
-        case .sandboxCreationBlocked, .candidatePatchBlocked:
+        case .sandboxCreationBlocked, .candidatePatchBlocked,
+             .generatedTestClarificationRequired, .generatedTestPlanningBlocked:
             return .orange
         case .retryingProvider:
             return .purple

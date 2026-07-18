@@ -3,6 +3,7 @@ import Foundation
 enum RuntimeCompletionContractKind: String, Codable, Hashable, Sendable {
     case safeSandboxAcceptance = "SAFE_SANDBOX_ACCEPTANCE"
     case candidatePatchGeneration = "CANDIDATE_PATCH_GENERATION"
+    case generatedTestPlan = "GENERATED_TEST_PLAN"
     case candidatePatchRevert = "CANDIDATE_PATCH_REVERT"
     case candidatePatchSandboxDestroy = "CANDIDATE_PATCH_SANDBOX_DESTROY"
     case planOnly = "PLAN_ONLY"
@@ -46,6 +47,10 @@ struct RuntimeCompletionContract: Sendable {
         normalizedInput = input.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         requiresVerification = intent.constraints.contains(.runVerification)
 
+        if intent.intentType == .generatedTestPlan {
+            kind = .generatedTestPlan
+            return
+        }
         if Self.isExplicitPlanOnlyRequest(normalizedInput) {
             kind = .planOnly
             return
@@ -58,6 +63,8 @@ struct RuntimeCompletionContract: Sendable {
             kind = .candidatePatchRevert
         case .candidatePatchGeneration:
             kind = .candidatePatchGeneration
+        case .generatedTestPlan:
+            kind = .generatedTestPlan
         case .safeSandboxAcceptance:
             kind = .safeSandboxAcceptance
         case .modifyCode, .createFeature, .refactorCode:
@@ -131,6 +138,53 @@ struct RuntimeCompletionContract: Sendable {
         }
 
         switch kind {
+        case .generatedTestPlan:
+            let completion = orderedEvents.last { event in
+                event.type == .taskCompleted
+                    && event.payload["completion_contract"] == RuntimeCompletionContractKind.generatedTestPlan.rawValue
+            }
+            let outcome = completion?.payload["generated_test_outcome"]
+            if outcome != GeneratedTestPlanningOutcome.testPlanReviewReady.rawValue,
+               outcome != GeneratedTestPlanningOutcome.clarificationRequired.rawValue {
+                missing.append("a truthful Generated Test Plan review-ready or clarification outcome")
+            }
+            if completion?.payload["source_binding_verified"] != "true"
+                || completion?.payload["candidate_patch_artifact_verified"] != "true"
+                || completion?.payload["validation_test_plan_loaded"] != "true" {
+                missing.append("verified exact Patch authority and structured validation-plan binding")
+            }
+            if outcome == GeneratedTestPlanningOutcome.testPlanReviewReady.rawValue {
+                if completion?.payload["framework_confirmed"] != "true"
+                    || completion?.payload["test_location_confirmed"] != "true"
+                    || completion?.payload["every_scenario_grounded"] != "true" {
+                    missing.append("confirmed framework, test location, and grounded scenarios")
+                }
+            } else if outcome == GeneratedTestPlanningOutcome.clarificationRequired.rawValue {
+                if completion?.payload["clarification_required"] != "true"
+                    || completion?.payload["approval_request_created"] != "false" {
+                    missing.append("bounded clarification evidence with no approval request")
+                }
+            }
+            let requiredZeroCounters = [
+                "sandbox_write_count",
+                "generated_test_file_count",
+                "generated_test_byte_count",
+                "build_execution_count",
+                "test_execution_count",
+                "syntax_check_count",
+                "shell_count",
+                "git_count",
+                "package_manager_count",
+                "deployment_count",
+                "candidate_patch_write_count",
+                "legacy_write_count"
+            ]
+            if requiredZeroCounters.contains(where: { completion?.payload[$0] != "0" }) {
+                missing.append("explicit zero-write and zero-execution counters")
+            }
+            if completion?.payload["phase_2d_3_available"] != "false" {
+                missing.append("confirmation that Phase 2D.3 remains unavailable")
+            }
         case .candidatePatchSandboxDestroy:
             let completion = orderedEvents.last { event in
                 event.type == .taskCompleted
@@ -549,6 +603,8 @@ struct RuntimeCompletionContract: Sendable {
             : verificationCommands.map { "- `\($0)` passed with exit status 0" }.joined(separator: "\n")
         let outcome: String
         switch kind {
+        case .generatedTestPlan:
+            outcome = "An exact-bound Candidate Patch and validation plan produced a read-only Generated Test Plan or a bounded clarification result; no test bytes were created and syntax, build, tests, runtime behavior, Git, and deployment remain unverified."
         case .candidatePatchSandboxDestroy:
             outcome = "The exact Sandbox bound to the reverted Candidate Patch was destroyed after separate explicit confirmation; audit history was retained and original Legacy integrity remained unchanged."
         case .candidatePatchRevert:

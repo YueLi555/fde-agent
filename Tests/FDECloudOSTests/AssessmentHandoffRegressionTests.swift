@@ -66,6 +66,25 @@ final class AssessmentHandoffRegressionTests: XCTestCase {
         let persistedContext = try decodeAssessmentContext(persisted)
         XCTAssertEqual(persistedContext.finalizationMode, .normal)
         XCTAssertEqual(persistedContext.validationStatus, .validated)
+        let structuredValidationPlan = try XCTUnwrap(persistedContext.validationTestPlan)
+        XCTAssertFalse(structuredValidationPlan.items.isEmpty)
+        XCTAssertFalse(structuredValidationPlan.executionAuthorized)
+        XCTAssertTrue(structuredValidationPlan.items.allSatisfy {
+            !$0.validationItemID.isEmpty
+                && !$0.title.isEmpty
+                && !$0.purpose.isEmpty
+                && !$0.expectedBehavior.isEmpty
+                && $0.runtimeVerificationStatus == .notVerified
+        })
+        XCTAssertEqual(
+            persisted.payload["validation_test_plan_sha256"],
+            CandidatePatchArtifactAuthority.validationTestPlanSHA256(structuredValidationPlan)
+        )
+        XCTAssertEqual(
+            persisted.payload["validation_test_plan_item_count"],
+            String(structuredValidationPlan.items.count)
+        )
+        XCTAssertEqual(persisted.payload["validation_test_execution_authorized"], "false")
         XCTAssertTrue(report.contains(persistedContext.requestedCapabilityID))
         XCTAssertTrue(report.contains(persistedContext.requestedCapabilityDisplayLabel))
 
@@ -125,6 +144,17 @@ final class AssessmentHandoffRegressionTests: XCTestCase {
             pendingApprovals[0].metadata["candidate_patch_plan_summary"]?
                 .contains(pendingApprovals[0].id.uuidString) == true
         )
+        let candidateManifest = try XCTUnwrap(
+            CandidatePatchManifestStore(
+                lifecycle: SandboxLifecycleService(storageRoot: fixture.storageRoot)
+            ).loadAll().first { $0.plan.approvalRequestID == pendingApprovals[0].id }
+        )
+        XCTAssertEqual(candidateManifest.plan.assessmentContext?.validationTestPlan, structuredValidationPlan)
+        XCTAssertEqual(
+            candidateManifest.validationTestPlanSHA256,
+            CandidatePatchArtifactAuthority.validationTestPlanSHA256(structuredValidationPlan)
+        )
+        XCTAssertEqual(candidateManifest.plan.validationTestPlanSHA256, candidateManifest.validationTestPlanSHA256)
 
         let mismatchedInput = "基于刚刚的销售 Agent 评估，创建 Candidate Patch 修改计划。"
         var mismatchedSession = AgentSession(workspace: fixture.workspace, userGoal: mismatchedInput)
@@ -176,6 +206,7 @@ final class AssessmentHandoffRegressionTests: XCTestCase {
         let persistedContext = try decodeAssessmentContext(persisted)
         XCTAssertEqual(persistedContext.finalizationMode, .fallback)
         XCTAssertEqual(persistedContext.validationStatus, .validated)
+        XCTAssertFalse(try XCTUnwrap(persistedContext.validationTestPlan).items.isEmpty)
         XCTAssertTrue(final.contains(persistedContext.requestedCapabilityID))
         XCTAssertTrue(final.contains(persistedContext.requestedCapabilityDisplayLabel))
         XCTAssertFalse(persistedContext.evidenceClaimIDs.isEmpty)

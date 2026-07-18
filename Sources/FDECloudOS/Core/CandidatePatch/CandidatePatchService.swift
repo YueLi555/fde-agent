@@ -1109,7 +1109,7 @@ struct CandidatePatchService: Sendable {
             ))
         }
 
-        let plan = CandidatePatchPlan(
+        var plan = CandidatePatchPlan(
             patchID: patchID,
             planID: planID,
             revision: revision,
@@ -1139,6 +1139,10 @@ struct CandidatePatchService: Sendable {
             approvalRequestID: nil,
             approvalRecord: nil
         )
+        if let validationTestPlan = context.assessment.validationTestPlan {
+            plan.validationTestPlanSHA256 = CandidatePatchArtifactAuthority
+                .validationTestPlanSHA256(validationTestPlan)
+        }
         let event = CandidatePatchAuditEvent(
             eventID: UUID(),
             type: .planPrepared,
@@ -1165,6 +1169,7 @@ struct CandidatePatchService: Sendable {
             sourceIntegrity: .unchanged,
             auditEvents: (previousManifest?.auditEvents ?? []) + [event],
             revisionHistory: revisionHistory,
+            validationTestPlanSHA256: plan.validationTestPlanSHA256,
             createdAt: previousManifest?.createdAt ?? now,
             updatedAt: now
         ))
@@ -1514,6 +1519,15 @@ struct CandidatePatchService: Sendable {
             manifest.sourceIntegrity = .unchanged
             manifest.updatedAt = Date()
             manifest.appliedAt = manifest.updatedAt
+            // Phase 2D.1's direct service tests intentionally exercise legacy approvals
+            // without runtime provenance. Preserve that compatibility, while ensuring
+            // only a provenance-bound artifact can become a Phase 2D.2A source.
+            if manifest.appliedBinding != nil,
+               manifest.plan.approvalRecord?.provenance != nil {
+                let artifactSHA256 = try CandidatePatchArtifactAuthority.artifactSHA256(for: manifest)
+                manifest.candidatePatchArtifactSHA256 = artifactSHA256
+                manifest.appliedBinding?.candidatePatchArtifactSHA256 = artifactSHA256
+            }
             manifest.auditEvents.append(CandidatePatchAuditEvent(
                 eventID: UUID(),
                 type: .reviewPrepared,
@@ -2130,6 +2144,77 @@ struct CandidatePatchService: Sendable {
 
     func loadManifest(sandboxID: SandboxID, patchID: CandidatePatchID) throws -> CandidatePatchManifest {
         try CandidatePatchManifestStore(lifecycle: lifecycle).load(sandboxID: sandboxID, patchID: patchID)
+    }
+
+    func validateGeneratedTestSourceAuthority(
+        workspaceID: UUID,
+        sourceCandidatePatchTaskID: UUID,
+        sandboxID: SandboxID,
+        patchID: CandidatePatchID
+    ) throws -> CandidatePatchManifest {
+        let manifest = try loadManifest(sandboxID: sandboxID, patchID: patchID)
+        guard manifest.status == .reviewReady,
+              manifest.plan.status == .reviewReady,
+              manifest.sandboxDestroyedAt == nil,
+              let recordedArtifactSHA256 = manifest.candidatePatchArtifactSHA256,
+              let binding = manifest.appliedBinding,
+              binding.workspaceID == workspaceID,
+              binding.taskID == sourceCandidatePatchTaskID,
+              binding.patchID == patchID,
+              binding.sandboxID == sandboxID,
+              binding.planID == manifest.plan.planID,
+              binding.planRevision == manifest.plan.revision,
+              binding.candidatePatchArtifactSHA256 == recordedArtifactSHA256 else {
+            if manifest.candidatePatchArtifactSHA256 == nil {
+                throw CandidatePatchError.blocked(.candidatePatchArtifactDigestMissing)
+            }
+            throw CandidatePatchError.blocked(.generatedTestSourceBindingMismatch)
+        }
+        guard let validationPlan = manifest.plan.assessmentContext?.validationTestPlan,
+              let recordedValidationSHA256 = manifest.validationTestPlanSHA256,
+              manifest.plan.validationTestPlanSHA256 == recordedValidationSHA256 else {
+            throw CandidatePatchError.blocked(.validationTestPlanMissing)
+        }
+        guard CandidatePatchArtifactAuthority.validationTestPlanSHA256(validationPlan)
+                == recordedValidationSHA256,
+              validationPlan.assessmentID == manifest.plan.assessmentID else {
+            throw CandidatePatchError.blocked(.validationTestPlanMismatch)
+        }
+
+        try verifyMutationPreconditions(manifest)
+        let workspace = try CandidatePatchSecureFileIO.Workspace(
+            root: resolveTarget(sandboxID, relativePath: "."),
+            interlock: nil
+        )
+        do {
+            for operation in manifest.operations {
+                guard let postimageSHA256 = operation.resultingSHA256 else {
+                    throw CandidatePatchError.blocked(.candidatePatchPostimageMismatch)
+                }
+                try workspace.preflightReplace(
+                    relativePath: operation.relativeCanonicalSandboxPath,
+                    expectedSHA256: postimageSHA256,
+                    expectedData: Data(operation.proposedContent.utf8)
+                )
+            }
+        } catch {
+            throw CandidatePatchError.blocked(.candidatePatchPostimageMismatch)
+        }
+
+        guard let recordedDiff = manifest.unifiedDiff else {
+            throw CandidatePatchError.blocked(.candidatePatchDiffMismatch)
+        }
+        let recomputedDiff = CandidatePatchUnifiedDiff.generate(operations: manifest.operations)
+        guard recomputedDiff.text == recordedDiff,
+              recomputedDiff.additions == manifest.additions,
+              recomputedDiff.deletions == manifest.deletions else {
+            throw CandidatePatchError.blocked(.candidatePatchDiffMismatch)
+        }
+        let recomputedArtifactSHA256 = try CandidatePatchArtifactAuthority.artifactSHA256(for: manifest)
+        guard recomputedArtifactSHA256 == recordedArtifactSHA256 else {
+            throw CandidatePatchError.blocked(.candidatePatchArtifactDigestMismatch)
+        }
+        return manifest
     }
 
     func readApprovedSandboxTextFile(sandboxID: SandboxID, relativePath: String) throws -> String {

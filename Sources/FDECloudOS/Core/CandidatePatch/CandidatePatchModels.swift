@@ -184,6 +184,7 @@ struct CandidatePatchAppliedBinding: Codable, Hashable, Sendable {
     var sourceSnapshotID: String
     var canonicalLegacyRoot: String
     var authenticatedLocalSessionID: UUID
+    var candidatePatchArtifactSHA256: String? = nil
 }
 
 struct CandidatePatchRevertTarget: Hashable, Sendable {
@@ -282,6 +283,38 @@ enum CandidatePatchAssessmentValidationStatus: String, Codable, Hashable, Sendab
     case invalid
 }
 
+enum CandidatePatchSuggestedTestLevel: String, Codable, CaseIterable, Hashable, Sendable {
+    case unit
+    case integration
+    case security
+    case contract
+}
+
+enum CandidatePatchRuntimeVerificationStatus: String, Codable, CaseIterable, Hashable, Sendable {
+    case notVerified = "NOT_VERIFIED"
+}
+
+struct CandidatePatchValidationTestItem: Codable, Hashable, Sendable, Identifiable {
+    var validationItemID: String
+    var title: String
+    var purpose: String
+    var expectedBehavior: String
+    var relatedRequirementIDs: [String]
+    var relatedBlockerIDs: [String]
+    var relatedEvidenceClaimIDs: [String]
+    var suggestedTestLevel: CandidatePatchSuggestedTestLevel
+    var runtimeVerificationStatus: CandidatePatchRuntimeVerificationStatus
+    var required: Bool
+
+    var id: String { validationItemID }
+}
+
+struct CandidatePatchValidationTestPlan: Codable, Hashable, Sendable {
+    var assessmentID: String
+    var items: [CandidatePatchValidationTestItem]
+    var executionAuthorized: Bool
+}
+
 struct CandidatePatchAssessmentContext: Codable, Hashable, Sendable {
     var assessmentID: String
     var generatedAt: Date
@@ -296,6 +329,7 @@ struct CandidatePatchAssessmentContext: Codable, Hashable, Sendable {
     var evidence: [CandidatePatchEvidence]
     var finalizationMode: CandidatePatchAssessmentFinalizationMode
     var validationStatus: CandidatePatchAssessmentValidationStatus
+    var validationTestPlan: CandidatePatchValidationTestPlan? = nil
 
     var evidenceClaimIDs: [String] { evidence.map(\.claimID) }
 
@@ -312,7 +346,8 @@ struct CandidatePatchAssessmentContext: Codable, Hashable, Sendable {
         unresolvedRequirements: [String] = [],
         evidence: [CandidatePatchEvidence],
         finalizationMode: CandidatePatchAssessmentFinalizationMode = .normal,
-        validationStatus: CandidatePatchAssessmentValidationStatus = .validated
+        validationStatus: CandidatePatchAssessmentValidationStatus = .validated,
+        validationTestPlan: CandidatePatchValidationTestPlan? = nil
     ) {
         self.assessmentID = assessmentID
         self.generatedAt = generatedAt
@@ -327,6 +362,7 @@ struct CandidatePatchAssessmentContext: Codable, Hashable, Sendable {
         self.evidence = evidence
         self.finalizationMode = finalizationMode
         self.validationStatus = validationStatus
+        self.validationTestPlan = validationTestPlan
     }
 
     init(
@@ -356,8 +392,69 @@ struct CandidatePatchAssessmentContext: Codable, Hashable, Sendable {
                 .map { $0.requirement.capability.rawValue },
             evidence: report.candidatePatchEvidence,
             finalizationMode: finalizationMode,
-            validationStatus: .validated
+            validationStatus: .validated,
+            validationTestPlan: CandidatePatchValidationTestPlan(
+                assessmentID: assessmentID,
+                report: report
+            )
         )
+    }
+}
+
+private extension CandidatePatchValidationTestPlan {
+    init(assessmentID: String, report: FDEAIIntegrationAssessmentReport) {
+        let entries = report.compatibilityMatrix.entries
+        let blockers = report.integrationBlockers.blockers
+        items = report.validationTestPlan.tests.map { test in
+            let relatedCapabilities = Self.relatedCapabilities(for: test.kind)
+            let relatedEntries = entries.filter { relatedCapabilities.contains($0.requirement.capability) }
+            let relatedBlockers = blockers.filter { relatedCapabilities.contains($0.requirement) }
+            return CandidatePatchValidationTestItem(
+                validationItemID: test.id,
+                title: test.name,
+                purpose: test.purpose,
+                expectedBehavior: test.expectedResult,
+                relatedRequirementIDs: relatedEntries.map(\.requirement.id).sorted(),
+                relatedBlockerIDs: relatedBlockers.map(\.id).sorted(),
+                relatedEvidenceClaimIDs: relatedEntries.map(\.claim.claimID).sorted(),
+                suggestedTestLevel: Self.suggestedLevel(for: test.kind),
+                runtimeVerificationStatus: .notVerified,
+                required: test.kind != .rollback
+            )
+        }
+        self.assessmentID = assessmentID
+        executionAuthorized = report.validationTestPlan.executionAuthorized
+    }
+
+    static func relatedCapabilities(
+        for kind: IntegrationValidationTestKind
+    ) -> Set<LegacyArchitectureCapability> {
+        switch kind {
+        case .permission:
+            [.permissionModel, .recordLevelAuthorization, .readOnlyMutationBoundary]
+        case .dataContract:
+            [.orderData, .customerData, .apiServiceLayer, .sensitiveResponseFieldControls]
+        case .failure:
+            [.apiServiceLayer, .eventSystem]
+        case .rollback:
+            [.readOnlyMutationBoundary, .approvalMechanism]
+        case .authentication:
+            [.authenticationBoundary, .permissionModel, .recordLevelAuthorization]
+        case .approval:
+            [.approvalMechanism, .businessActionAPI]
+        case .audit:
+            [.auditLogging, .approvalMechanism]
+        }
+    }
+
+    static func suggestedLevel(
+        for kind: IntegrationValidationTestKind
+    ) -> CandidatePatchSuggestedTestLevel {
+        switch kind {
+        case .permission, .authentication, .approval, .audit: .security
+        case .dataContract: .contract
+        case .failure, .rollback: .integration
+        }
     }
 }
 
@@ -475,6 +572,7 @@ struct CandidatePatchPlan: Codable, Hashable, Sendable, Identifiable {
     var updatedAt: Date
     var approvalRequestID: UUID?
     var approvalRecord: CandidatePatchApprovalRecord?
+    var validationTestPlanSHA256: String? = nil
 
     var id: UUID { planID }
     var filesToCreate: [String] {
@@ -595,6 +693,8 @@ struct CandidatePatchManifest: Codable, Hashable, Sendable {
     var appliedAt: Date? = nil
     var revertedAt: Date? = nil
     var sandboxDestroyedAt: Date? = nil
+    var candidatePatchArtifactSHA256: String? = nil
+    var validationTestPlanSHA256: String? = nil
     var createdAt: Date
     var updatedAt: Date
 
@@ -769,6 +869,13 @@ enum CandidatePatchFailureCode: String, Codable, CaseIterable, Hashable, Sendabl
     case sandboxMetadataPathRejected = "sandbox_metadata_path_rejected"
     case sensitivePathRejected = "sensitive_path_rejected"
     case generatedTestUnavailable = "phase_2d_2_generated_tests_unavailable"
+    case candidatePatchArtifactDigestMissing = "candidate_patch_artifact_digest_missing"
+    case candidatePatchArtifactDigestMismatch = "candidate_patch_artifact_digest_mismatch"
+    case candidatePatchDiffMismatch = "candidate_patch_diff_mismatch"
+    case candidatePatchPostimageMismatch = "candidate_patch_postimage_mismatch"
+    case generatedTestSourceBindingMismatch = "generated_test_source_binding_mismatch"
+    case validationTestPlanMissing = "validation_test_plan_missing"
+    case validationTestPlanMismatch = "validation_test_plan_mismatch"
     case binaryFileRejected = "binary_file_rejected"
     case sensitiveContentRejected = "sensitive_content_rejected"
     case symlinkRejected = "symlink_rejected"

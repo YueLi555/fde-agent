@@ -6,6 +6,7 @@ enum MissionIntentType: String, Codable, CaseIterable, Identifiable, Sendable {
     case candidatePatchGeneration = "CANDIDATE_PATCH_GENERATION"
     case candidatePatchRevert = "CANDIDATE_PATCH_REVERT"
     case candidatePatchSandboxDestroy = "CANDIDATE_PATCH_SANDBOX_DESTROY"
+    case generatedTestPlan = "GENERATED_TEST_PLAN"
     case answerQuestion = "answer_question"
     case inspectWorkspace = "inspect_workspace"
     case architectureAnalysis = "architecture_analysis"
@@ -40,6 +41,7 @@ enum MissionExpectedOutput: String, Codable, CaseIterable, Identifiable, Sendabl
     case candidatePatchReview = "candidate_patch_review"
     case candidatePatchRevertReview = "candidate_patch_revert_review"
     case candidatePatchSandboxDestructionReview = "candidate_patch_sandbox_destruction_review"
+    case generatedTestPlan = "generated_test_plan"
     case directAnswer = "direct_answer"
     case workspaceSummary = "workspace_summary"
     case architectureSummary = "architecture_summary"
@@ -149,6 +151,9 @@ struct MissionIntentParser: MissionIntentParsing {
     private func classify(_ normalized: String) -> MissionIntentType {
         if let primaryCandidatePatchAction = primaryCandidatePatchAction(normalized) {
             return primaryCandidatePatchAction
+        }
+        if isGeneratedTestPlan(normalized) {
+            return .generatedTestPlan
         }
         if isCandidatePatchRevert(normalized) {
             return .candidatePatchRevert
@@ -313,6 +318,29 @@ struct MissionIntentParser: MissionIntentParsing {
             ["phase 2c", "phase2c", "integration assessment", "接入评估", "当前 ai 接入评估"]
         ) && containsAny(normalized, ["generate", "implement", "apply", "生成", "实现", "实施"])
         return explicitCandidatePatch || sandboxImplementation || assessmentBacked
+    }
+
+    private func isGeneratedTestPlan(_ normalized: String) -> Bool {
+        let requestsExecution = containsAny(normalized, [
+            "run tests", "run test", "execute tests", "execute test", "tests pass", "test suite",
+            "build project", "build the project", "swift test", "npm test", "pytest",
+            "运行测试", "执行测试", "跑测试", "构建项目", "验证测试通过"
+        ])
+        if requestsExecution { return false }
+        let explicitPlan = containsAny(normalized, [
+            "generated test plan", "test-generation plan", "test generation plan",
+            "prepare a generated test plan", "analyze which tests should be generated",
+            "create a test-generation plan", "validation plan prepare generated tests",
+            "测试生成计划", "制定测试生成计划", "准备 generated test plan",
+            "应该生成哪些测试", "准备测试计划"
+        ])
+        let patchBound = containsAny(normalized, [
+            "candidate patch", "this patch", "current patch", "当前 patch", "这个 patch", "候选修改"
+        ])
+        let noWrite = containsAny(normalized, [
+            "without writing", "do not write", "no files", "plan only", "不要写文件", "但不要写文件", "只制定计划"
+        ])
+        return explicitPlan && (patchBound || noWrite || normalized.contains("validation plan"))
     }
 
     private func isCandidatePatchRevert(_ normalized: String) -> Bool {
@@ -612,6 +640,8 @@ struct MissionIntentParser: MissionIntentParsing {
             values.append(contentsOf: [.allowFileEdits, .requiresApproval, .noNetwork])
         case .candidatePatchGeneration:
             values.append(contentsOf: [.allowFileEdits, .requiresApproval, .noNetwork])
+        case .generatedTestPlan:
+            values.append(contentsOf: [.readOnly, .noNetwork, .preserveWorkspace])
         case .safeSandboxAcceptance:
             values.append(contentsOf: [.readOnly, .noNetwork, .runVerification])
         case .aiAgentCompatibilityAssessment, .architectureAnalysis, .inspectWorkspace, .answerQuestion, .explainCode, .generateReport:
@@ -635,6 +665,8 @@ struct MissionIntentParser: MissionIntentParsing {
             return [.candidatePatchRevertReview, .executionReport]
         case .candidatePatchGeneration:
             return [.candidatePatchPlan, .candidatePatchReview, .codePatch, .riskAssessment]
+        case .generatedTestPlan:
+            return [.generatedTestPlan, .riskAssessment]
         case .safeSandboxAcceptance:
             return [.safeSandboxAcceptanceReport, .executionReport]
         case .aiAgentCompatibilityAssessment:
@@ -677,7 +709,7 @@ struct MissionIntentParser: MissionIntentParsing {
         }
 
         switch intentType {
-        case .candidatePatchGeneration, .candidatePatchRevert, .candidatePatchSandboxDestroy:
+        case .candidatePatchGeneration, .candidatePatchRevert, .candidatePatchSandboxDestroy, .generatedTestPlan:
             break
         case .safeSandboxAcceptance:
             break
@@ -752,6 +784,8 @@ struct MissionIntentParser: MissionIntentParsing {
             return "Revert one exactly bound applied Candidate Patch inside its existing Safe Sandbox after explicit confirmation."
         case .candidatePatchGeneration:
             return "Generate an approval-gated Candidate Patch only inside the validated Safe Sandbox."
+        case .generatedTestPlan:
+            return "Prepare an exact-bound read-only Generated Test Plan without creating test files or executing tests."
         case .safeSandboxAcceptance:
             return "Create, validate, and destroy an isolated Sandbox without changing the selected Legacy source."
         case .aiAgentCompatibilityAssessment:
@@ -794,6 +828,10 @@ struct MissionIntentParser: MissionIntentParsing {
             return usesChinese
                 ? "请选择要回滚的确切 Candidate Patch。"
                 : "Select the exact Candidate Patch to revert."
+        case .generatedTestPlan:
+            return usesChinese
+                ? "请从可见的 Candidate Patch 卡片选择确切 Patch 来制定 Generated Test Plan。"
+                : "Select the exact visible Candidate Patch to prepare a Generated Test Plan."
         case .debugIssue:
             return usesChinese
                 ? "你希望我从哪个报错、异常现象或复现步骤开始排查？"

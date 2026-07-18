@@ -69,6 +69,7 @@ final class AppStore: ObservableObject {
     @Published var isRunning = false
     @Published var lastError: String?
     @Published private var conversationActivities: [UUID: AgentConversationActivity] = [:]
+    @Published private(set) var conversationAssetProjection = AgentConversationAssetProjection.empty
 
     private let environment: AppEnvironment
     private let startupIssue: String?
@@ -299,6 +300,18 @@ final class AppStore: ObservableObject {
             latestGlobalExecutionPolicy = try await environment.persistence.loadLatestGlobalExecutionPolicy(workspaceID: workspace.id)
             governorDecisions = try await environment.persistence.loadGlobalGovernorDecisions(workspaceID: workspace.id)
             let workspaceEvents = try await environment.persistence.loadEvents(workspaceID: workspace.id, taskID: nil)
+            let candidatePatchManifests = (try? CandidatePatchManifestStore(
+                lifecycle: environment.sandboxLifecycle
+            ).loadAll()) ?? []
+            conversationAssetProjection = AgentConversationAssetProjector.project(
+                workspaceID: workspace.id,
+                events: workspaceEvents,
+                candidatePatchManifests: candidatePatchManifests
+            )
+            restoreCandidatePatchConversationIfNeeded(
+                workspace: workspace,
+                workspaceEvents: workspaceEvents
+            )
             let allApprovals = try await environment.persistence.loadApprovalRequests(workspaceID: workspace.id, state: nil)
             let executionMemory = try await environment.persistence.loadTaskExecutionMemory(workspaceID: workspace.id)
             pendingApprovals = allApprovals.filter { $0.state == .pending }
@@ -643,6 +656,40 @@ final class AppStore: ObservableObject {
                 await refresh()
             } catch {
                 candidatePatchRevertConfirmation = nil
+                lastError = error.localizedDescription
+                await refresh()
+            }
+        }
+    }
+
+    func prepareGeneratedTestPlan(_ snapshot: CandidatePatchActivitySnapshot) {
+        guard let workspace = selectedWorkspace,
+              let sourceBinding = snapshot.exactGeneratedTestSourceBinding,
+              sourceBinding.workspaceID == workspace.id,
+              let authenticatedLocalSessionID = session?.id,
+              authenticatedLocalSessionID == sourceBinding.authenticatedLocalSessionID,
+              session?.workspaceID == workspace.id else {
+            lastError = snapshot.generatedTestActionUnavailableReason
+                ?? "The exact persisted PATCH_READY Candidate Patch binding is not available in the authenticated workspace."
+            return
+        }
+        let context = GeneratedTestPlanningContext(
+            sourceBinding: sourceBinding,
+            appSessionID: appSessionID
+        )
+        Task {
+            do {
+                let task = try await environment.runtime.runGeneratedTestPlanning(
+                    input: "prepare a Generated Test Plan for this exact visible Candidate Patch without writing files",
+                    workspace: workspace,
+                    context: context
+                )
+                selectedTaskID = task.id
+                if let selectedAgentSessionID {
+                    linkRuntimeTask(task, to: selectedAgentSessionID)
+                }
+                await refresh()
+            } catch {
                 lastError = error.localizedDescription
                 await refresh()
             }
@@ -1128,6 +1175,48 @@ final class AppStore: ObservableObject {
         for index in agentSessions.indices where agentSessions[index].workspaceID == workspace.id {
             agentSessions[index].refreshSelectedWorkspace(workspace)
         }
+    }
+
+    private func restoreCandidatePatchConversationIfNeeded(
+        workspace: Workspace,
+        workspaceEvents: [ExecutionEvent]
+    ) {
+        guard !conversationAssetProjection.candidatePatches.isEmpty,
+              !agentSessions.contains(where: { $0.workspaceID == workspace.id }),
+              let sourceTaskID = conversationAssetProjection.candidatePatches
+                .compactMap(\.sourceCandidatePatchTaskID)
+                .compactMap(UUID.init(uuidString:))
+                .last,
+              let task = tasks.first(where: { $0.id == sourceTaskID }) else {
+            return
+        }
+        let taskEvents = workspaceEvents.filter { $0.taskID == task.id }
+        let conversation = AgentResponseComposer.replayConversation(
+            sessionID: task.id,
+            workspaceID: workspace.id,
+            userRequest: task.rawInput,
+            events: taskEvents,
+            createdAt: task.createdAt
+        )
+        var workspaceContext = AgentWorkspaceContext(workspace: workspace)
+        workspaceContext.missionTaskIDs = conversationAssetProjection.candidatePatches
+            .compactMap(\.sourceCandidatePatchTaskID)
+            .compactMap(UUID.init(uuidString:))
+        workspaceContext.linkRuntimeTask(task)
+        let restored = AgentSession(
+            sessionID: task.id,
+            workspaceID: workspace.id,
+            userGoal: task.rawInput,
+            createdAt: task.createdAt,
+            currentState: .completed,
+            interactionState: .completed,
+            currentPlan: task.plan,
+            conversation: conversation,
+            workspaceContext: workspaceContext
+        )
+        agentSessions.insert(restored, at: 0)
+        selectedAgentSessionID = restored.sessionID
+        selectedTaskID = task.id
     }
 
     private func linkRuntimeTask(_ task: FDETask, to sessionID: UUID) {
