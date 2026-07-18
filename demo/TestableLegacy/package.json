@@ -1,0 +1,13 @@
+{
+  "name": "testable-legacy-order-support-fixture",
+  "version": "0.0.0-demo",
+  "private": true,
+  "description": "Sanitized deterministic customer-support order lookup fixture",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "5.4.5",
+    "vitest": "1.6.0"
+  }
+}

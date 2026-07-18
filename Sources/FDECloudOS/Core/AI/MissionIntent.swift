@@ -158,7 +158,11 @@ struct MissionIntentParser: MissionIntentParsing {
         if isCandidatePatchRevert(normalized) {
             return .candidatePatchRevert
         }
-        if isCandidatePatchGeneration(normalized) {
+        let candidatePatchSignals = candidatePatchGenerationSignals(normalized)
+        if candidatePatchSignals.prohibited && candidatePatchSignals.affirmative {
+            return .unknown
+        }
+        if candidatePatchSignals.affirmative {
             return .candidatePatchGeneration
         }
         if isSafeSandboxAcceptance(normalized) {
@@ -286,27 +290,48 @@ struct MissionIntentParser: MissionIntentParsing {
         return explicitPhase || sandboxAction || isolatedSandboxRequest
     }
 
-    private func isCandidatePatchGeneration(_ normalized: String) -> Bool {
-        let explicitlyProhibitsCandidatePatch = containsAny(
-            normalized,
-            [
-                "do not generate a candidate patch", "don't generate a candidate patch",
-                "no candidate patch", "without a candidate patch",
-                "不要生成 candidate patch", "不要生成候选修改", "不要生成候选补丁",
-                "不生成 candidate patch", "不生成候选修改", "不生成候选补丁"
-            ]
-        )
-        if explicitlyProhibitsCandidatePatch { return false }
+    private func candidatePatchGenerationSignals(
+        _ normalized: String
+    ) -> (prohibited: Bool, affirmative: Bool) {
+        let englishProhibitionPatterns = [
+            #"\b(?:do\s+not|don['’]t)\b[^.!?;\n]{0,160}\b(?:create|prepare|produce|generate|propose)\s+(?:a\s+)?candidate(?:\s*-\s*|\s+)patch\b"#,
+            #"\bwithout\s+(?:(?:creating|preparing|producing|generating|proposing)\s+)?(?:a\s+)?candidate(?:\s*-\s*|\s+)patch\b"#,
+            #"\bno\s+candidate(?:\s*-\s*|\s+)patch\b(?:\s+should\s+be\s+(?:created|prepared|produced|generated|proposed))?"#
+        ]
+        var affirmativeText = normalized
+        var prohibited = false
+        for pattern in englishProhibitionPatterns {
+            guard let expression = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(affirmativeText.startIndex..<affirmativeText.endIndex, in: affirmativeText)
+            if expression.firstMatch(in: affirmativeText, range: range) != nil {
+                prohibited = true
+                affirmativeText = expression.stringByReplacingMatches(
+                    in: affirmativeText,
+                    range: range,
+                    withTemplate: " "
+                )
+            }
+        }
+
+        let chineseProhibitions = [
+            "不要生成 candidate patch", "不要生成候选修改", "不要生成候选补丁",
+            "不生成 candidate patch", "不生成候选修改", "不生成候选补丁"
+        ]
+        for phrase in chineseProhibitions where affirmativeText.contains(phrase) {
+            prohibited = true
+            affirmativeText = affirmativeText.replacingOccurrences(of: phrase, with: " ")
+        }
+
         let explicitCandidatePatch = containsAny(
-            normalized,
+            affirmativeText,
             [
                 "candidate patch", "candidate-patch", "候选修改", "候选补丁", "候选 patch",
                 "生成候选修改", "生成 candidate patch", "candidate changes"
             ]
         )
-        let sandboxImplementation = containsAny(normalized, ["sandbox", "沙箱"])
+        let sandboxImplementation = containsAny(affirmativeText, ["sandbox", "沙箱"])
             && containsAny(
-                normalized,
+                affirmativeText,
                 [
                     "implement the proposed integration", "implement the proposed change",
                     "implement in an isolated", "implement in the safe", "apply proposed source changes",
@@ -314,10 +339,10 @@ struct MissionIntentParser: MissionIntentParsing {
                 ]
             )
         let assessmentBacked = containsAny(
-            normalized,
+            affirmativeText,
             ["phase 2c", "phase2c", "integration assessment", "接入评估", "当前 ai 接入评估"]
-        ) && containsAny(normalized, ["generate", "implement", "apply", "生成", "实现", "实施"])
-        return explicitCandidatePatch || sandboxImplementation || assessmentBacked
+        ) && containsAny(affirmativeText, ["generate", "implement", "apply", "生成", "实现", "实施"])
+        return (prohibited, explicitCandidatePatch || sandboxImplementation || assessmentBacked)
     }
 
     private func isGeneratedTestPlan(_ normalized: String) -> Bool {
@@ -582,7 +607,8 @@ struct MissionIntentParser: MissionIntentParsing {
     }
 
     private func isAIAgentIntegrationAssessment(_ normalized: String) -> Bool {
-        let desiredAICapability = containsAny(
+        let desiredAICapability = AIAgentCapabilityKind.classification(request: normalized).hasExactAuthority
+            || containsAny(
             normalized,
             [
                 "ai agent", "ai-agent", "aiagent", "ai assistant", "ai workflow",

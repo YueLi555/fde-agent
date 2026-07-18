@@ -70,6 +70,8 @@ final class AppStore: ObservableObject {
     @Published var lastError: String?
     @Published private var conversationActivities: [UUID: AgentConversationActivity] = [:]
     @Published private(set) var conversationAssetProjection = AgentConversationAssetProjection.empty
+    @Published private var generatedTestPlanGenerationsInFlight: Set<String> = []
+    @Published private var generatedTestArtifactReviewSessionsInFlight: Set<UUID> = []
 
     private let environment: AppEnvironment
     private let startupIssue: String?
@@ -303,10 +305,14 @@ final class AppStore: ObservableObject {
             let candidatePatchManifests = (try? CandidatePatchManifestStore(
                 lifecycle: environment.sandboxLifecycle
             ).loadAll()) ?? []
+            let generatedTestArtifacts = (try? GeneratedTestArtifactStore(
+                storageRoot: environment.sandboxLifecycle.storageRoot
+            ).loadAll(workspaceID: workspace.id)) ?? []
             conversationAssetProjection = AgentConversationAssetProjector.project(
                 workspaceID: workspace.id,
                 events: workspaceEvents,
-                candidatePatchManifests: candidatePatchManifests
+                candidatePatchManifests: candidatePatchManifests,
+                generatedTestArtifacts: generatedTestArtifacts
             )
             restoreCandidatePatchConversationIfNeeded(
                 workspace: workspace,
@@ -688,6 +694,166 @@ final class AppStore: ObservableObject {
                 if let selectedAgentSessionID {
                     linkRuntimeTask(task, to: selectedAgentSessionID)
                 }
+                await refresh()
+            } catch {
+                lastError = error.localizedDescription
+                await refresh()
+            }
+        }
+    }
+
+    func generatedTestPlanGenerationEligibility(
+        _ snapshot: GeneratedTestActivitySnapshot
+    ) -> GeneratedTestPlanGenerationEligibility {
+        guard let workspace = selectedWorkspace,
+              let authenticatedLocalSessionID = session?.id,
+              session?.workspaceID == workspace.id,
+              let planningTaskID = snapshot.planningTaskID.flatMap(UUID.init(uuidString:)) else {
+            return .unavailable("The exact authenticated Generated Test Plan authority is unavailable.")
+        }
+        let plan = try? GeneratedTestPlanStore(storageRoot: environment.sandboxLifecycle.storageRoot).load(
+            workspaceID: workspace.id,
+            planningTaskID: planningTaskID
+        )
+        let hasExistingArtifact = plan.map { exactPlan in
+            conversationAssetProjection.generatedTestArtifacts.contains {
+                $0.sourceBinding.generatedTestPlanID == exactPlan.planID
+                    && $0.sourceBinding.generatedTestPlanRevision == exactPlan.revision
+                    && $0.sourceBinding.generatedTestPlanSHA256 == exactPlan.planSHA256
+                    && $0.sourceBinding.generatedTestSourceBinding == exactPlan.sourceBinding
+            }
+        } ?? false
+        return snapshot.generationEligibility(
+            persistedPlan: plan,
+            workspaceID: workspace.id,
+            authenticatedLocalSessionID: authenticatedLocalSessionID,
+            appSessionID: appSessionID,
+            hasExistingArtifact: hasExistingArtifact,
+            isInFlight: generatedTestPlanGenerationsInFlight.contains(snapshot.assetID)
+        )
+    }
+
+    func generateTestArtifact(_ snapshot: GeneratedTestActivitySnapshot) {
+        let eligibility = generatedTestPlanGenerationEligibility(snapshot)
+        guard eligibility.isAvailable,
+              let workspace = selectedWorkspace,
+              let authenticatedLocalSessionID = session?.id,
+              let planningTaskID = snapshot.planningTaskID.flatMap(UUID.init(uuidString:)),
+              let plan = try? GeneratedTestPlanStore(
+                storageRoot: environment.sandboxLifecycle.storageRoot
+              ).load(workspaceID: workspace.id, planningTaskID: planningTaskID),
+              let context = snapshot.exactGenerationContext(
+                for: plan,
+                workspaceID: workspace.id,
+                authenticatedLocalSessionID: authenticatedLocalSessionID,
+                appSessionID: appSessionID
+              ) else {
+            lastError = eligibility.unavailableReason
+                ?? "The exact persisted Generated Test Plan binding is unavailable."
+            return
+        }
+        let actionID = snapshot.assetID
+        generatedTestPlanGenerationsInFlight.insert(actionID)
+        Task {
+            defer { generatedTestPlanGenerationsInFlight.remove(actionID) }
+            do {
+                let result = try GeneratedTestArtifactService(lifecycle: environment.sandboxLifecycle).generate(
+                    GeneratedTestArtifactGenerationRequest(context: context)
+                )
+                if result.outcome == .clarificationRequired {
+                    lastError = "CLARIFICATION_REQUIRED: " + result.missingEvidence.joined(separator: " · ")
+                }
+                await refresh()
+            } catch {
+                lastError = error.localizedDescription
+                await refresh()
+            }
+        }
+    }
+
+    func requestGeneratedTestArtifactChanges(_ artifact: GeneratedTestArtifact, instructions: String) {
+        reviewGeneratedTestArtifact(artifact) { service, context in
+            _ = try service.requestChanges(context, instructions: instructions)
+        }
+    }
+
+    func rejectGeneratedTestArtifact(_ artifact: GeneratedTestArtifact) {
+        reviewGeneratedTestArtifact(artifact) { service, context in
+            _ = try service.reject(context)
+        }
+    }
+
+    func approveGeneratedTestArtifact(_ artifact: GeneratedTestArtifact) {
+        reviewGeneratedTestArtifact(artifact) { service, context in
+            let confirmation = try service.beginApprovalConfirmation(context)
+            _ = try service.confirmApproval(confirmation, context: context)
+        }
+    }
+
+    func generatedTestArtifactReviewEligibility(
+        _ artifact: GeneratedTestArtifact
+    ) -> GeneratedTestArtifactReviewEligibility {
+        guard let workspace = selectedWorkspace,
+              let authenticatedLocalSessionID = session?.id,
+              session?.workspaceID == workspace.id,
+              artifact.sourceBinding.generatedTestSourceBinding.workspaceID == workspace.id else {
+            return .unavailable("An authenticated local session is required to review this artifact.")
+        }
+        let eligibility = artifact.reviewEligibility(
+            authenticatedLocalSessionID: authenticatedLocalSessionID,
+            appSessionID: appSessionID
+        )
+        guard eligibility.isAvailable,
+              let reviewSessionID = artifact.currentRevision?.reviewSessionID else {
+            return eligibility
+        }
+        guard !generatedTestArtifactReviewSessionsInFlight.contains(reviewSessionID) else {
+            return .unavailable("This exact Generated Test Artifact review action is already in progress.")
+        }
+        return .available
+    }
+
+    private func reviewGeneratedTestArtifact(
+        _ artifact: GeneratedTestArtifact,
+        operation: @escaping @Sendable (GeneratedTestArtifactService, GeneratedTestArtifactReviewContext) throws -> Void
+    ) {
+        let eligibility = generatedTestArtifactReviewEligibility(artifact)
+        guard let workspace = selectedWorkspace,
+              let authenticatedLocalSessionID = session?.id,
+              session?.workspaceID == workspace.id,
+              let revision = artifact.currentRevision,
+              let reviewSessionID = revision.reviewSessionID,
+              eligibility.isAvailable,
+              artifact.sourceBinding.generatedTestSourceBinding.workspaceID == workspace.id else {
+            lastError = eligibility.unavailableReason
+                ?? "The exact Generated Test Artifact review binding is unavailable."
+            return
+        }
+        generatedTestArtifactReviewSessionsInFlight.insert(reviewSessionID)
+        let sourceBinding = artifact.sourceBinding.generatedTestSourceBinding
+        let context = GeneratedTestArtifactReviewContext(
+            workspaceID: workspace.id,
+            generatedTestPlanningTaskID: sourceBinding.generatedTestPlanningTaskID,
+            generatedTestPlanID: artifact.sourceBinding.generatedTestPlanID,
+            generatedTestPlanRevision: artifact.sourceBinding.generatedTestPlanRevision,
+            generatedTestPlanSHA256: artifact.sourceBinding.generatedTestPlanSHA256,
+            sourceCandidatePatchTaskID: sourceBinding.sourceCandidatePatchTaskID,
+            candidatePatchID: sourceBinding.patchID,
+            candidatePatchPlanID: sourceBinding.candidatePatchPlanID,
+            candidatePatchPlanRevision: sourceBinding.candidatePatchPlanRevision,
+            candidatePatchArtifactSHA256: sourceBinding.candidatePatchArtifactSHA256,
+            sandboxID: sourceBinding.sandboxID,
+            artifactID: artifact.artifactID,
+            artifactRevision: revision.revision,
+            artifactSHA256: revision.digest.sha256,
+            reviewSessionID: reviewSessionID,
+            authenticatedLocalSessionID: authenticatedLocalSessionID,
+            appSessionID: appSessionID
+        )
+        Task {
+            defer { generatedTestArtifactReviewSessionsInFlight.remove(reviewSessionID) }
+            do {
+                try operation(GeneratedTestArtifactService(lifecycle: environment.sandboxLifecycle), context)
                 await refresh()
             } catch {
                 lastError = error.localizedDescription

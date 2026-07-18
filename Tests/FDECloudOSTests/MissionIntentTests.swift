@@ -42,6 +42,63 @@ final class MissionIntentTests: XCTestCase {
         }
     }
 
+    func testNegatedCandidatePatchLanguagePreservesAssessmentAndReadOnlyRouting() {
+        let exactFailedRequest = """
+        Inspect the selected TestableLegacy project in read-only mode.
+
+        Determine the test framework and grounded test location from repository evidence.
+
+        Assess the customer_support_order_lookup capability.
+
+        Do not modify files, create a Candidate Patch, run builds or tests, execute Shell or Git, install packages, deploy, or access credentials.
+        """
+        let prohibitedVariants = [
+            "Assess customer-support read-only order lookup. Do not create a Candidate Patch.",
+            "Assess customer-support read-only order lookup. Don't create a Candidate Patch.",
+            "Evaluate customer-support read-only order lookup. Do not prepare a Candidate Patch.",
+            "Evaluate customer-support read-only order lookup. Don't prepare a Candidate Patch.",
+            "Analyze customer-support read-only order lookup. Do not produce a Candidate Patch.",
+            "Determine readiness for customer-support read-only order lookup. Do not generate a Candidate Patch.",
+            "Inspect customer-support read-only order lookup without creating a Candidate Patch.",
+            "Inspect customer-support read-only order lookup without preparing a Candidate Patch.",
+            "Assess customer-support read-only order lookup. No Candidate Patch should be created."
+        ]
+
+        for input in [exactFailedRequest] + prohibitedVariants {
+            let intent = MissionIntentParser().parse(input)
+            XCTAssertEqual(intent.intentType, .aiAgentCompatibilityAssessment, input)
+            XCTAssertTrue(intent.constraints.contains(.readOnly), input)
+            XCTAssertFalse(intent.constraints.contains(.allowFileEdits), input)
+            XCTAssertFalse(intent.constraints.contains(.requiresApproval), input)
+            XCTAssertFalse(intent.expectedOutputs.contains(.candidatePatchPlan), input)
+        }
+    }
+
+    func testAffirmativeCandidatePatchRequestsPreserveGenerationRouting() {
+        let inputs = [
+            "Create a Candidate Patch.",
+            "Prepare a Candidate Patch from the validated assessment.",
+            "Generate a Candidate Patch for customer_support_order_lookup.",
+            "Propose a Candidate Patch addressing the validated blockers."
+        ]
+
+        for input in inputs {
+            let intent = MissionIntentParser().parse(input)
+            XCTAssertEqual(intent.intentType, .candidatePatchGeneration, input)
+            XCTAssertTrue(intent.constraints.contains(.allowFileEdits), input)
+            XCTAssertTrue(intent.constraints.contains(.requiresApproval), input)
+        }
+    }
+
+    func testConflictingCandidatePatchDirectivesFailClosedAsAmbiguous() {
+        let input = "Assess customer-support order lookup. Do not create a Candidate Patch. Create a Candidate Patch."
+        let intent = MissionIntentParser().parse(input)
+
+        XCTAssertEqual(intent.intentType, .unknown)
+        XCTAssertTrue(intent.shouldAskClarification)
+        XCTAssertFalse(intent.constraints.contains(.allowFileEdits))
+    }
+
     func testApprovedAIAgentIntegrationImplementationAllowsCodePatchAndVerification() {
         let intent = MissionIntentParser().parse(
             "Customer approved implementation for AI agent integration, write tests, generate patch, adapter client service"

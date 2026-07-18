@@ -5,6 +5,12 @@ enum AIIntegrationAssessmentLayer {
     static let id = "AI_INTEGRATION_ASSESSMENT_LAYER"
 }
 
+struct AIAgentCapabilityClassification: Hashable, Sendable {
+    var kind: AIAgentCapabilityKind
+    var hasExactAuthority: Bool
+    var isConflicting: Bool
+}
+
 enum AIAgentCapabilityKind: String, Codable, CaseIterable, Hashable, Sendable {
     case unspecified = "unspecified_ai_agent"
     case customerSupportOrderLookup = "customer_support_order_lookup"
@@ -29,7 +35,34 @@ enum AIAgentCapabilityKind: String, Codable, CaseIterable, Hashable, Sendable {
     }
 
     init(request: String) {
+        self = Self.classification(request: request).kind
+    }
+
+    static func classification(request: String) -> AIAgentCapabilityClassification {
         let value = request.lowercased()
+        let supportedKinds = allCases.filter { $0 != .unspecified }
+        let canonicalMatches = Set(supportedKinds.filter { kind in
+            containsBounded(value, kind.rawValue.lowercased(), identifierBoundary: true)
+        })
+        let displayLabelMatches = Set(supportedKinds.filter { kind in
+            containsBounded(value, kind.displayName.lowercased(), identifierBoundary: false)
+        })
+        let exactMatches = canonicalMatches.union(displayLabelMatches)
+        if exactMatches.count > 1 {
+            return AIAgentCapabilityClassification(
+                kind: .unspecified,
+                hasExactAuthority: true,
+                isConflicting: true
+            )
+        }
+        if let exactKind = exactMatches.first {
+            return AIAgentCapabilityClassification(
+                kind: exactKind,
+                hasExactAuthority: true,
+                isConflicting: false
+            )
+        }
+
         let customerSupport = Self.containsAny(
             value,
             ["customer support", "customer-support", "customer service", "support agent", "客服", "客户支持", "客户服务"]
@@ -42,27 +75,46 @@ enum AIAgentCapabilityKind: String, Codable, CaseIterable, Hashable, Sendable {
                 "查订单", "订单查找", "读取订单", "订单状态"
             ]
         )
+        let kind: AIAgentCapabilityKind
         if customerSupport && orderLookup {
-            self = .customerSupportOrderLookup
+            kind = .customerSupportOrderLookup
         } else if customerSupport {
-            self = .customerSupport
+            kind = .customerSupport
         } else if Self.containsAny(value, ["sales", "crm", "销售"]) {
-            self = .sales
+            kind = .sales
         } else if Self.containsAny(value, ["workflow", "automation", "approval", "工作流", "自动化"]) {
-            self = .workflowAutomation
+            kind = .workflowAutomation
         } else if Self.containsAny(value, ["data analysis", "analytics", "分析 agent", "数据分析"]) {
-            self = .dataAnalysis
+            kind = .dataAnalysis
         } else if Self.containsAny(value, ["knowledge", "retrieval", "internal assistant", "知识", "内部助手"]) {
-            self = .internalKnowledge
+            kind = .internalKnowledge
         } else if Self.containsAny(value, ["developer", "coding", "code assistant", "开发", "编程助手"]) {
-            self = .developerAssistant
+            kind = .developerAssistant
         } else {
-            self = .unspecified
+            kind = .unspecified
         }
+        return AIAgentCapabilityClassification(
+            kind: kind,
+            hasExactAuthority: false,
+            isConflicting: false
+        )
     }
 
     private static func containsAny(_ value: String, _ candidates: [String]) -> Bool {
         candidates.contains { value.contains($0) }
+    }
+
+    private static func containsBounded(
+        _ value: String,
+        _ candidate: String,
+        identifierBoundary: Bool
+    ) -> Bool {
+        let escaped = NSRegularExpression.escapedPattern(for: candidate)
+        let boundaryCharacters = identifierBoundary ? "A-Za-z0-9_" : "A-Za-z0-9"
+        let pattern = "(?<![\(boundaryCharacters)])\(escaped)(?![\(boundaryCharacters)])"
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return false }
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        return expression.firstMatch(in: value, range: range) != nil
     }
 }
 
@@ -2201,6 +2253,17 @@ struct LegacyAgentCompatibilityAnalyzer: Sendable {
             IntegrationValidationTest(kind: .rollback, name: "AI integration can be disabled safely", purpose: "Verify feature-flag rollback without data repair.", expectedResult: "Disabling the integration restores the legacy-only path.", generatedOnly: true),
             IntegrationValidationTest(kind: .authentication, name: "Agent identity cannot cross tenant or user boundaries", purpose: "Verify authentication context propagation.", expectedResult: "Cross-boundary requests are denied.", generatedOnly: true)
         ]
+        if profile.kind == .customerSupportOrderLookup {
+            tests += [
+                IntegrationValidationTest(kind: .authentication, name: "Authenticated user can access an authorized order", purpose: "Verify the authenticated customer/order binding on the approved read path.", expectedResult: "The authorized order is returned through the bounded response contract.", generatedOnly: true),
+                IntegrationValidationTest(kind: .authentication, name: "User cannot access another customer's order", purpose: "Verify record-level customer/order isolation.", expectedResult: "A cross-customer lookup is rejected before order data is returned.", generatedOnly: true),
+                IntegrationValidationTest(kind: .permission, name: "Support role alone does not bypass record-level authorization", purpose: "Verify role permission and record authorization remain separate required boundaries.", expectedResult: "A support principal without the record-level decision is denied.", generatedOnly: true),
+                IntegrationValidationTest(kind: .dataContract, name: "customerID and unnecessary sensitive fields are omitted by the approved allowlist", purpose: "Verify the exact Agent-facing response allowlist.", expectedResult: "Only orderID and status are returned; customerID is absent.", generatedOnly: true),
+                IntegrationValidationTest(kind: .permission, name: "Order lookup remains read-only", purpose: "Verify repeated lookup does not expose a mutation path.", expectedResult: "The lookup remains deterministic and no write-capable API is exposed.", generatedOnly: true),
+                IntegrationValidationTest(kind: .audit, name: "Audit logging receives the approved non-sensitive order-read event", purpose: "Verify the bounded actor, action, resource, and outcome audit contract.", expectedResult: "The audit event contains approved identifiers and no order response payload.", generatedOnly: true),
+                IntegrationValidationTest(kind: .permission, name: "Unauthorized mutation attempts remain rejected", purpose: "Verify the generated adapter exposes no mutation operation.", expectedResult: "Only the approved read-only lookup is available.", generatedOnly: true)
+            ]
+        }
         if profile.proposesWriteAccess {
             tests += [
                 IntegrationValidationTest(kind: .approval, name: "Consequential actions require human approval", purpose: "Attempt action execution without a valid approval token.", expectedResult: "The action is blocked before legacy mutation.", generatedOnly: true),

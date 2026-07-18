@@ -212,6 +212,107 @@ final class AssessmentHandoffRegressionTests: XCTestCase {
         XCTAssertFalse(persistedContext.evidenceClaimIDs.isEmpty)
     }
 
+    func testNegatedCandidatePatchAssessmentCreatesNoPatchPlanApprovalSandboxOrArtifact() async throws {
+        let fixture = try await makeFixture(includeFinalization: true)
+        defer { fixture.cleanup() }
+        let input = """
+        Inspect the selected TestableLegacy project in read-only mode.
+
+        Determine the test framework and grounded test location from repository evidence.
+
+        Assess the customer_support_order_lookup capability.
+
+        Do not modify files, create a Candidate Patch, run builds or tests, execute Shell or Git, install packages, deploy, or access credentials.
+        """
+        let activeSandboxesBefore = try fixture.kernelSandboxCount()
+        var session = AgentSession(workspace: fixture.workspace, userGoal: input)
+
+        let result = try await AgentRuntimeCoordinator().startMission(
+            input: input,
+            workspace: fixture.workspace,
+            session: &session,
+            runtime: fixture.kernel
+        )
+
+        let task = try XCTUnwrap(result.task)
+        XCTAssertEqual(task.state, .blocked)
+        let events = try await fixture.persistence.loadEvents(
+            workspaceID: fixture.workspace.id,
+            taskID: task.id
+        )
+        let created = try XCTUnwrap(events.first { $0.type == .taskCreated })
+        XCTAssertEqual(
+            created.payload["intent_type"],
+            MissionIntentType.aiAgentCompatibilityAssessment.rawValue
+        )
+        XCTAssertEqual(created.payload["mission_workspace_scope"], MissionWorkspaceScope.legacyOnly.rawValue)
+        XCTAssertFalse(events.contains {
+            $0.payload["intent_type"] == MissionIntentType.candidatePatchGeneration.rawValue
+                || $0.payload["candidate_patch_activity_phase"] != nil
+                || $0.type == .humanApprovalRequested
+        })
+        let pendingApprovals = try await fixture.persistence.loadApprovalRequests(
+            workspaceID: fixture.workspace.id,
+            state: .pending
+        )
+        XCTAssertTrue(pendingApprovals.isEmpty)
+        XCTAssertEqual(try fixture.kernelSandboxCount(), activeSandboxesBefore)
+        let manifests = try CandidatePatchManifestStore(
+            lifecycle: SandboxLifecycleService(storageRoot: fixture.storageRoot)
+        ).loadAll()
+        XCTAssertTrue(manifests.isEmpty)
+    }
+
+    func testCanonicalCapabilityIDSurvivesApprovalKeywordDuringCandidatePatchHandoff() async throws {
+        let fixture = try await makeFixture(includeFinalization: true)
+        defer { fixture.cleanup() }
+        var assessmentSession = AgentSession(workspace: fixture.workspace, userGoal: fixture.assessmentInput)
+        let assessment = try await AgentRuntimeCoordinator().startMission(
+            input: fixture.assessmentInput,
+            workspace: fixture.workspace,
+            session: &assessmentSession,
+            runtime: fixture.kernel
+        )
+        XCTAssertEqual(try XCTUnwrap(assessment.task).state, .completed)
+
+        let candidateInput = """
+        Using the validated TestableLegacy assessment for the customer_support_order_lookup capability, prepare an evidence-grounded Candidate Patch.
+
+        The Patch should address the validated record-level authorization and response-field allowlist findings.
+
+        Create the Candidate Patch plan only. Do not apply changes until explicit approval.
+
+        Keep the original Legacy read-only. Use only an app-managed Safe Sandbox for any later approved mutation.
+
+        Do not run builds, tests, Shell, Git, package management, deployment, or credential access.
+        """
+        XCTAssertEqual(AIAgentCapabilityKind(request: candidateInput), .customerSupportOrderLookup)
+        let activeSandboxesBefore = try fixture.kernelSandboxCount()
+        var candidateSession = AgentSession(workspace: fixture.workspace, userGoal: candidateInput)
+        let candidate = try await AgentRuntimeCoordinator().startMission(
+            input: candidateInput,
+            workspace: fixture.workspace,
+            session: &candidateSession,
+            runtime: fixture.kernel
+        )
+
+        let task = try XCTUnwrap(candidate.task)
+        XCTAssertEqual(task.state, .pendingApproval)
+        XCTAssertEqual(try fixture.kernelSandboxCount(), activeSandboxesBefore)
+        let events = try await fixture.persistence.loadEvents(
+            workspaceID: fixture.workspace.id,
+            taskID: task.id
+        )
+        let approval = try XCTUnwrap(events.last { $0.type == .humanApprovalRequested })
+        XCTAssertEqual(
+            approval.payload["candidate_patch_capability_id"],
+            AIAgentCapabilityKind.customerSupportOrderLookup.rawValue
+        )
+        XCTAssertFalse(events.contains {
+            $0.payload["failure_category"] == CandidatePatchFailureCode.assessmentCapabilityMismatch.rawValue
+        })
+    }
+
     private func decodeAssessmentContext(_ event: ExecutionEvent) throws -> CandidatePatchAssessmentContext {
         let json = try XCTUnwrap(event.payload["candidate_patch_assessment_context"])
         let data = try XCTUnwrap(json.data(using: .utf8))

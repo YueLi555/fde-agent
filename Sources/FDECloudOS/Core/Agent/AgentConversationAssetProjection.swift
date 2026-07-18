@@ -3,10 +3,12 @@ import Foundation
 struct AgentConversationAssetProjection: Equatable, Sendable {
     var candidatePatches: [CandidatePatchActivitySnapshot]
     var generatedTestPlans: [GeneratedTestActivitySnapshot]
+    var generatedTestArtifacts: [GeneratedTestArtifact]
 
     static let empty = AgentConversationAssetProjection(
         candidatePatches: [],
-        generatedTestPlans: []
+        generatedTestPlans: [],
+        generatedTestArtifacts: []
     )
 }
 
@@ -14,7 +16,8 @@ enum AgentConversationAssetProjector {
     static func project(
         workspaceID: UUID,
         events: [ExecutionEvent],
-        candidatePatchManifests: [CandidatePatchManifest] = []
+        candidatePatchManifests: [CandidatePatchManifest] = [],
+        generatedTestArtifacts: [GeneratedTestArtifact] = []
     ) -> AgentConversationAssetProjection {
         let orderedEvents = events
             .filter { $0.workspaceID == workspaceID }
@@ -63,6 +66,21 @@ enum AgentConversationAssetProjector {
             candidateOrder[key] = max(candidateOrder[key] ?? 0, Int64.max - 1)
         }
 
+        var exactGeneratedTests: [String: GeneratedTestActivitySnapshot] = [:]
+        var exactGeneratedOrder: [String: Int64] = [:]
+        var exactGeneratedSourceKey: [String: String] = [:]
+        for (sourceKey, snapshot) in generatedTests {
+            let key = snapshot.stableProjectionKey
+            let order = generatedOrder[sourceKey] ?? 0
+            let existingOrder = exactGeneratedOrder[key] ?? Int64.min
+            let existingSourceKey = exactGeneratedSourceKey[key] ?? ""
+            if order > existingOrder || (order == existingOrder && sourceKey > existingSourceKey) {
+                exactGeneratedTests[key] = snapshot
+                exactGeneratedOrder[key] = order
+                exactGeneratedSourceKey[key] = sourceKey
+            }
+        }
+
         return AgentConversationAssetProjection(
             candidatePatches: candidatePatches
                 .sorted { lhs, rhs in
@@ -71,13 +89,21 @@ enum AgentConversationAssetProjector {
                     return left == right ? lhs.key < rhs.key : left < right
                 }
                 .map(\.value),
-            generatedTestPlans: generatedTests
+            generatedTestPlans: exactGeneratedTests
                 .sorted { lhs, rhs in
-                    let left = generatedOrder[lhs.key] ?? 0
-                    let right = generatedOrder[rhs.key] ?? 0
+                    let left = exactGeneratedOrder[lhs.key] ?? 0
+                    let right = exactGeneratedOrder[rhs.key] ?? 0
                     return left == right ? lhs.key < rhs.key : left < right
                 }
-                .map(\.value)
+                .map(\.value),
+            generatedTestArtifacts: generatedTestArtifacts
+                .filter { $0.sourceBinding.generatedTestSourceBinding.workspaceID == workspaceID }
+                .sorted {
+                    if $0.updatedAt == $1.updatedAt {
+                        return $0.artifactID.uuidString < $1.artifactID.uuidString
+                    }
+                    return $0.updatedAt < $1.updatedAt
+                }
         )
     }
 
@@ -98,9 +124,6 @@ enum AgentConversationAssetProjector {
 
 extension GeneratedTestActivitySnapshot {
     var assetID: String {
-        planningTaskID
-            ?? [sourceCandidatePatchTaskID, patchID]
-                .compactMap { $0 }
-                .joined(separator: ":")
+        stableProjectionKey
     }
 }

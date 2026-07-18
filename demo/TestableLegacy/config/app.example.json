@@ -1,0 +1,7 @@
+{
+  "fixtureMode": true,
+  "orderLookupMode": "read-only",
+  "outboundActionsEnabled": false,
+  "networkAccessEnabled": false,
+  "productionAccessEnabled": false
+}

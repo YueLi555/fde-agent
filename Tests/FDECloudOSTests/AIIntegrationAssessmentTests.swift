@@ -379,6 +379,40 @@ final class AIIntegrationAssessmentTests: XCTestCase {
         XCTAssertFalse(intent.constraints.contains(.allowFileEdits))
     }
 
+    func testExactCapabilityAuthorityPrecedesBroadHeuristicKeywords() {
+        let exactFailedCandidateRequest = """
+        Using the validated TestableLegacy assessment for the customer_support_order_lookup capability, prepare an evidence-grounded Candidate Patch.
+
+        The Patch should address the validated record-level authorization and response-field allowlist findings.
+
+        Create the Candidate Patch plan only. Do not apply changes until explicit approval.
+        """
+        let cases: [(String, AIAgentCapabilityKind)] = [
+            ("Generate a Candidate Patch for customer_support_order_lookup.", .customerSupportOrderLookup),
+            (exactFailedCandidateRequest, .customerSupportOrderLookup),
+            ("Use customer_support_order_lookup and wait for explicit approval.", .customerSupportOrderLookup),
+            (AIAgentCapabilityKind.customerSupportOrderLookup.displayName, .customerSupportOrderLookup),
+            ("Design a workflow automation agent for approval routing.", .workflowAutomation)
+        ]
+
+        for (request, expected) in cases {
+            XCTAssertEqual(AIAgentCapabilityKind(request: request), expected, request)
+        }
+    }
+
+    func testCanonicalCapabilityIDsAreTokenBoundedAndConflictsRemainExplicit() {
+        XCTAssertEqual(
+            AIAgentCapabilityKind(request: "reference unrelated_customer_support_order_lookup_suffix only"),
+            .unspecified
+        )
+        let conflict = AIAgentCapabilityKind.classification(
+            request: "Use customer_support_order_lookup and workflow_automation_agent."
+        )
+        XCTAssertTrue(conflict.hasExactAuthority)
+        XCTAssertTrue(conflict.isConflicting)
+        XCTAssertEqual(conflict.kind, .unspecified)
+    }
+
     func testGenericAssessmentDoesNotAssumeCustomerSupportCapability() {
         let profile = AgentCapabilityProfile.detect(from: "Can this legacy application integrate an AI assistant?")
 

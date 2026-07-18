@@ -12,6 +12,10 @@ enum GeneratedTestActivityPhase: String, Codable, CaseIterable, Hashable, Sendab
 }
 
 struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
+    var generatedTestPlanID: String?
+    var generatedTestPlanRevision: Int?
+    var generatedTestPlanSHA256: String?
+    var generatedTestSourceBindingSHA256: String?
     var planningTaskID: String?
     var sourceCandidatePatchTaskID: String?
     var patchID: String?
@@ -43,8 +47,16 @@ struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
         scenarioCount: Int,
         proposedTestPaths: [String],
         status: GeneratedTestLifecycleStatus,
-        remainingUnknowns: [String]
+        remainingUnknowns: [String],
+        generatedTestPlanID: String? = nil,
+        generatedTestPlanRevision: Int? = nil,
+        generatedTestPlanSHA256: String? = nil,
+        generatedTestSourceBindingSHA256: String? = nil
     ) {
+        self.generatedTestPlanID = generatedTestPlanID
+        self.generatedTestPlanRevision = generatedTestPlanRevision
+        self.generatedTestPlanSHA256 = generatedTestPlanSHA256
+        self.generatedTestSourceBindingSHA256 = generatedTestSourceBindingSHA256
         self.planningTaskID = planningTaskID
         self.sourceCandidatePatchTaskID = sourceCandidatePatchTaskID
         self.patchID = patchID
@@ -81,6 +93,10 @@ struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
     )
 
     init(plan: GeneratedTestPlan) {
+        generatedTestPlanID = plan.planID.uuidString.lowercased()
+        generatedTestPlanRevision = plan.revision
+        generatedTestPlanSHA256 = plan.planSHA256
+        generatedTestSourceBindingSHA256 = plan.sourceBinding.digest
         planningTaskID = plan.sourceBinding.generatedTestPlanningTaskID.uuidString
         sourceCandidatePatchTaskID = plan.sourceBinding.sourceCandidatePatchTaskID.uuidString
         patchID = plan.sourceBinding.patchID.rawValue
@@ -100,6 +116,10 @@ struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
 
     var eventPayload: [String: String] {
         [
+            "generated_test_plan_id": generatedTestPlanID ?? "",
+            "generated_test_plan_revision": generatedTestPlanRevision.map(String.init) ?? "",
+            "generated_test_plan_sha256": generatedTestPlanSHA256 ?? "",
+            "generated_test_source_binding_sha256": generatedTestSourceBindingSHA256 ?? "",
             "generated_test_planning_task_id": planningTaskID ?? "",
             "generated_test_source_candidate_patch_task_id": sourceCandidatePatchTaskID ?? "",
             "generated_test_patch_id": patchID ?? "",
@@ -124,6 +144,10 @@ struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
             return nil
         }
         self.status = status
+        generatedTestPlanID = eventPayload["generated_test_plan_id"]?.nonEmpty
+        generatedTestPlanRevision = eventPayload["generated_test_plan_revision"].flatMap(Int.init)
+        generatedTestPlanSHA256 = eventPayload["generated_test_plan_sha256"]?.nonEmpty
+        generatedTestSourceBindingSHA256 = eventPayload["generated_test_source_binding_sha256"]?.nonEmpty
         planningTaskID = eventPayload["generated_test_planning_task_id"]?.nonEmpty
         sourceCandidatePatchTaskID = eventPayload["generated_test_source_candidate_patch_task_id"]?.nonEmpty
         patchID = eventPayload["generated_test_patch_id"]?.nonEmpty
@@ -142,6 +166,125 @@ struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
         remainingUnknowns = eventPayload["generated_test_remaining_unknowns"]?
             .split(separator: "|")
             .map { $0.trimmingCharacters(in: .whitespaces) } ?? []
+    }
+}
+
+struct GeneratedTestPlanGenerationEligibility: Equatable, Sendable {
+    var isAvailable: Bool
+    var unavailableReason: String?
+
+    static let available = GeneratedTestPlanGenerationEligibility(
+        isAvailable: true,
+        unavailableReason: nil
+    )
+
+    static func unavailable(_ reason: String) -> GeneratedTestPlanGenerationEligibility {
+        GeneratedTestPlanGenerationEligibility(isAvailable: false, unavailableReason: reason)
+    }
+}
+
+extension GeneratedTestActivitySnapshot {
+    var exactPlanProjectionKey: String? {
+        guard let planID = generatedTestPlanID.flatMap(UUID.init(uuidString:)),
+              let revision = generatedTestPlanRevision,
+              revision > 0,
+              let digest = generatedTestPlanSHA256,
+              digest.count == 64 else {
+            return nil
+        }
+        return "generated-test-plan:\(planID.uuidString.lowercased()):\(revision):\(digest.lowercased())"
+    }
+
+    var stableProjectionKey: String {
+        exactPlanProjectionKey
+            ?? planningTaskID.flatMap(UUID.init(uuidString:)).map {
+                "generated-test-planning-task:\($0.uuidString.lowercased())"
+            }
+            ?? [sourceCandidatePatchTaskID, patchID]
+                .compactMap { $0 }
+                .joined(separator: ":")
+    }
+
+    func generationEligibility(
+        persistedPlan: GeneratedTestPlan?,
+        workspaceID: UUID,
+        authenticatedLocalSessionID: UUID,
+        appSessionID: UUID,
+        hasExistingArtifact: Bool,
+        isInFlight: Bool
+    ) -> GeneratedTestPlanGenerationEligibility {
+        guard status == .testPlanReviewReady else {
+            return .unavailable("This Generated Test Plan is not ready for Artifact generation.")
+        }
+        guard let persistedPlan,
+              exactGenerationContext(
+                for: persistedPlan,
+                workspaceID: workspaceID,
+                authenticatedLocalSessionID: authenticatedLocalSessionID,
+                appSessionID: appSessionID
+              ) != nil else {
+            if let persistedPlan,
+               persistedPlan.sourceBinding.appSessionID != appSessionID {
+                return .unavailable("This historical Generated Test Plan belongs to a previous app session and is read-only.")
+            }
+            return .unavailable("The exact persisted authority for this Generated Test Plan is unavailable or stale.")
+        }
+        guard !hasExistingArtifact else {
+            return .unavailable("This exact Generated Test Plan already has an auditable Generated Test Artifact.")
+        }
+        guard !isInFlight else {
+            return .unavailable("Artifact generation for this exact Generated Test Plan is already in progress.")
+        }
+        return .available
+    }
+
+    func exactGenerationContext(
+        for plan: GeneratedTestPlan,
+        workspaceID: UUID,
+        authenticatedLocalSessionID: UUID,
+        appSessionID: UUID
+    ) -> GeneratedTestArtifactGenerationContext? {
+        guard let planningTaskID = planningTaskID.flatMap(UUID.init(uuidString:)),
+              let planID = generatedTestPlanID.flatMap(UUID.init(uuidString:)),
+              let planRevision = generatedTestPlanRevision,
+              let planSHA256 = generatedTestPlanSHA256,
+              let sourceBindingSHA256 = generatedTestSourceBindingSHA256,
+              let sourceCandidatePatchTaskID = sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
+              let candidatePatchID = patchID.flatMap(CandidatePatchID.init(rawValue:)),
+              let sandboxID = sandboxID.flatMap(SandboxID.init(rawValue:)),
+              plan.sourceBinding.workspaceID == workspaceID,
+              plan.sourceBinding.generatedTestPlanningTaskID == planningTaskID,
+              plan.planID == planID,
+              plan.revision == planRevision,
+              plan.planSHA256 == planSHA256,
+              GeneratedTestPlanDigest.compute(plan) == planSHA256,
+              plan.sourceBinding.digest == sourceBindingSHA256,
+              plan.sourceBinding.sourceCandidatePatchTaskID == sourceCandidatePatchTaskID,
+              plan.sourceBinding.patchID == candidatePatchID,
+              plan.sourceBinding.candidatePatchArtifactSHA256 == candidatePatchArtifactSHA256,
+              plan.sourceBinding.sandboxID == sandboxID,
+              plan.sourceBinding.sourceSnapshotID == sourceSnapshotID,
+              plan.sourceBinding.authenticatedLocalSessionID == authenticatedLocalSessionID,
+              plan.sourceBinding.appSessionID == appSessionID else {
+            return nil
+        }
+        return GeneratedTestArtifactGenerationContext(
+            workspaceID: workspaceID,
+            generatedTestPlanningTaskID: planningTaskID,
+            generatedTestPlanID: planID,
+            generatedTestPlanRevision: planRevision,
+            generatedTestPlanSHA256: planSHA256,
+            generatedTestSourceBindingSHA256: sourceBindingSHA256,
+            sourceCandidatePatchTaskID: sourceCandidatePatchTaskID,
+            candidatePatchID: candidatePatchID,
+            candidatePatchPlanID: plan.sourceBinding.candidatePatchPlanID,
+            candidatePatchPlanRevision: plan.sourceBinding.candidatePatchPlanRevision,
+            candidatePatchArtifactSHA256: plan.sourceBinding.candidatePatchArtifactSHA256,
+            sandboxID: sandboxID,
+            sourceSnapshotID: plan.sourceBinding.sourceSnapshotID,
+            authenticatedLocalSessionID: authenticatedLocalSessionID,
+            appSessionID: appSessionID
+        )
     }
 }
 

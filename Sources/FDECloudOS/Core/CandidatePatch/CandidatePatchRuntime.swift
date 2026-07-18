@@ -36,7 +36,11 @@ struct PersistedCandidatePatchPlanRequestProvider: CandidatePatchPlanRequestProv
             URL(fileURLWithPath: rootPath, isDirectory: true)
         )
         let currentSnapshot = try SourceSnapshotBuilder().build(root: root)
-        let explicitKind = AIAgentCapabilityKind(request: input)
+        let capabilityClassification = AIAgentCapabilityKind.classification(request: input)
+        guard !capabilityClassification.isConflicting else {
+            throw CandidatePatchError.blocked(.assessmentCapabilityMismatch)
+        }
+        let explicitKind = capabilityClassification.kind
         let explicitCapabilityID = explicitKind == .unspecified ? nil : explicitKind.rawValue
 
         let events = try await persistence.loadEvents(workspaceID: workspace.id, taskID: nil)

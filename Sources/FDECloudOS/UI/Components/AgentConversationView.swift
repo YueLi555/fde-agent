@@ -8,6 +8,7 @@ struct AgentConversationView: View {
     var activity: AgentConversationActivity? = nil
     var candidatePatchAssets: [CandidatePatchActivitySnapshot] = []
     var generatedTestAssets: [GeneratedTestActivitySnapshot] = []
+    var generatedTestArtifactAssets: [GeneratedTestArtifact] = []
     let approvals: [ApprovalRequest]
     var showsHeader = true
     let onApprove: (ApprovalRequest) -> Void
@@ -17,6 +18,12 @@ struct AgentConversationView: View {
     var onCandidatePatchRevert: ((CandidatePatchActivitySnapshot) -> Void)? = nil
     var onCandidatePatchDestroySandbox: ((CandidatePatchActivitySnapshot) -> Void)? = nil
     var onPlanGeneratedTests: ((CandidatePatchActivitySnapshot) -> Void)? = nil
+    var onGenerateTestArtifact: ((GeneratedTestActivitySnapshot) -> Void)? = nil
+    var generatedTestPlanGenerationEligibility: ((GeneratedTestActivitySnapshot) -> GeneratedTestPlanGenerationEligibility)? = nil
+    var onRequestGeneratedTestArtifactChanges: ((GeneratedTestArtifact, String) -> Void)? = nil
+    var onRejectGeneratedTestArtifact: ((GeneratedTestArtifact) -> Void)? = nil
+    var onApproveGeneratedTestArtifact: ((GeneratedTestArtifact) -> Void)? = nil
+    var generatedTestArtifactReviewEligibility: ((GeneratedTestArtifact) -> GeneratedTestArtifactReviewEligibility)? = nil
 
     private var displayItems: [AgentConversationDisplayItem] {
         AgentConversationWorkUnitAdapter.displayItems(
@@ -63,7 +70,23 @@ struct AgentConversationView: View {
                 }
 
                 ForEach(generatedTestAssets, id: \.assetID) { snapshot in
-                    GeneratedTestPlanStatusCard(snapshot: snapshot)
+                    GeneratedTestPlanStatusCard(
+                        snapshot: snapshot,
+                        onGenerateArtifact: onGenerateTestArtifact,
+                        generationEligibility: generatedTestPlanGenerationEligibility?(snapshot)
+                            ?? .unavailable("The exact Generated Test Plan action authority is unavailable.")
+                    )
+                }
+
+                ForEach(generatedTestArtifactAssets) { artifact in
+                    GeneratedTestArtifactCard(
+                        artifact: artifact,
+                        onRequestChanges: onRequestGeneratedTestArtifactChanges,
+                        onReject: onRejectGeneratedTestArtifact,
+                        onApprove: onApproveGeneratedTestArtifact,
+                        reviewEligibility: generatedTestArtifactReviewEligibility?(artifact)
+                            ?? .unavailable("The exact Generated Test Artifact review authority is unavailable.")
+                    )
                 }
 
                 if let activity, activity.kind.isVisible {
@@ -158,7 +181,7 @@ private struct AgentConversationActivityRow: View {
 
             if let generatedTest = activity.metadata.generatedTest,
                !projectedGeneratedTestIDs.contains(generatedTest.assetID) {
-                GeneratedTestPlanStatusCard(snapshot: generatedTest)
+                GeneratedTestPlanStatusCard(snapshot: generatedTest, onGenerateArtifact: nil)
             }
         }
         .frame(maxWidth: 680, alignment: .leading)
@@ -411,6 +434,10 @@ private struct CandidatePatchStatusCard: View {
 
 private struct GeneratedTestPlanStatusCard: View {
     let snapshot: GeneratedTestActivitySnapshot
+    let onGenerateArtifact: ((GeneratedTestActivitySnapshot) -> Void)?
+    var generationEligibility: GeneratedTestPlanGenerationEligibility = .unavailable(
+        "The exact Generated Test Plan action authority is unavailable."
+    )
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -450,12 +477,45 @@ private struct GeneratedTestPlanStatusCard: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
+            DisclosureGroup("Exact Plan binding") {
+                VStack(alignment: .leading, spacing: 5) {
+                    generatedTestExact("Projection key", snapshot.assetID)
+                    generatedTestExact("Planning task ID", snapshot.planningTaskID)
+                    generatedTestExact("Generated Test Plan ID", snapshot.generatedTestPlanID)
+                    generatedTestExact("Plan revision", snapshot.generatedTestPlanRevision.map(String.init))
+                    generatedTestExact("Plan SHA-256", snapshot.generatedTestPlanSHA256)
+                    generatedTestExact("Source binding SHA-256", snapshot.generatedTestSourceBindingSHA256)
+                    generatedTestExact("Source Candidate Patch task ID", snapshot.sourceCandidatePatchTaskID)
+                    generatedTestExact("Candidate Patch ID", snapshot.patchID)
+                    generatedTestExact("Candidate Patch artifact", snapshot.candidatePatchArtifactSHA256)
+                    generatedTestExact("Sandbox ID", snapshot.sandboxID)
+                    generatedTestExact("Source snapshot", snapshot.sourceSnapshotID)
+                }
+                .padding(.top, 4)
+            }
+            .font(.caption)
             Text("No test files were created. Test syntax was not verified. Build was not executed. Tests were not executed. Behavioral correctness was not verified.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Text("Phase 2D.3 is unavailable.")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.orange)
+            if snapshot.status == .testPlanReviewReady {
+                Button {
+                    onGenerateArtifact?(snapshot)
+                } label: {
+                    Label("Generate Reviewable Virtual Test Files", systemImage: "doc.text.magnifyingglass")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!generationEligibility.isAvailable || onGenerateArtifact == nil)
+                .accessibilityIdentifier("generatedTests.artifact.generate")
+                if let unavailableReason = generationEligibility.unavailableReason {
+                    Text(unavailableReason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("generatedTests.artifact.generate.unavailableReason")
+                }
+            }
         }
         .padding(10)
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
@@ -484,6 +544,18 @@ private struct GeneratedTestPlanStatusCard: View {
     private func abbreviated(_ value: String?) -> String {
         guard let value, !value.isEmpty else { return "—" }
         return value.count > 12 ? "\(value.prefix(12))…" : value
+    }
+
+    private func generatedTestExact(_ label: String, _ value: String?) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label)
+                .foregroundStyle(.secondary)
+                .frame(width: 184, alignment: .leading)
+            Text(value ?? "UNAVAILABLE")
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 
