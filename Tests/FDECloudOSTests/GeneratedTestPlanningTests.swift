@@ -632,6 +632,129 @@ final class GeneratedTestPlanningTests: XCTestCase {
         XCTAssertEqual(projection.generatedTestPlans.first?.status, .clarificationRequired)
     }
 
+    func testGeneratedTestPlanProjectionDeduplicatesOneAuthorityAndPreservesDistinctPlans() throws {
+        let fixture = try makeFixture(environment: .vitest)
+        defer { fixture.cleanup() }
+        _ = try fixture.authorizedManifest()
+        let plan = try fixture.planGeneratedTests().plan
+        let first = GeneratedTestActivitySnapshot(plan: plan)
+        var duplicateReady = event(
+            workspaceID: fixture.workspaceID,
+            taskID: fixture.planningTaskID,
+            payload: first.eventPayload
+        )
+        duplicateReady.sequence = 1
+        var duplicateCompleted = event(
+            workspaceID: fixture.workspaceID,
+            taskID: fixture.planningTaskID,
+            payload: first.eventPayload
+        )
+        duplicateCompleted.sequence = 2
+
+        let onePlan = AgentConversationAssetProjector.project(
+            workspaceID: fixture.workspaceID,
+            events: [duplicateReady, duplicateCompleted]
+        )
+        XCTAssertEqual(onePlan.generatedTestPlans, [first])
+        XCTAssertEqual(onePlan.generatedTestPlans.first?.assetID, first.exactPlanProjectionKey)
+
+        var second = first
+        second.generatedTestPlanID = "00000000-0000-0000-0000-0000000002c0"
+        second.generatedTestPlanSHA256 = String(repeating: "2", count: 64)
+        second.generatedTestSourceBindingSHA256 = String(repeating: "3", count: 64)
+        second.planningTaskID = "00000000-0000-0000-0000-0000000002c1"
+        var secondEvent = event(
+            workspaceID: fixture.workspaceID,
+            taskID: UUID(uuidString: second.planningTaskID!)!,
+            payload: second.eventPayload
+        )
+        secondEvent.sequence = 3
+
+        let distinctPlans = AgentConversationAssetProjector.project(
+            workspaceID: fixture.workspaceID,
+            events: [duplicateReady, duplicateCompleted, secondEvent]
+        )
+        XCTAssertEqual(distinctPlans.generatedTestPlans.count, 2)
+        XCTAssertEqual(distinctPlans.generatedTestPlans[0].generatedTestPlanID, first.generatedTestPlanID)
+        XCTAssertEqual(distinctPlans.generatedTestPlans[0].generatedTestPlanRevision, first.generatedTestPlanRevision)
+        XCTAssertEqual(distinctPlans.generatedTestPlans[0].generatedTestPlanSHA256, first.generatedTestPlanSHA256)
+        XCTAssertEqual(distinctPlans.generatedTestPlans[1].generatedTestPlanID, second.generatedTestPlanID)
+        XCTAssertEqual(distinctPlans.generatedTestPlans[1].generatedTestPlanRevision, second.generatedTestPlanRevision)
+        XCTAssertEqual(distinctPlans.generatedTestPlans[1].generatedTestPlanSHA256, second.generatedTestPlanSHA256)
+        XCTAssertEqual(Set(distinctPlans.generatedTestPlans.map(\.assetID)).count, 2)
+        XCTAssertEqual(
+            AgentConversationAssetProjector.project(
+                workspaceID: fixture.workspaceID,
+                events: [duplicateReady, duplicateCompleted, secondEvent]
+            ),
+            distinctPlans
+        )
+    }
+
+    func testExactPlanCardEligibilityDisablesRestartedExistingAndInFlightActions() throws {
+        let fixture = try makeFixture(environment: .vitest)
+        defer { fixture.cleanup() }
+        _ = try fixture.authorizedManifest()
+        let plan = try fixture.planGeneratedTests().plan
+        let snapshot = GeneratedTestActivitySnapshot(plan: plan)
+
+        XCTAssertEqual(snapshot.generationEligibility(
+            persistedPlan: plan,
+            workspaceID: fixture.workspaceID,
+            authenticatedLocalSessionID: fixture.userSessionID,
+            appSessionID: fixture.appSessionID,
+            hasExistingArtifact: false,
+            isInFlight: false
+        ), .available)
+        let context = try XCTUnwrap(snapshot.exactGenerationContext(
+            for: plan,
+            workspaceID: fixture.workspaceID,
+            authenticatedLocalSessionID: fixture.userSessionID,
+            appSessionID: fixture.appSessionID
+        ))
+        XCTAssertEqual(context.generatedTestPlanID, plan.planID)
+        XCTAssertEqual(context.generatedTestPlanRevision, plan.revision)
+        XCTAssertEqual(context.generatedTestPlanSHA256, plan.planSHA256)
+        XCTAssertEqual(context.candidatePatchID, plan.sourceBinding.patchID)
+        XCTAssertEqual(context.candidatePatchArtifactSHA256, plan.sourceBinding.candidatePatchArtifactSHA256)
+
+        let restarted = snapshot.generationEligibility(
+            persistedPlan: plan,
+            workspaceID: fixture.workspaceID,
+            authenticatedLocalSessionID: fixture.userSessionID,
+            appSessionID: UUID(),
+            hasExistingArtifact: false,
+            isInFlight: false
+        )
+        XCTAssertFalse(restarted.isAvailable)
+        XCTAssertTrue(restarted.unavailableReason?.contains("previous app session") == true)
+        XCTAssertFalse(snapshot.generationEligibility(
+            persistedPlan: plan,
+            workspaceID: fixture.workspaceID,
+            authenticatedLocalSessionID: fixture.userSessionID,
+            appSessionID: fixture.appSessionID,
+            hasExistingArtifact: true,
+            isInFlight: false
+        ).isAvailable)
+        XCTAssertFalse(snapshot.generationEligibility(
+            persistedPlan: plan,
+            workspaceID: fixture.workspaceID,
+            authenticatedLocalSessionID: fixture.userSessionID,
+            appSessionID: fixture.appSessionID,
+            hasExistingArtifact: false,
+            isInFlight: true
+        ).isAvailable)
+
+        var staleDigest = snapshot
+        staleDigest.generatedTestPlanSHA256 = String(repeating: "0", count: 64)
+        XCTAssertNil(staleDigest.exactGenerationContext(
+            for: plan,
+            workspaceID: fixture.workspaceID,
+            authenticatedLocalSessionID: fixture.userSessionID,
+            appSessionID: fixture.appSessionID
+        ))
+    }
+
     func testExactActionBindingRejectsMissingTruncatedAndTamperedAuthority() throws {
         let fixture = try makeFixture(environment: .vitest)
         defer { fixture.cleanup() }

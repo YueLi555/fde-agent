@@ -149,6 +149,7 @@ struct GeneratedTestPlanningService: Sendable {
             sourceSnapshotID: persistedBinding.sourceSnapshotID,
             canonicalLegacyRoot: persistedBinding.canonicalLegacyRoot,
             normalizedCapabilityID: persistedBinding.normalizedCapabilityID,
+            capabilityDisplayLabel: persistedBinding.capabilityDisplayLabel,
             validatedAssessmentID: persistedBinding.validatedAssessmentID,
             validationTestPlanSHA256: validationPlanSHA256,
             unifiedDiffSHA256: persistedBinding.unifiedDiffSHA256,
@@ -259,7 +260,7 @@ struct GeneratedTestPlanningService: Sendable {
         let symbolIDs = symbols.map(\.symbolID).sorted()
         let operationEvidence = Array(Set(manifest.operations.flatMap(\.evidenceClaimIDs))).sorted()
         let blockers = Array(Set(manifest.plan.blockersAddressed)).sorted()
-        return validationPlan.items.prefix(8).enumerated().map { index, item in
+        return validationPlan.items.prefix(16).enumerated().map { index, item in
             GeneratedTestScenario(
                 scenarioID: "scenario-\(index + 1)-\(CandidatePatchArtifactAuthority.digest([("item", item.validationItemID)]).prefix(12))",
                 title: item.title,
@@ -305,7 +306,7 @@ struct GeneratedTestPlanningService: Sendable {
     }
 }
 
-private struct GeneratedTestReadOnlySandbox: Sendable {
+struct GeneratedTestReadOnlySandbox: Sendable {
     let lifecycle: SandboxLifecycleService
     let sandboxID: SandboxID
     let maximumBytes = 524_288

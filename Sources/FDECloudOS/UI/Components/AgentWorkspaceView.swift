@@ -91,6 +91,7 @@ struct AgentWorkspaceView: View {
                     activity: store.selectedConversationActivity,
                     candidatePatchAssets: store.conversationAssetProjection.candidatePatches,
                     generatedTestAssets: store.conversationAssetProjection.generatedTestPlans,
+                    generatedTestArtifactAssets: store.conversationAssetProjection.generatedTestArtifacts,
                     approvals: store.selectedTaskPendingApprovals,
                     showsHeader: false,
                     onApprove: store.approve,
@@ -99,7 +100,13 @@ struct AgentWorkspaceView: View {
                     onSelectOption: store.selectDecision,
                     onCandidatePatchRevert: store.openCandidatePatchRevertConfirmation,
                     onCandidatePatchDestroySandbox: store.openCandidatePatchDestructionConfirmation,
-                    onPlanGeneratedTests: store.prepareGeneratedTestPlan
+                    onPlanGeneratedTests: store.prepareGeneratedTestPlan,
+                    onGenerateTestArtifact: store.generateTestArtifact,
+                    generatedTestPlanGenerationEligibility: store.generatedTestPlanGenerationEligibility,
+                    onRequestGeneratedTestArtifactChanges: store.requestGeneratedTestArtifactChanges,
+                    onRejectGeneratedTestArtifact: store.rejectGeneratedTestArtifact,
+                    onApproveGeneratedTestArtifact: store.approveGeneratedTestArtifact,
+                    generatedTestArtifactReviewEligibility: store.generatedTestArtifactReviewEligibility
                 )
             }
             .frame(maxWidth: 780, alignment: .topLeading)

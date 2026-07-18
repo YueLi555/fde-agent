@@ -7,6 +7,17 @@ enum GeneratedTestLifecycleStatus: String, Codable, CaseIterable, Hashable, Send
     case preparingTestGenerationPlan = "PREPARING_TEST_GENERATION_PLAN"
     case testPlanReviewReady = "TEST_PLAN_REVIEW_READY"
     case testPlanApprovalRequired = "TEST_PLAN_APPROVAL_REQUIRED"
+    case loadingExactPatch = "LOADING_EXACT_PATCH"
+    case validatingTestPlan = "VALIDATING_TEST_PLAN"
+    case discoveringTestConventions = "DISCOVERING_TEST_CONVENTIONS"
+    case generatingTestScenarios = "GENERATING_TEST_SCENARIOS"
+    case generatingVirtualTestFiles = "GENERATING_VIRTUAL_TEST_FILES"
+    case bindingEvidence = "BINDING_EVIDENCE"
+    case verifyingArtifactDigest = "VERIFYING_ARTIFACT_DIGEST"
+    case testArtifactReviewReady = "TEST_ARTIFACT_REVIEW_READY"
+    case artifactChangeRequested = "ARTIFACT_CHANGE_REQUESTED"
+    case artifactRejected = "ARTIFACT_REJECTED"
+    case artifactApproved = "ARTIFACT_APPROVED"
     case rejected = "REJECTED"
     case blocked = "BLOCKED"
     case failed = "FAILED"
@@ -183,6 +194,7 @@ struct GeneratedTestSourceBinding: Codable, Hashable, Sendable {
     var sourceSnapshotID: String
     var canonicalLegacyRoot: String
     var normalizedCapabilityID: String
+    var capabilityDisplayLabel: String?
     var validatedAssessmentID: String
     var validationTestPlanSHA256: String
     var unifiedDiffSHA256: String
@@ -207,6 +219,7 @@ struct GeneratedTestSourceBinding: Codable, Hashable, Sendable {
             ("source_snapshot_id", sourceSnapshotID),
             ("canonical_legacy_root", canonicalLegacyRoot),
             ("normalized_capability_id", normalizedCapabilityID),
+            ("capability_display_label", capabilityDisplayLabel ?? normalizedCapabilityID),
             ("validated_assessment_id", validatedAssessmentID),
             ("validation_test_plan_sha256", validationTestPlanSHA256),
             ("unified_diff_sha256", unifiedDiffSHA256),
@@ -403,6 +416,20 @@ enum GeneratedTestFailureCode: String, Codable, CaseIterable, Hashable, Sendable
     case writeOperationUnavailable = "generated_test_write_operation_unavailable"
     case phase2D3Unavailable = "phase_2d_3_unavailable"
     case planPersistenceInvalid = "generated_test_plan_persistence_invalid"
+    case exactPlanBindingRequired = "generated_test_exact_plan_binding_required"
+    case generatedTestPlanMismatch = "generated_test_plan_mismatch"
+    case generatedTestPlanDigestMismatch = "generated_test_plan_digest_mismatch"
+    case generatedTestPlanNotReviewReady = "generated_test_plan_not_review_ready"
+    case virtualFilePathInvalid = "generated_test_virtual_file_path_invalid"
+    case unsupportedImport = "generated_test_unsupported_import"
+    case ungroundedHelperOrAPI = "generated_test_ungrounded_helper_or_api"
+    case generationEvidenceMissing = "generated_test_generation_evidence_missing"
+    case artifactDigestMismatch = "generated_test_artifact_digest_mismatch"
+    case artifactPersistenceInvalid = "generated_test_artifact_persistence_invalid"
+    case artifactReviewBindingMismatch = "generated_test_artifact_review_binding_mismatch"
+    case artifactReviewStateInvalid = "generated_test_artifact_review_state_invalid"
+    case artifactApprovalConfirmationRequired = "generated_test_artifact_approval_confirmation_required"
+    case artifactApprovalConfirmationInvalid = "generated_test_artifact_approval_confirmation_invalid"
 }
 
 enum GeneratedTestError: Error, Equatable, Sendable {
@@ -414,5 +441,18 @@ enum GeneratedTestError: Error, Equatable, Sendable {
 }
 
 extension GeneratedTestError: LocalizedError {
-    var errorDescription: String? { code.rawValue }
+    var errorDescription: String? {
+        switch code {
+        case .artifactReviewStateInvalid:
+            return "This exact Generated Test Artifact revision is no longer awaiting review. Its persisted review decision was preserved."
+        case .artifactReviewBindingMismatch:
+            return "This Generated Test Artifact review action is stale or does not match the exact persisted revision and review session."
+        case .artifactApprovalConfirmationInvalid:
+            return "The Generated Test Artifact approval confirmation is stale or does not match the exact persisted review action."
+        case .generatedTestPlanMismatch:
+            return "The selected Generated Test Plan no longer matches its exact persisted Plan, Candidate Patch, workspace, or session authority."
+        default:
+            return code.rawValue
+        }
+    }
 }
