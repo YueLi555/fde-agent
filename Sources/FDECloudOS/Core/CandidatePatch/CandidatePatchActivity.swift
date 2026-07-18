@@ -81,6 +81,7 @@ struct CandidatePatchActivitySnapshot: Codable, Hashable, Sendable {
     var approvalState: CandidatePatchApprovalDecision?
     var projectionState: CandidatePatchProjectionState?
     var generatedTestSourceBinding: CandidatePatchGeneratedTestSourceBinding?
+    var lifecycleEvents: [CandidatePatchProjectionState]? = nil
 
     static let empty = CandidatePatchActivitySnapshot(
         patchID: nil,
@@ -146,6 +147,23 @@ struct CandidatePatchActivitySnapshot: Codable, Hashable, Sendable {
         } else {
             projectionState = nil
         }
+        var lifecycle: [CandidatePatchProjectionState] = []
+        if manifest.auditEvents.contains(where: { $0.type == .reviewPrepared })
+            || manifest.status == .reviewReady
+            || manifest.status == .reverted
+            || manifest.sandboxDestroyedAt != nil {
+            lifecycle.append(.patchReady)
+        }
+        if manifest.auditEvents.contains(where: { $0.type == .revertCompleted })
+            || manifest.status == .reverted
+            || manifest.sandboxDestroyedAt != nil {
+            lifecycle.append(.reverted)
+        }
+        if manifest.auditEvents.contains(where: { $0.type == .sandboxDestroyed })
+            || manifest.sandboxDestroyedAt != nil {
+            lifecycle.append(.sandboxDestroyed)
+        }
+        lifecycleEvents = lifecycle
     }
 
     init(plan: CandidatePatchPlan) {
@@ -175,6 +193,7 @@ struct CandidatePatchActivitySnapshot: Codable, Hashable, Sendable {
         approvalState = plan.approvalRecord?.decision
         projectionState = plan.status == .reviewReady || plan.status == .applied ? .patchReady : nil
         generatedTestSourceBinding = nil
+        lifecycleEvents = projectionState.map { [$0] }
     }
 
     init(
@@ -202,7 +221,8 @@ struct CandidatePatchActivitySnapshot: Codable, Hashable, Sendable {
         sourceIntegrity: SourceIntegrityState?,
         approvalState: CandidatePatchApprovalDecision?,
         projectionState: CandidatePatchProjectionState? = nil,
-        generatedTestSourceBinding: CandidatePatchGeneratedTestSourceBinding? = nil
+        generatedTestSourceBinding: CandidatePatchGeneratedTestSourceBinding? = nil,
+        lifecycleEvents: [CandidatePatchProjectionState]? = nil
     ) {
         self.patchID = patchID
         self.sourceCandidatePatchTaskID = sourceCandidatePatchTaskID
@@ -229,6 +249,7 @@ struct CandidatePatchActivitySnapshot: Codable, Hashable, Sendable {
         self.approvalState = approvalState
         self.projectionState = projectionState
         self.generatedTestSourceBinding = generatedTestSourceBinding
+        self.lifecycleEvents = lifecycleEvents ?? projectionState.map { [$0] }
     }
 
     var eventPayload: [String: String] {
@@ -258,6 +279,7 @@ struct CandidatePatchActivitySnapshot: Codable, Hashable, Sendable {
         payload["candidate_patch_source_integrity"] = sourceIntegrity?.rawValue ?? ""
         payload["candidate_patch_approval_state"] = approvalState?.rawValue ?? ""
         payload["candidate_patch_projection_state"] = projectionState?.rawValue ?? ""
+        payload["candidate_patch_lifecycle_events"] = (lifecycleEvents ?? []).map(\.rawValue).joined(separator: "|")
         if let generatedTestSourceBinding,
            let data = try? Self.bindingEncoder.encode(generatedTestSourceBinding),
            let json = String(data: data, encoding: .utf8) {
@@ -301,10 +323,22 @@ struct CandidatePatchActivitySnapshot: Codable, Hashable, Sendable {
         approvalState = eventPayload["candidate_patch_approval_state"].flatMap(CandidatePatchApprovalDecision.init(rawValue:))
         projectionState = eventPayload["candidate_patch_projection_state"].flatMap(CandidatePatchProjectionState.init(rawValue:))
         generatedTestSourceBinding = Self.decodeVerifiedBinding(eventPayload)
+        lifecycleEvents = eventPayload["candidate_patch_lifecycle_events"]?
+            .split(separator: "|")
+            .compactMap { CandidatePatchProjectionState(rawValue: String($0)) }
+        if lifecycleEvents?.isEmpty != false, let projectionState {
+            lifecycleEvents = [projectionState]
+        }
     }
 
     var assetID: String {
-        manifestID ?? [patchID ?? "unknown-patch", sandboxID ?? "unknown-sandbox"].joined(separator: ":")
+        [
+            "candidate-patch-plan",
+            planID ?? "unknown-plan",
+            planRevision.map(String.init) ?? "unknown-revision",
+            patchID ?? "unknown-patch",
+            sandboxID ?? "unknown-sandbox"
+        ].joined(separator: ":")
     }
 
     var exactGeneratedTestSourceBinding: CandidatePatchGeneratedTestSourceBinding? {
@@ -366,8 +400,17 @@ struct CandidatePatchActivitySnapshot: Codable, Hashable, Sendable {
             sourceIntegrity: newer.sourceIntegrity ?? sourceIntegrity,
             approvalState: newer.approvalState ?? approvalState,
             projectionState: newer.projectionState ?? projectionState,
-            generatedTestSourceBinding: newer.generatedTestSourceBinding ?? generatedTestSourceBinding
+            generatedTestSourceBinding: newer.generatedTestSourceBinding ?? generatedTestSourceBinding,
+            lifecycleEvents: orderedLifecycleEvents(
+                (lifecycleEvents ?? []) + (newer.lifecycleEvents ?? [])
+            )
         )
+    }
+
+    private func orderedLifecycleEvents(
+        _ values: [CandidatePatchProjectionState]
+    ) -> [CandidatePatchProjectionState] {
+        CandidatePatchProjectionState.allCases.filter(values.contains)
     }
 
     private static let bindingEncoder: JSONEncoder = {

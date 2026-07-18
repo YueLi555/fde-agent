@@ -61,6 +61,15 @@ struct AgentWorkspaceView: View {
             )
             .interactiveDismissDisabled()
         }
+        .sheet(item: $store.missionUndoConfirmation) { confirmation in
+            MissionUndoConfirmationView(
+                confirmation: confirmation,
+                isConfirming: store.isConfirmingMissionUndo,
+                onConfirm: { store.confirmMissionUndo(confirmation) },
+                onCancel: store.cancelMissionUndoConfirmation
+            )
+            .interactiveDismissDisabled()
+        }
     }
 
     @ViewBuilder
@@ -102,17 +111,89 @@ struct AgentWorkspaceView: View {
                     onCandidatePatchDestroySandbox: store.openCandidatePatchDestructionConfirmation,
                     onPlanGeneratedTests: store.prepareGeneratedTestPlan,
                     onGenerateTestArtifact: store.generateTestArtifact,
+                    onReviewProposedTests: store.reviewProposedTests,
                     generatedTestPlanGenerationEligibility: store.generatedTestPlanGenerationEligibility,
                     onRequestGeneratedTestArtifactChanges: store.requestGeneratedTestArtifactChanges,
                     onRejectGeneratedTestArtifact: store.rejectGeneratedTestArtifact,
                     onApproveGeneratedTestArtifact: store.approveGeneratedTestArtifact,
-                    generatedTestArtifactReviewEligibility: store.generatedTestArtifactReviewEligibility
+                    candidatePatchReviewEligibility: store.candidatePatchReviewEligibility,
+                    generatedTestArtifactReviewEligibility: store.generatedTestArtifactReviewEligibility,
+                    missionCleanupStates: store.missionCleanupStates,
+                    onUndoMission: store.openMissionUndoConfirmation,
+                    onRetryMissionCleanup: store.retryMissionCleanup
                 )
             }
             .frame(maxWidth: 780, alignment: .topLeading)
             .padding(.horizontal, 24)
             .padding(.vertical, 22)
             .frame(maxWidth: .infinity, alignment: .top)
+        }
+    }
+}
+
+private struct MissionUndoConfirmationView: View {
+    let confirmation: MissionUndoConfirmation
+    let isConfirming: Bool
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+    @State private var showsTechnicalDetails = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("Undo this run?", systemImage: "arrow.uturn.backward.circle")
+                .font(.title3.weight(.semibold))
+
+            Text("This will:")
+                .font(.callout.weight(.semibold))
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(confirmation.request.expectedOperations, id: \.self) { operation in
+                    Label(operation, systemImage: "checkmark.circle")
+                        .font(.callout)
+                }
+            }
+
+            Text("The original Legacy will not be modified. All Plans, Artifacts, decisions, revisions, and audit records will be preserved.")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.orange)
+
+            DisclosureGroup(isExpanded: $showsTechnicalDetails) {
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 7) {
+                    technicalRow("Mission", confirmation.request.missionID.uuidString.lowercased())
+                    technicalRow("Patch", confirmation.request.patchID ?? "No applied Patch")
+                    technicalRow("Patch revision", confirmation.request.patchRevision.map(String.init) ?? "—")
+                    technicalRow("Sandbox", confirmation.request.sandboxID ?? "No bound Sandbox")
+                    technicalRow("Legacy root", confirmation.request.canonicalLegacyRoot ?? "—")
+                }
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .padding(.top, 6)
+            } label: {
+                Text("Technical details")
+                    .font(.caption.weight(.semibold))
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { onCancel() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(isConfirming)
+                    .accessibilityIdentifier("mission.current.undo.cancel")
+                Button("Undo and clean up", role: .destructive) { onConfirm() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isConfirming)
+                    .accessibilityIdentifier("mission.current.undo.confirm")
+            }
+        }
+        .padding(22)
+        .frame(width: 610)
+        .accessibilityIdentifier("mission.current.undo.confirmation")
+        .onExitCommand(perform: onCancel)
+    }
+
+    private func technicalRow(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label).foregroundStyle(.secondary)
+            Text(value)
         }
     }
 }

@@ -57,13 +57,18 @@ enum AgentConversationAssetProjector {
         for manifest in candidatePatchManifests {
             let snapshot = CandidatePatchActivitySnapshot(manifest: manifest)
             guard let key = candidateKey(snapshot) else { continue }
+            let unboundKey = candidateUnboundKey(snapshot)
+            let unboundEventSnapshot = candidatePatches.removeValue(forKey: unboundKey)
+            let unboundEventOrder = candidateOrder.removeValue(forKey: unboundKey)
             let belongsToWorkspace = manifest.appliedBinding?.workspaceID == workspaceID
                 || candidatePatches[key] != nil
+                || unboundEventSnapshot != nil
             guard belongsToWorkspace else { continue }
-            candidatePatches[key] = candidatePatches[key]
+            let existing = candidatePatches[key] ?? unboundEventSnapshot
+            candidatePatches[key] = existing
                 .map { $0.merged(with: snapshot) }
                 ?? snapshot
-            candidateOrder[key] = max(candidateOrder[key] ?? 0, Int64.max - 1)
+            candidateOrder[key] = max(candidateOrder[key] ?? unboundEventOrder ?? 0, Int64.max - 1)
         }
 
         var exactGeneratedTests: [String: GeneratedTestActivitySnapshot] = [:]
@@ -111,7 +116,21 @@ enum AgentConversationAssetProjector {
         guard let patchID = snapshot.patchID, let sandboxID = snapshot.sandboxID else {
             return nil
         }
-        return "\(patchID):\(sandboxID)"
+        return [
+            patchID,
+            sandboxID,
+            snapshot.planID ?? "unbound-plan",
+            snapshot.planRevision.map(String.init) ?? "unbound-revision"
+        ].joined(separator: ":")
+    }
+
+    private static func candidateUnboundKey(_ snapshot: CandidatePatchActivitySnapshot) -> String {
+        [
+            snapshot.patchID ?? "unknown-patch",
+            snapshot.sandboxID ?? "unknown-sandbox",
+            "unbound-plan",
+            "unbound-revision"
+        ].joined(separator: ":")
     }
 
     private static func eventOrder(_ lhs: ExecutionEvent, _ rhs: ExecutionEvent) -> Bool {

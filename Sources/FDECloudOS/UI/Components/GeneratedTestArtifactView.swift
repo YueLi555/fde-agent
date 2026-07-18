@@ -1,6 +1,339 @@
 import AppKit
 import SwiftUI
 
+struct GeneratedTestFileWorkspace: View {
+    private enum InspectorSection: String, CaseIterable, Identifiable {
+        case scenarios = "Scenarios"
+        case evidence = "Evidence"
+        case details = "Details"
+
+        var id: String { rawValue }
+    }
+
+    let artifact: GeneratedTestArtifact
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedFileID: String?
+    @State private var inspectorSection: InspectorSection = .scenarios
+
+    private var revision: GeneratedTestArtifactRevision? { artifact.currentRevision }
+    private var files: [GeneratedTestVirtualFile] { revision?.virtualFiles ?? [] }
+    private var selectedFile: GeneratedTestVirtualFile? {
+        guard let selectedFileID else { return files.first }
+        return files.first { $0.stableID == selectedFileID } ?? files.first
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            workspaceHeader
+            Divider()
+            HSplitView {
+                fileList
+                    .frame(minWidth: 210, idealWidth: 250, maxWidth: 320)
+                sourcePane
+                    .frame(minWidth: 430, idealWidth: 620)
+                inspector
+                    .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
+            }
+        }
+        .frame(minWidth: 980, minHeight: 640)
+        .accessibilityIdentifier("mission.fileWorkspace")
+        .onAppear(perform: restoreSelection)
+        .onChange(of: files.map(\.stableID)) { _, _ in restoreSelection() }
+        .onMoveCommand(perform: moveSelection)
+        .onExitCommand { dismiss() }
+    }
+
+    private var workspaceHeader: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Generated Tests")
+                    .font(.title3.weight(.semibold))
+                Text("Read-only virtual files · not present on disk")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                selectPrevious()
+            } label: {
+                Image(systemName: "chevron.up")
+            }
+            .disabled(previousFile == nil)
+            .help("Previous file")
+            Button {
+                selectNext()
+            } label: {
+                Image(systemName: "chevron.down")
+            }
+            .disabled(nextFile == nil)
+            .help("Next file")
+            Button("Done") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+        }
+        .padding(14)
+    }
+
+    private var fileList: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Files")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.top, 10)
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(files) { file in
+                        Button {
+                            selectedFileID = file.stableID
+                        } label: {
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: file.operation == .create ? "doc.badge.plus" : "doc.badge.ellipsis")
+                                    .foregroundStyle(file.operation == .create ? .green : .orange)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(file.proposedRelativePath)
+                                        .font(.caption.monospaced())
+                                        .lineLimit(2)
+                                    Text("\(file.operation.rawValue.uppercased()) · \(file.scenarioIDs.count) scenarios")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 2)
+                            }
+                            .padding(8)
+                            .contentShape(Rectangle())
+                            .background(
+                                selectedFile?.stableID == file.stableID
+                                    ? Color.accentColor.opacity(0.13)
+                                    : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 7)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("mission.fileRow")
+                        .accessibilityValue(selectedFile?.stableID == file.stableID ? "Selected" : "Not selected")
+                    }
+                }
+                .padding(.horizontal, 6)
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+        .accessibilityIdentifier("mission.fileList")
+    }
+
+    @ViewBuilder
+    private var sourcePane: some View {
+        if let file = selectedFile {
+            VStack(spacing: 0) {
+                HStack(spacing: 9) {
+                    Text(file.proposedRelativePath)
+                        .font(.caption.monospaced().weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button("Copy Path") { copy(file.proposedRelativePath) }
+                    Button("Copy Source") { copy(file.sourceText) }
+                }
+                .padding(10)
+                Divider()
+                ScrollView([.horizontal, .vertical]) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(sourceLines(file), id: \.offset) { index, line in
+                            HStack(alignment: .top, spacing: 12) {
+                                Text(String(index + 1))
+                                    .foregroundStyle(.tertiary)
+                                    .frame(width: 46, alignment: .trailing)
+                                Text(line.isEmpty ? " " : line)
+                                    .foregroundStyle(sourceColor(line))
+                                    .textSelection(.enabled)
+                            }
+                            .font(.system(.body, design: .monospaced))
+                            .fixedSize(horizontal: true, vertical: false)
+                        }
+                    }
+                    .padding(12)
+                }
+                .background(Color(nsColor: .textBackgroundColor))
+                .accessibilityIdentifier("mission.fileContent")
+                Divider()
+                HStack(spacing: 7) {
+                    workspaceBadge(file.writtenStatus)
+                    workspaceBadge(file.compiledStatus)
+                    workspaceBadge(file.executedStatus)
+                    workspaceBadge(file.behaviorVerificationStatus)
+                    Spacer()
+                }
+                .padding(8)
+            }
+        } else {
+            ContentUnavailableView("No virtual files", systemImage: "doc")
+        }
+    }
+
+    @ViewBuilder
+    private var inspector: some View {
+        VStack(spacing: 0) {
+            Picker("Inspector", selection: $inspectorSection) {
+                ForEach(InspectorSection.allCases) { section in
+                    Text(section.rawValue).tag(section)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(10)
+            Divider()
+            ScrollView {
+                Group {
+                    switch inspectorSection {
+                    case .scenarios: scenarioInspector
+                    case .evidence: evidenceInspector
+                    case .details: detailsInspector
+                    }
+                }
+                .padding(10)
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private var scenarioInspector: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(selectedScenarios) { scenario in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(scenario.title).font(.caption.weight(.semibold))
+                    Text(scenario.behaviorUnderTest)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 7))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("mission.fileInspector.scenarios")
+    }
+
+    private var evidenceInspector: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            ForEach(selectedEvidence) { evidence in
+                DisclosureGroup(evidence.relativePath) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(evidence.safeClaim)
+                        Text(evidence.kind.rawValue)
+                            .foregroundStyle(.secondary)
+                        Text(evidence.sourceSHA256)
+                            .font(.caption2.monospaced())
+                            .textSelection(.enabled)
+                    }
+                    .font(.caption)
+                    .padding(.top, 4)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("mission.fileInspector.evidence")
+    }
+
+    private var detailsInspector: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            if let file = selectedFile {
+                detail("Operation", file.operation.rawValue.uppercased())
+                detail("Virtual file ID", file.stableID)
+                detail("Source SHA-256", file.sourceSHA256)
+                detail("Candidate Patch binding", file.candidatePatchBindingSHA256)
+                detail("Artifact ID", artifact.artifactID.uuidString.lowercased())
+                detail("Artifact revision", revision.map { String($0.revision) } ?? "—")
+                detail("Artifact SHA-256", revision?.digest.sha256 ?? "—")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("mission.fileInspector.details")
+    }
+
+    private var selectedScenarios: [GeneratedTestScenarioBinding] {
+        guard let file = selectedFile else { return [] }
+        return revision?.scenarioBindings.filter { file.scenarioIDs.contains($0.scenarioID) } ?? []
+    }
+
+    private var selectedEvidence: [GeneratedTestEvidenceBinding] {
+        guard let file = selectedFile else { return [] }
+        return revision?.evidenceBindings.filter {
+            file.evidencePaths.contains($0.relativePath) || $0.supportsVirtualFileIDs.contains(file.stableID)
+        } ?? []
+    }
+
+    private var selectedIndex: Int? {
+        guard let id = selectedFile?.stableID else { return nil }
+        return files.firstIndex { $0.stableID == id }
+    }
+
+    private var previousFile: GeneratedTestVirtualFile? {
+        guard let selectedIndex, selectedIndex > files.startIndex else { return nil }
+        return files[selectedIndex - 1]
+    }
+
+    private var nextFile: GeneratedTestVirtualFile? {
+        guard let selectedIndex, selectedIndex + 1 < files.endIndex else { return nil }
+        return files[selectedIndex + 1]
+    }
+
+    private func restoreSelection() {
+        if let selectedFileID, files.contains(where: { $0.stableID == selectedFileID }) { return }
+        selectedFileID = files.first?.stableID
+    }
+
+    private func moveSelection(_ direction: MoveCommandDirection) {
+        switch direction {
+        case .up, .left: selectPrevious()
+        case .down, .right: selectNext()
+        @unknown default: break
+        }
+    }
+
+    private func selectPrevious() {
+        if let previousFile { selectedFileID = previousFile.stableID }
+    }
+
+    private func selectNext() {
+        if let nextFile { selectedFileID = nextFile.stableID }
+    }
+
+    private func sourceLines(_ file: GeneratedTestVirtualFile) -> [(offset: Int, element: String)] {
+        file.sourceText
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .enumerated()
+            .map { ($0.offset, $0.element) }
+    }
+
+    private func sourceColor(_ line: String) -> Color {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("//") { return .secondary }
+        if trimmed.hasPrefix("import ") || trimmed.hasPrefix("const ")
+            || trimmed.hasPrefix("describe(") || trimmed.hasPrefix("it(") {
+            return .accentColor
+        }
+        return .primary
+    }
+
+    private func workspaceBadge(_ value: String) -> some View {
+        Text(value)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.orange)
+    }
+
+    private func detail(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            Text(value).font(.caption.monospaced()).textSelection(.enabled)
+        }
+    }
+
+    private func copy(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+}
+
 struct GeneratedTestArtifactCard: View {
     let artifact: GeneratedTestArtifact
     let onRequestChanges: ((GeneratedTestArtifact, String) -> Void)?

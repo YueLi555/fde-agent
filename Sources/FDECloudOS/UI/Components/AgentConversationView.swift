@@ -19,11 +19,17 @@ struct AgentConversationView: View {
     var onCandidatePatchDestroySandbox: ((CandidatePatchActivitySnapshot) -> Void)? = nil
     var onPlanGeneratedTests: ((CandidatePatchActivitySnapshot) -> Void)? = nil
     var onGenerateTestArtifact: ((GeneratedTestActivitySnapshot) -> Void)? = nil
+    var onReviewProposedTests: MissionGeneratedTestReviewAction? = nil
     var generatedTestPlanGenerationEligibility: ((GeneratedTestActivitySnapshot) -> GeneratedTestPlanGenerationEligibility)? = nil
     var onRequestGeneratedTestArtifactChanges: ((GeneratedTestArtifact, String) -> Void)? = nil
     var onRejectGeneratedTestArtifact: ((GeneratedTestArtifact) -> Void)? = nil
     var onApproveGeneratedTestArtifact: ((GeneratedTestArtifact) -> Void)? = nil
+    var candidatePatchReviewEligibility: ((ApprovalRequest) -> Bool)? = nil
     var generatedTestArtifactReviewEligibility: ((GeneratedTestArtifact) -> GeneratedTestArtifactReviewEligibility)? = nil
+    var missionCleanupStates: [MissionCleanupState] = []
+    var onUndoMission: ((MissionSummary) -> Void)? = nil
+    var onRetryMissionCleanup: ((MissionSummary) -> Void)? = nil
+    @State private var showsWorkDetails = false
 
     private var displayItems: [AgentConversationDisplayItem] {
         AgentConversationWorkUnitAdapter.displayItems(
@@ -37,6 +43,52 @@ struct AgentConversationView: View {
             conversation: session.conversation,
             events: events
         )
+    }
+
+    private var missionPresentation: MissionPresentationState {
+        MissionPresentationProjector.project(
+            session: session,
+            activity: activity,
+            candidatePatches: candidatePatchAssets,
+            generatedTestPlans: generatedTestAssets,
+            generatedTestArtifacts: generatedTestArtifactAssets,
+            approvals: approvals,
+            cleanupStates: missionCleanupStates
+        )
+    }
+
+    private var conciseDisplayItems: [AgentConversationDisplayItem] {
+        let hasMissionAssets = !candidatePatchAssets.isEmpty
+            || !generatedTestAssets.isEmpty
+            || !generatedTestArtifactAssets.isEmpty
+        let lastAgentID = displayItems.reversed().first(where: { item in
+            switch item.content {
+            case let .message(message): return message.sender == .agent
+            case .streamingResponse: return true
+            }
+        })?.id
+        return displayItems.filter { item in
+            switch item.content {
+            case let .message(message):
+                if item.id == lastAgentID,
+                   !(hasMissionAssets && message.type == .result) {
+                    return true
+                }
+                return message.sender == .user
+                    || !message.options.isEmpty
+                    || message.type == .question
+                    || message.type == .decisionRequest
+                    || message.type == .warning
+                    || (!hasMissionAssets && message.type == .result)
+            case let .streamingResponse(response):
+                return response.messageType == .warning || response.messageType == .result
+            }
+        }
+    }
+
+    private var workDetailDisplayItems: [AgentConversationDisplayItem] {
+        let conciseIDs = Set(conciseDisplayItems.map(\.id))
+        return displayItems.filter { !conciseIDs.contains($0.id) }
     }
 
     var body: some View {
@@ -53,61 +105,69 @@ struct AgentConversationView: View {
             }
 
             VStack(spacing: 14) {
-                ForEach(displayItems) { item in
+                ForEach(conciseDisplayItems) { item in
                     AgentConversationDisplayRow(
                         item: item,
                         onSelectOption: onSelectOption
                     )
                 }
 
-                ForEach(candidatePatchAssets, id: \.assetID) { snapshot in
-                    CandidatePatchStatusCard(
-                        snapshot: snapshot,
-                        onRevert: onCandidatePatchRevert,
-                        onDestroySandbox: onCandidatePatchDestroySandbox,
-                        onPlanGeneratedTests: onPlanGeneratedTests
-                    )
-                }
+                MissionPresentationView(
+                    state: missionPresentation,
+                    candidatePatchReviewEligibility: candidatePatchReviewEligibility,
+                    generatedTestPlanGenerationEligibility: generatedTestPlanGenerationEligibility,
+                    generatedTestArtifactReviewEligibility: generatedTestArtifactReviewEligibility,
+                    onApproveCandidatePatch: onApprove,
+                    onRejectCandidatePatch: onReject,
+                    onRequestCandidatePatchChanges: onRequestChanges,
+                    onPlanGeneratedTests: onPlanGeneratedTests,
+                    onGenerateTestArtifact: onGenerateTestArtifact,
+                    onReviewProposedTests: onReviewProposedTests,
+                    onRequestGeneratedTestArtifactChanges: onRequestGeneratedTestArtifactChanges,
+                    onRejectGeneratedTestArtifact: onRejectGeneratedTestArtifact,
+                    onApproveGeneratedTestArtifact: onApproveGeneratedTestArtifact,
+                    onUndoRun: onUndoMission,
+                    onRetryCleanup: onRetryMissionCleanup,
+                    onShowWorkDetails: { showsWorkDetails = true }
+                )
+            }
 
-                ForEach(generatedTestAssets, id: \.assetID) { snapshot in
-                    GeneratedTestPlanStatusCard(
-                        snapshot: snapshot,
-                        onGenerateArtifact: onGenerateTestArtifact,
-                        generationEligibility: generatedTestPlanGenerationEligibility?(snapshot)
-                            ?? .unavailable("The exact Generated Test Plan action authority is unavailable.")
-                    )
-                }
-
-                ForEach(generatedTestArtifactAssets) { artifact in
-                    GeneratedTestArtifactCard(
-                        artifact: artifact,
-                        onRequestChanges: onRequestGeneratedTestArtifactChanges,
-                        onReject: onRejectGeneratedTestArtifact,
-                        onApprove: onApproveGeneratedTestArtifact,
-                        reviewEligibility: generatedTestArtifactReviewEligibility?(artifact)
-                            ?? .unavailable("The exact Generated Test Artifact review authority is unavailable.")
-                    )
-                }
-
-                if let activity, activity.kind.isVisible {
-                    AgentConversationActivityRow(
-                        activity: activity,
-                        projectedCandidatePatchIDs: Set(candidatePatchAssets.map(\.assetID)),
-                        projectedGeneratedTestIDs: Set(generatedTestAssets.map(\.assetID)),
-                        onCandidatePatchRevert: onCandidatePatchRevert,
-                        onCandidatePatchDestroySandbox: onCandidatePatchDestroySandbox,
-                        onPlanGeneratedTests: onPlanGeneratedTests
-                    )
+            if activity?.kind.isVisible == true
+                || !workStatusCards.isEmpty
+                || !workDetailDisplayItems.isEmpty {
+                DisclosureGroup(isExpanded: $showsWorkDetails) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(workDetailDisplayItems) { item in
+                            AgentConversationDisplayRow(
+                                item: item,
+                                onSelectOption: onSelectOption
+                            )
+                        }
+                        if let activity, activity.kind.isVisible {
+                            AgentConversationActivityRow(
+                                activity: activity,
+                                projectedCandidatePatchIDs: Set(candidatePatchAssets.map(\.assetID)),
+                                projectedGeneratedTestIDs: Set(generatedTestAssets.map(\.assetID)),
+                                onCandidatePatchRevert: nil,
+                                onCandidatePatchDestroySandbox: nil,
+                                onPlanGeneratedTests: nil
+                            )
+                        }
+                        if !workStatusCards.isEmpty {
+                            AgentConversationWorkStatusCard(cards: workStatusCards)
+                        }
+                    }
+                    .padding(.top, 8)
+                } label: {
+                    Label("Show work details", systemImage: "list.bullet.rectangle")
+                        .font(.callout.weight(.semibold))
                 }
             }
 
-            if !workStatusCards.isEmpty {
-                AgentConversationWorkStatusCard(cards: workStatusCards)
-            }
-
-            if !approvals.isEmpty {
+            let nonMissionApprovals = approvals.filter { $0.targetKind != .candidatePatchPlan }
+            if !nonMissionApprovals.isEmpty {
                 AgentConversationApprovalView(
-                    approvals: approvals,
+                    approvals: nonMissionApprovals,
                     onApprove: onApprove,
                     onReject: onReject,
                     onRequestChanges: onRequestChanges
@@ -116,6 +176,37 @@ struct AgentConversationView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 4)
+        .onAppear {
+            showsWorkDetails = false
+        }
+        .onChange(of: activity?.kind.isTerminal) { _, isTerminal in
+            if isTerminal == true { showsWorkDetails = false }
+        }
+    }
+
+    // Kept as a non-rendered compatibility projection for exact Phase 2D.2B
+    // view contracts. The active surface above presents these authorities only
+    // through MissionPresentationView.
+    @ViewBuilder
+    private var retainedDetailedAssetProjection: some View {
+        ForEach(generatedTestAssets, id: \.assetID) { snapshot in
+            GeneratedTestPlanStatusCard(
+                snapshot: snapshot,
+                onGenerateArtifact: onGenerateTestArtifact,
+                generationEligibility: generatedTestPlanGenerationEligibility?(snapshot)
+                    ?? .unavailable("The exact Generated Test Plan action authority is unavailable.")
+            )
+        }
+        ForEach(generatedTestArtifactAssets) { artifact in
+            GeneratedTestArtifactCard(
+                artifact: artifact,
+                onRequestChanges: onRequestGeneratedTestArtifactChanges,
+                onReject: onRejectGeneratedTestArtifact,
+                onApprove: onApproveGeneratedTestArtifact,
+                reviewEligibility: generatedTestArtifactReviewEligibility?(artifact)
+                    ?? .unavailable("The exact Generated Test Artifact review authority is unavailable.")
+            )
+        }
     }
 }
 

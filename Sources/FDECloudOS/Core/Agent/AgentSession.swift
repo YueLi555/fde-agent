@@ -158,22 +158,46 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
         }
     }
 
+    mutating func linkMissionChildTask(_ task: FDETask, missionRunID: UUID) {
+        guard workspaceID == task.workspaceID,
+              runtimeTaskID == missionRunID else {
+            return
+        }
+        var missionIDs = workspaceContext.missionTaskIDs ?? [missionRunID]
+        if !missionIDs.contains(missionRunID) { missionIDs.append(missionRunID) }
+        if !missionIDs.contains(task.id) { missionIDs.append(task.id) }
+        workspaceContext.missionTaskIDs = missionIDs
+    }
+
     mutating func apply(event: ExecutionEvent) {
         guard event.workspaceID == workspaceID else { return }
         if let runtimeTaskID, let eventTaskID = event.taskID, runtimeTaskID != eventTaskID {
-            guard event.type == .taskCreated,
-                  currentState == .completed || currentState == .failed else {
+            let isKnownMissionChild = workspaceContext.missionTaskIDs?.contains(eventTaskID) == true
+            guard event.exactParentMissionRunID == runtimeTaskID
+                    || isKnownMissionChild
+                    || (event.type == .taskCreated
+                        && (currentState == .completed || currentState == .failed)) else {
                 return
             }
         }
 
         if event.type == .taskCreated, let taskID = event.taskID {
-            workspaceContext.runtimeTaskID = taskID
             var missionIDs = workspaceContext.missionTaskIDs ?? []
             if !missionIDs.contains(taskID) {
                 missionIDs.append(taskID)
             }
             workspaceContext.missionTaskIDs = missionIDs
+            if let parentMissionRunID = event.exactParentMissionRunID,
+               parentMissionRunID != taskID,
+               workspaceContext.runtimeTaskID == parentMissionRunID
+                    || missionIDs.contains(parentMissionRunID) {
+                // Generated Test planning and Artifact generation are child
+                // activities. Keep the exact Candidate Patch task as the
+                // Current Run while still retaining the child in its timeline.
+                workspaceContext.runtimeTaskID = parentMissionRunID
+            } else {
+                workspaceContext.runtimeTaskID = taskID
+            }
         }
         workspaceContext.latestEventSequence = event.sequence
 
@@ -309,5 +333,18 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
         default:
             return false
         }
+    }
+}
+
+extension ExecutionEvent {
+    var exactParentMissionRunID: UUID? {
+        [
+            payload["generated_test_source_candidate_patch_task_id"],
+            payload["candidate_patch_source_task_id"],
+            payload["source_candidate_patch_task_id"]
+        ]
+        .compactMap { $0 }
+        .compactMap(UUID.init(uuidString:))
+        .first
     }
 }
