@@ -46,6 +46,8 @@ final class AppStore: ObservableObject {
     @Published var isConfirmingCandidatePatchRevert = false
     @Published var candidatePatchDestructionConfirmation: CandidatePatchSandboxDestructionConfirmation?
     @Published var isConfirmingCandidatePatchDestruction = false
+    @Published var missionUndoConfirmation: MissionUndoConfirmation?
+    @Published var isConfirmingMissionUndo = false
     @Published var agentBenchmarkSummary = AgentBenchmarkSummary.empty
     @Published var agentCapabilityReport = AgentCapabilityReport.empty
     @Published var engineeringActivity = EngineeringActivitySnapshot.empty
@@ -72,6 +74,8 @@ final class AppStore: ObservableObject {
     @Published private(set) var conversationAssetProjection = AgentConversationAssetProjection.empty
     @Published private var generatedTestPlanGenerationsInFlight: Set<String> = []
     @Published private var generatedTestArtifactReviewSessionsInFlight: Set<UUID> = []
+    @Published private var candidatePatchReviewActionsInFlight: Set<UUID> = []
+    @Published private(set) var missionCleanupStates: [MissionCleanupState] = []
 
     private let environment: AppEnvironment
     private let startupIssue: String?
@@ -308,6 +312,9 @@ final class AppStore: ObservableObject {
             let generatedTestArtifacts = (try? GeneratedTestArtifactStore(
                 storageRoot: environment.sandboxLifecycle.storageRoot
             ).loadAll(workspaceID: workspace.id)) ?? []
+            missionCleanupStates = (try? MissionCleanupStore(
+                storageRoot: environment.sandboxLifecycle.storageRoot
+            ).loadAll(workspaceID: workspace.id)) ?? []
             conversationAssetProjection = AgentConversationAssetProjector.project(
                 workspaceID: workspace.id,
                 events: workspaceEvents,
@@ -361,6 +368,7 @@ final class AppStore: ObservableObject {
     }
 
     func selectWorkspace(_ workspaceID: UUID?) {
+        cancelMissionUndoConfirmation()
         cancelCandidatePatchApprovalConfirmation()
         cancelCandidatePatchRevertConfirmation()
         cancelCandidatePatchDestructionConfirmation()
@@ -402,6 +410,7 @@ final class AppStore: ObservableObject {
     }
 
     func selectTask(_ taskID: UUID?) {
+        cancelMissionUndoConfirmation()
         cancelCandidatePatchApprovalConfirmation()
         cancelCandidatePatchRevertConfirmation()
         cancelCandidatePatchDestructionConfirmation()
@@ -414,6 +423,7 @@ final class AppStore: ObservableObject {
     }
 
     func selectAgentSession(_ sessionID: UUID?) {
+        cancelMissionUndoConfirmation()
         cancelCandidatePatchApprovalConfirmation()
         cancelCandidatePatchRevertConfirmation()
         cancelCandidatePatchDestructionConfirmation()
@@ -550,7 +560,16 @@ final class AppStore: ObservableObject {
     }
 
     func approve(_ approval: ApprovalRequest) {
+        if let missionID = approval.taskID,
+           missionCleanupState(for: missionID)?.freezesMissionActions == true {
+            lastError = "This exact mission is locked while Undo this run is being completed."
+            return
+        }
         if approval.targetKind == .candidatePatchPlan {
+            guard candidatePatchReviewEligibility(approval) else {
+                lastError = "This exact Candidate Patch review action is unavailable or already in progress."
+                return
+            }
             openCandidatePatchApprovalConfirmation(
                 approval,
                 source: candidatePatchApprovalInvocationSource()
@@ -575,6 +594,19 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func candidatePatchReviewEligibility(_ approval: ApprovalRequest) -> Bool {
+        guard approval.targetKind == .candidatePatchPlan,
+              approval.state == .pending,
+              selectedTaskPendingApprovals.contains(where: { $0.id == approval.id }),
+              !candidatePatchReviewActionsInFlight.contains(approval.id),
+              candidatePatchApprovalConfirmation == nil,
+              let missionID = approval.taskID,
+              missionCleanupState(for: missionID)?.freezesMissionActions != true else {
+            return false
+        }
+        return true
+    }
+
     func confirmCandidatePatchApproval(_ confirmation: CandidatePatchApprovalConfirmation) {
         guard confirmation == candidatePatchApprovalConfirmation,
               let workspace = selectedWorkspace,
@@ -584,9 +616,13 @@ final class AppStore: ObservableObject {
             return
         }
         let source = candidatePatchApprovalInvocationSource()
+        candidatePatchReviewActionsInFlight.insert(confirmation.approvalRequestID)
         isConfirmingCandidatePatchApproval = true
         Task {
-            defer { isConfirmingCandidatePatchApproval = false }
+            defer {
+                isConfirmingCandidatePatchApproval = false
+                candidatePatchReviewActionsInFlight.remove(confirmation.approvalRequestID)
+            }
             do {
                 _ = try await environment.runtime.confirmCandidatePatchApproval(
                     confirmation,
@@ -620,6 +656,11 @@ final class AppStore: ObservableObject {
     }
 
     func openCandidatePatchRevertConfirmation(_ snapshot: CandidatePatchActivitySnapshot) {
+        if let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
+           missionCleanupState(for: missionID)?.freezesMissionActions == true {
+            lastError = "This exact mission is locked while Undo this run is being completed."
+            return
+        }
         guard candidatePatchRevertConfirmation == nil,
               let workspace = selectedWorkspace,
               let patchID = snapshot.patchID.flatMap(CandidatePatchID.init(rawValue:)),
@@ -669,6 +710,11 @@ final class AppStore: ObservableObject {
     }
 
     func prepareGeneratedTestPlan(_ snapshot: CandidatePatchActivitySnapshot) {
+        if let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
+           missionCleanupState(for: missionID)?.freezesMissionActions == true {
+            lastError = "This exact mission is locked while Undo this run is being completed."
+            return
+        }
         guard let workspace = selectedWorkspace,
               let sourceBinding = snapshot.exactGeneratedTestSourceBinding,
               sourceBinding.workspaceID == workspace.id,
@@ -690,10 +736,14 @@ final class AppStore: ObservableObject {
                     workspace: workspace,
                     context: context
                 )
-                selectedTaskID = task.id
-                if let selectedAgentSessionID {
-                    linkRuntimeTask(task, to: selectedAgentSessionID)
+                if let selectedAgentSessionID,
+                   let index = agentSessions.firstIndex(where: { $0.sessionID == selectedAgentSessionID }) {
+                    agentSessions[index].linkMissionChildTask(
+                        task,
+                        missionRunID: sourceBinding.sourceCandidatePatchTaskID
+                    )
                 }
+                selectedTaskID = sourceBinding.sourceCandidatePatchTaskID
                 await refresh()
             } catch {
                 lastError = error.localizedDescription
@@ -705,6 +755,10 @@ final class AppStore: ObservableObject {
     func generatedTestPlanGenerationEligibility(
         _ snapshot: GeneratedTestActivitySnapshot
     ) -> GeneratedTestPlanGenerationEligibility {
+        if let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
+           missionCleanupState(for: missionID)?.freezesMissionActions == true {
+            return .unavailable("This exact mission is locked while Undo this run is being completed.")
+        }
         guard let workspace = selectedWorkspace,
               let authenticatedLocalSessionID = session?.id,
               session?.workspaceID == workspace.id,
@@ -723,11 +777,14 @@ final class AppStore: ObservableObject {
                     && $0.sourceBinding.generatedTestSourceBinding == exactPlan.sourceBinding
             }
         } ?? false
+        let authorityAppSessionID = plan.flatMap {
+            exactMissionContinuationAppSessionID(for: snapshot, persistedPlan: $0)
+        } ?? appSessionID
         return snapshot.generationEligibility(
             persistedPlan: plan,
             workspaceID: workspace.id,
             authenticatedLocalSessionID: authenticatedLocalSessionID,
-            appSessionID: appSessionID,
+            appSessionID: authorityAppSessionID,
             hasExistingArtifact: hasExistingArtifact,
             isInFlight: generatedTestPlanGenerationsInFlight.contains(snapshot.assetID)
         )
@@ -746,7 +803,7 @@ final class AppStore: ObservableObject {
                 for: plan,
                 workspaceID: workspace.id,
                 authenticatedLocalSessionID: authenticatedLocalSessionID,
-                appSessionID: appSessionID
+                appSessionID: plan.sourceBinding.appSessionID
               ) else {
             lastError = eligibility.unavailableReason
                 ?? "The exact persisted Generated Test Plan binding is unavailable."
@@ -767,6 +824,105 @@ final class AppStore: ObservableObject {
             } catch {
                 lastError = error.localizedDescription
                 await refresh()
+            }
+        }
+    }
+
+    /// Executes the single product-facing test-review action. The summary must
+    /// still be the exact Current Run. An existing awaiting-review Artifact is
+    /// returned directly; otherwise exactly one Artifact is generated from the
+    /// bound persisted Plan and returned for the unified review workspace.
+    func reviewProposedTests(
+        _ summary: MissionSummary,
+        completion: @escaping (GeneratedTestArtifact?) -> Void
+    ) {
+        guard let current = exactCurrentMissionSummary(),
+              summary.missionID == current.missionID,
+              summary.lineageState == .exact,
+              current.lineageState == .exact,
+              summary.lineage?.lineageKey == current.lineage?.lineageKey,
+              current.primaryAction == .reviewProposedTests else {
+            lastError = "Review proposed tests could not bind to the exact current Mission Run."
+            completion(nil)
+            return
+        }
+
+        if let artifact = current.generatedTestArtifact,
+           let revision = artifact.currentRevision {
+            guard artifact.reviewState(for: revision.revision) == .awaitingReview,
+                  generatedTestArtifactReviewEligibility(artifact).isAvailable else {
+                lastError = "This exact Generated Test Artifact already has a persisted decision or is no longer reviewable."
+                completion(nil)
+                return
+            }
+            completion(artifact)
+            return
+        }
+
+        guard let planSnapshot = current.generatedTestPlan,
+              planSnapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)) == current.missionID else {
+            lastError = "The exact Generated Test Plan is not attached to this Mission Run."
+            completion(nil)
+            return
+        }
+        generateTestArtifactForReview(
+            planSnapshot,
+            missionRunID: current.missionID,
+            completion: completion
+        )
+    }
+
+    private func generateTestArtifactForReview(
+        _ snapshot: GeneratedTestActivitySnapshot,
+        missionRunID: UUID,
+        completion: @escaping (GeneratedTestArtifact?) -> Void
+    ) {
+        let eligibility = generatedTestPlanGenerationEligibility(snapshot)
+        guard eligibility.isAvailable,
+              let workspace = selectedWorkspace,
+              let authenticatedLocalSessionID = session?.id,
+              let planningTaskID = snapshot.planningTaskID.flatMap(UUID.init(uuidString:)),
+              let plan = try? GeneratedTestPlanStore(
+                storageRoot: environment.sandboxLifecycle.storageRoot
+              ).load(workspaceID: workspace.id, planningTaskID: planningTaskID),
+              plan.sourceBinding.sourceCandidatePatchTaskID == missionRunID,
+              let context = snapshot.exactGenerationContext(
+                for: plan,
+                workspaceID: workspace.id,
+                authenticatedLocalSessionID: authenticatedLocalSessionID,
+                appSessionID: plan.sourceBinding.appSessionID
+              ) else {
+            lastError = eligibility.unavailableReason
+                ?? "The exact persisted Generated Test Plan binding is unavailable."
+            completion(nil)
+            return
+        }
+
+        let actionID = snapshot.assetID
+        generatedTestPlanGenerationsInFlight.insert(actionID)
+        Task {
+            defer { generatedTestPlanGenerationsInFlight.remove(actionID) }
+            do {
+                let result = try GeneratedTestArtifactService(lifecycle: environment.sandboxLifecycle).generate(
+                    GeneratedTestArtifactGenerationRequest(context: context)
+                )
+                guard result.outcome == .testArtifactReviewReady,
+                      let artifact = result.artifact,
+                      artifact.sourceBinding.generatedTestSourceBinding.sourceCandidatePatchTaskID == missionRunID,
+                      artifact.sourceBinding.generatedTestPlanID == context.generatedTestPlanID,
+                      artifact.sourceBinding.generatedTestPlanRevision == context.generatedTestPlanRevision,
+                      artifact.sourceBinding.generatedTestPlanSHA256 == context.generatedTestPlanSHA256 else {
+                    lastError = "CLARIFICATION_REQUIRED: " + result.missingEvidence.joined(separator: " · ")
+                    await refresh()
+                    completion(nil)
+                    return
+                }
+                await refresh()
+                completion(artifact)
+            } catch {
+                lastError = error.localizedDescription
+                await refresh()
+                completion(nil)
             }
         }
     }
@@ -793,6 +949,10 @@ final class AppStore: ObservableObject {
     func generatedTestArtifactReviewEligibility(
         _ artifact: GeneratedTestArtifact
     ) -> GeneratedTestArtifactReviewEligibility {
+        let missionID = artifact.sourceBinding.generatedTestSourceBinding.sourceCandidatePatchTaskID
+        if missionCleanupState(for: missionID)?.freezesMissionActions == true {
+            return .unavailable("This exact mission is locked while Undo this run is being completed.")
+        }
         guard let workspace = selectedWorkspace,
               let authenticatedLocalSessionID = session?.id,
               session?.workspaceID == workspace.id,
@@ -801,7 +961,7 @@ final class AppStore: ObservableObject {
         }
         let eligibility = artifact.reviewEligibility(
             authenticatedLocalSessionID: authenticatedLocalSessionID,
-            appSessionID: appSessionID
+            appSessionID: exactMissionReviewAppSessionID(for: artifact) ?? appSessionID
         )
         guard eligibility.isAvailable,
               let reviewSessionID = artifact.currentRevision?.reviewSessionID else {
@@ -811,6 +971,215 @@ final class AppStore: ObservableObject {
             return .unavailable("This exact Generated Test Artifact review action is already in progress.")
         }
         return .available
+    }
+
+    func openMissionUndoConfirmation(_ summary: MissionSummary) {
+        guard missionUndoConfirmation == nil,
+              let workspace = selectedWorkspace,
+              let session = selectedAgentSession,
+              summary.cleanup?.phase != .cleanedUp,
+              summary.cleanup?.freezesMissionActions != true else {
+            lastError = "Undo this run is unavailable because this exact mission is already being cleaned up."
+            return
+        }
+        let exactCurrent = MissionPresentationProjector.project(
+            session: session,
+            activity: selectedConversationActivity,
+            candidatePatches: conversationAssetProjection.candidatePatches,
+            generatedTestPlans: conversationAssetProjection.generatedTestPlans,
+            generatedTestArtifacts: conversationAssetProjection.generatedTestArtifacts,
+            approvals: selectedTaskPendingApprovals,
+            cleanupStates: missionCleanupStates
+        )
+        .current
+        guard summary.undoEligible,
+              summary.lineageState == .exact,
+              summary.missionID == exactCurrent.missionID,
+              summary.lineage?.lineageKey == exactCurrent.lineage?.lineageKey,
+              summary.legacyRoot == nil || summary.legacyRoot == workspace.localProjectRoot,
+              let request = MissionUndoRequest(summary: summary, workspaceID: workspace.id) else {
+            lastError = "Undo this run could not bind to the exact current mission and Legacy."
+            return
+        }
+        missionUndoConfirmation = MissionUndoConfirmation(
+            confirmationID: UUID(),
+            request: request,
+            issuedAt: Date()
+        )
+    }
+
+    func confirmMissionUndo(_ confirmation: MissionUndoConfirmation) {
+        guard confirmation == missionUndoConfirmation,
+              let workspace = selectedWorkspace,
+              confirmation.request.workspaceID == workspace.id,
+              !isConfirmingMissionUndo else {
+            lastError = "The Undo this run confirmation is no longer current."
+            cancelMissionUndoConfirmation()
+            return
+        }
+        let request = confirmation.request
+        let starting = MissionCleanupState.starting(
+            missionID: request.missionID,
+            workspaceID: request.workspaceID,
+            patch: selectedMissionPatch(for: request),
+            lineage: MissionRunIdentity(
+                missionRunID: request.missionID,
+                workspaceID: request.workspaceID,
+                sourceCandidatePatchTaskID: request.missionID,
+                lineageKey: request.lineageKey ?? "",
+                canonicalLegacyRoot: request.canonicalLegacyRoot,
+                sourceSnapshotID: request.sourceSnapshotID,
+                assessmentID: request.assessmentID,
+                candidatePatchID: request.patchID,
+                candidatePatchPlanID: request.patchPlanID,
+                candidatePatchPlanRevision: request.patchRevision,
+                sandboxID: request.sandboxID,
+                generatedTestPlanningTaskID: nil,
+                generatedTestPlanID: nil,
+                generatedTestPlanRevision: nil,
+                generatedTestPlanSHA256: nil,
+                generatedTestArtifactID: nil,
+                generatedTestArtifactRevision: nil,
+                generatedTestArtifactSHA256: nil
+            )
+        )
+        do {
+            try MissionCleanupStore(storageRoot: environment.sandboxLifecycle.storageRoot).save(starting)
+            replaceMissionCleanupState(starting)
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
+
+        missionUndoConfirmation = nil
+        isConfirmingMissionUndo = true
+        cancelCandidatePatchApprovalConfirmation()
+        cancelCandidatePatchRevertConfirmation()
+        cancelCandidatePatchDestructionConfirmation()
+        let lifecycle = environment.sandboxLifecycle
+        Task {
+            let result = await Task.detached {
+                MissionCleanupOrchestrator(lifecycle: lifecycle).execute(request)
+            }.value
+            replaceMissionCleanupState(result)
+            isConfirmingMissionUndo = false
+            if result.phase == .partialFailure {
+                lastError = result.failureReason ?? "Cleanup partially completed."
+            }
+            await refresh()
+        }
+    }
+
+    func retryMissionCleanup(_ summary: MissionSummary) {
+        guard let workspace = selectedWorkspace,
+              let cleanup = missionCleanupState(for: summary.missionID),
+              cleanup.phase == .partialFailure,
+              !isConfirmingMissionUndo else {
+            lastError = "There is no incomplete exact cleanup step available to retry."
+            return
+        }
+        guard let request = MissionUndoRequest(summary: summary, workspaceID: workspace.id) else {
+            lastError = "The incomplete cleanup no longer matches an exact Mission Run."
+            return
+        }
+        isConfirmingMissionUndo = true
+        let lifecycle = environment.sandboxLifecycle
+        Task {
+            let result = await Task.detached {
+                MissionCleanupOrchestrator(lifecycle: lifecycle).execute(request)
+            }.value
+            replaceMissionCleanupState(result)
+            isConfirmingMissionUndo = false
+            if result.phase == .partialFailure {
+                lastError = result.failureReason ?? "Cleanup remains incomplete."
+            }
+            await refresh()
+        }
+    }
+
+    func cancelMissionUndoConfirmation() {
+        missionUndoConfirmation = nil
+    }
+
+    private func missionCleanupState(for missionID: UUID) -> MissionCleanupState? {
+        missionCleanupStates.first { $0.missionID == missionID }
+    }
+
+    private func exactCurrentMissionSummary() -> MissionSummary? {
+        guard let session = selectedAgentSession else { return nil }
+        return MissionPresentationProjector.project(
+            session: session,
+            activity: selectedConversationActivity,
+            candidatePatches: conversationAssetProjection.candidatePatches,
+            generatedTestPlans: conversationAssetProjection.generatedTestPlans,
+            generatedTestArtifacts: conversationAssetProjection.generatedTestArtifacts,
+            approvals: selectedTaskPendingApprovals,
+            cleanupStates: missionCleanupStates
+        )
+        .current
+    }
+
+    private func exactMissionContinuationAppSessionID(
+        for snapshot: GeneratedTestActivitySnapshot,
+        persistedPlan: GeneratedTestPlan
+    ) -> UUID? {
+        guard let current = exactCurrentMissionSummary(),
+              current.lineageState == .exact,
+              current.primaryAction == .reviewProposedTests,
+              current.generatedTestArtifact == nil,
+              current.generatedTestPlan?.assetID == snapshot.assetID,
+              snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)) == current.missionID,
+              persistedPlan.sourceBinding.sourceCandidatePatchTaskID == current.missionID,
+              current.lineage?.generatedTestPlanID
+                == persistedPlan.planID.uuidString.lowercased(),
+              current.lineage?.generatedTestPlanRevision == persistedPlan.revision,
+              current.lineage?.generatedTestPlanSHA256 == persistedPlan.planSHA256 else {
+            return nil
+        }
+        // Continue with the app-session authority sealed into the exact Plan;
+        // the current authenticated local session and Mission Run must still
+        // match before this persisted authority can be reused after restart.
+        return persistedPlan.sourceBinding.appSessionID
+    }
+
+    private func exactMissionReviewAppSessionID(
+        for artifact: GeneratedTestArtifact
+    ) -> UUID? {
+        guard let current = exactCurrentMissionSummary(),
+              current.lineageState == .exact,
+              current.primaryAction == .reviewProposedTests,
+              current.generatedTestArtifact?.artifactID == artifact.artifactID,
+              artifact.sourceBinding.generatedTestSourceBinding.sourceCandidatePatchTaskID
+                == current.missionID,
+              current.lineage?.generatedTestArtifactID
+                == artifact.artifactID.uuidString.lowercased() else {
+            return nil
+        }
+        return artifact.sourceBinding.generatedTestSourceBinding.appSessionID
+    }
+
+    private func replaceMissionCleanupState(_ state: MissionCleanupState) {
+        missionCleanupStates.removeAll { $0.missionID == state.missionID }
+        missionCleanupStates.append(state)
+        missionCleanupStates.sort { lhs, rhs in
+            if lhs.updatedAt == rhs.updatedAt { return lhs.missionID.uuidString < rhs.missionID.uuidString }
+            return lhs.updatedAt < rhs.updatedAt
+        }
+    }
+
+    private func selectedMissionPatch(for request: MissionUndoRequest) -> CandidatePatchActivitySnapshot? {
+        conversationAssetProjection.candidatePatches.first { patch in
+            patch.sourceCandidatePatchTaskID == request.missionID.uuidString
+                && patch.patchID == request.patchID
+                && patch.planID == request.patchPlanID
+                && patch.planRevision == request.patchRevision
+                && patch.sandboxID == request.sandboxID
+                && patch.canonicalLegacyRoot == request.canonicalLegacyRoot
+                && patch.sourceSnapshotID == request.sourceSnapshotID
+                && patch.manifestID == request.candidatePatchManifestID
+                && patch.candidatePatchArtifactSHA256 == request.candidatePatchArtifactSHA256
+                && patch.assessmentID == request.assessmentID
+        }
     }
 
     private func reviewGeneratedTestArtifact(
@@ -831,6 +1200,7 @@ final class AppStore: ObservableObject {
         }
         generatedTestArtifactReviewSessionsInFlight.insert(reviewSessionID)
         let sourceBinding = artifact.sourceBinding.generatedTestSourceBinding
+        let authorityAppSessionID = exactMissionReviewAppSessionID(for: artifact) ?? appSessionID
         let context = GeneratedTestArtifactReviewContext(
             workspaceID: workspace.id,
             generatedTestPlanningTaskID: sourceBinding.generatedTestPlanningTaskID,
@@ -848,7 +1218,7 @@ final class AppStore: ObservableObject {
             artifactSHA256: revision.digest.sha256,
             reviewSessionID: reviewSessionID,
             authenticatedLocalSessionID: authenticatedLocalSessionID,
-            appSessionID: appSessionID
+            appSessionID: authorityAppSessionID
         )
         Task {
             defer { generatedTestArtifactReviewSessionsInFlight.remove(reviewSessionID) }
@@ -912,6 +1282,11 @@ final class AppStore: ObservableObject {
     }
 
     func openCandidatePatchDestructionConfirmation(_ snapshot: CandidatePatchActivitySnapshot) {
+        if let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
+           missionCleanupState(for: missionID)?.freezesMissionActions == true {
+            lastError = "This exact mission is locked while Undo this run is being completed."
+            return
+        }
         guard candidatePatchDestructionConfirmation == nil,
               let workspace = selectedWorkspace,
               let taskID = selectedTaskID,
@@ -1061,8 +1436,21 @@ final class AppStore: ObservableObject {
     }
 
     func reject(_ approval: ApprovalRequest) {
-        guard let workspace = selectedWorkspace else { return }
+        if let missionID = approval.taskID,
+           missionCleanupState(for: missionID)?.freezesMissionActions == true {
+            lastError = "This exact mission is locked while Undo this run is being completed."
+            return
+        }
+        guard let workspace = selectedWorkspace,
+              approval.targetKind != .candidatePatchPlan || candidatePatchReviewEligibility(approval) else {
+            lastError = "This exact Candidate Patch review action is unavailable or already in progress."
+            return
+        }
+        if approval.targetKind == .candidatePatchPlan {
+            candidatePatchReviewActionsInFlight.insert(approval.id)
+        }
         Task {
+            defer { candidatePatchReviewActionsInFlight.remove(approval.id) }
             do {
                 _ = try await environment.runtime.rejectApprovalRequest(
                     approval.id,
@@ -1086,8 +1474,19 @@ final class AppStore: ObservableObject {
     }
 
     func requestCandidatePatchChanges(_ approval: ApprovalRequest, revisionInstructions: String) {
-        guard let workspace = selectedWorkspace else { return }
+        if let missionID = approval.taskID,
+           missionCleanupState(for: missionID)?.freezesMissionActions == true {
+            lastError = "This exact mission is locked while Undo this run is being completed."
+            return
+        }
+        guard let workspace = selectedWorkspace,
+              candidatePatchReviewEligibility(approval) else {
+            lastError = "This exact Candidate Patch review action is unavailable or already in progress."
+            return
+        }
+        candidatePatchReviewActionsInFlight.insert(approval.id)
         Task {
+            defer { candidatePatchReviewActionsInFlight.remove(approval.id) }
             do {
                 _ = try await environment.runtime.requestChangesApprovalRequest(
                     approval.id,
@@ -1365,9 +1764,20 @@ final class AppStore: ObservableObject {
             createdAt: task.createdAt
         )
         var workspaceContext = AgentWorkspaceContext(workspace: workspace)
-        workspaceContext.missionTaskIDs = conversationAssetProjection.candidatePatches
-            .compactMap(\.sourceCandidatePatchTaskID)
-            .compactMap(UUID.init(uuidString:))
+        var missionTaskIDs = [sourceTaskID]
+        for plan in conversationAssetProjection.generatedTestPlans
+        where plan.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)) == sourceTaskID {
+            if let planningTaskID = plan.planningTaskID.flatMap(UUID.init(uuidString:)),
+               !missionTaskIDs.contains(planningTaskID) {
+                missionTaskIDs.append(planningTaskID)
+            }
+        }
+        for artifact in conversationAssetProjection.generatedTestArtifacts
+        where artifact.sourceBinding.generatedTestSourceBinding.sourceCandidatePatchTaskID == sourceTaskID {
+            let planningTaskID = artifact.sourceBinding.generatedTestSourceBinding.generatedTestPlanningTaskID
+            if !missionTaskIDs.contains(planningTaskID) { missionTaskIDs.append(planningTaskID) }
+        }
+        workspaceContext.missionTaskIDs = missionTaskIDs
         workspaceContext.linkRuntimeTask(task)
         let restored = AgentSession(
             sessionID: task.id,
@@ -1893,6 +2303,21 @@ final class AppStore: ObservableObject {
         if let taskID = event.taskID,
            let linkedIndex = agentSessions.firstIndex(where: { $0.runtimeTaskID == taskID }) {
             return linkedIndex
+        }
+
+        if let parentMissionRunID = event.exactParentMissionRunID,
+           let parentIndex = agentSessions.firstIndex(where: { $0.runtimeTaskID == parentMissionRunID }) {
+            return parentIndex
+        }
+
+        if let taskID = event.taskID,
+           let selectedAgentSessionID,
+           let childIndex = agentSessions.firstIndex(where: {
+               $0.sessionID == selectedAgentSessionID
+                   && $0.workspaceID == event.workspaceID
+                   && $0.workspaceContext.missionTaskIDs?.contains(taskID) == true
+           }) {
+            return childIndex
         }
 
         guard event.type == .taskCreated,

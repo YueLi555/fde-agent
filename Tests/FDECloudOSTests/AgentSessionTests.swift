@@ -47,6 +47,42 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(session.currentPlan, task.plan)
     }
 
+    func testGeneratedTestPlanningTaskRemainsChildOfCandidatePatchMissionRun() {
+        let workspace = Workspace.default()
+        let missionRunID = UUID()
+        let planningTaskID = UUID()
+        var session = AgentSession(workspace: workspace, userGoal: "Prepare safe order lookup")
+        session.syncRuntimeTask(makeTask(id: missionRunID, workspaceID: workspace.id))
+        session.currentState = .completed
+        session.interactionState = .completed
+
+        session.apply(event: makeEvent(
+            .taskCreated,
+            sequence: 1,
+            workspaceID: workspace.id,
+            taskID: planningTaskID,
+            payload: [
+                "intent_type": MissionIntentType.generatedTestPlan.rawValue,
+                "source_candidate_patch_task_id": missionRunID.uuidString
+            ]
+        ))
+        session.apply(event: makeEvent(
+            .taskCompleted,
+            sequence: 2,
+            workspaceID: workspace.id,
+            taskID: planningTaskID,
+            payload: [
+                "completion_gate_passed": "true",
+                "generated_test_source_candidate_patch_task_id": missionRunID.uuidString,
+                "generated_test_lifecycle_status": GeneratedTestLifecycleStatus.testPlanReviewReady.rawValue
+            ]
+        ))
+
+        XCTAssertEqual(session.runtimeTaskID, missionRunID)
+        XCTAssertEqual(session.workspaceContext.missionTaskIDs, [missionRunID, planningTaskID])
+        XCTAssertEqual(session.interactionState, .completed)
+    }
+
     func testEventUpdatesChangeAgentState() {
         var session = AgentSession(workspace: Workspace.default(), userGoal: "Investigate API")
         let taskID = UUID()

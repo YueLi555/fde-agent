@@ -31,6 +31,13 @@ struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
     var proposedTestPaths: [String]
     var status: GeneratedTestLifecycleStatus
     var remainingUnknowns: [String]
+    var workspaceID: String? = nil
+    var candidatePatchPlanID: String? = nil
+    var candidatePatchPlanRevision: Int? = nil
+    var candidatePatchManifestID: String? = nil
+    var canonicalLegacyRoot: String? = nil
+    var validationTestPlanSHA256: String? = nil
+    var unifiedDiffSHA256: String? = nil
 
     init(
         planningTaskID: String?,
@@ -51,7 +58,14 @@ struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
         generatedTestPlanID: String? = nil,
         generatedTestPlanRevision: Int? = nil,
         generatedTestPlanSHA256: String? = nil,
-        generatedTestSourceBindingSHA256: String? = nil
+        generatedTestSourceBindingSHA256: String? = nil,
+        workspaceID: String? = nil,
+        candidatePatchPlanID: String? = nil,
+        candidatePatchPlanRevision: Int? = nil,
+        candidatePatchManifestID: String? = nil,
+        canonicalLegacyRoot: String? = nil,
+        validationTestPlanSHA256: String? = nil,
+        unifiedDiffSHA256: String? = nil
     ) {
         self.generatedTestPlanID = generatedTestPlanID
         self.generatedTestPlanRevision = generatedTestPlanRevision
@@ -72,6 +86,13 @@ struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
         self.proposedTestPaths = proposedTestPaths
         self.status = status
         self.remainingUnknowns = remainingUnknowns
+        self.workspaceID = workspaceID
+        self.candidatePatchPlanID = candidatePatchPlanID
+        self.candidatePatchPlanRevision = candidatePatchPlanRevision
+        self.candidatePatchManifestID = candidatePatchManifestID
+        self.canonicalLegacyRoot = canonicalLegacyRoot
+        self.validationTestPlanSHA256 = validationTestPlanSHA256
+        self.unifiedDiffSHA256 = unifiedDiffSHA256
     }
 
     static let empty = GeneratedTestActivitySnapshot(
@@ -105,6 +126,13 @@ struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
         sourceSnapshotID = plan.sourceBinding.sourceSnapshotID
         capabilityID = plan.sourceBinding.normalizedCapabilityID
         assessmentID = plan.sourceBinding.validatedAssessmentID
+        workspaceID = plan.sourceBinding.workspaceID.uuidString.lowercased()
+        candidatePatchPlanID = plan.sourceBinding.candidatePatchPlanID.uuidString.lowercased()
+        candidatePatchPlanRevision = plan.sourceBinding.candidatePatchPlanRevision
+        candidatePatchManifestID = plan.sourceBinding.candidatePatchManifestID
+        canonicalLegacyRoot = plan.sourceBinding.canonicalLegacyRoot
+        validationTestPlanSHA256 = plan.sourceBinding.validationTestPlanSHA256
+        unifiedDiffSHA256 = plan.sourceBinding.unifiedDiffSHA256
         validationPlanItemCount = plan.relatedValidationPlanItemIDs.count
         framework = plan.expectedFramework?.displayName
         testLocation = plan.confirmedTestLocation
@@ -128,6 +156,13 @@ struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
             "generated_test_source_snapshot_id": sourceSnapshotID ?? "",
             "generated_test_capability_id": capabilityID ?? "",
             "generated_test_assessment_id": assessmentID ?? "",
+            "generated_test_workspace_id": workspaceID ?? "",
+            "generated_test_candidate_patch_plan_id": candidatePatchPlanID ?? "",
+            "generated_test_candidate_patch_plan_revision": candidatePatchPlanRevision.map(String.init) ?? "",
+            "generated_test_candidate_patch_manifest_id": candidatePatchManifestID ?? "",
+            "generated_test_canonical_legacy_root": canonicalLegacyRoot ?? "",
+            "generated_test_validation_test_plan_sha256": validationTestPlanSHA256 ?? "",
+            "generated_test_unified_diff_sha256": unifiedDiffSHA256 ?? "",
             "generated_test_validation_plan_item_count": String(validationPlanItemCount),
             "generated_test_framework": framework ?? "UNKNOWN",
             "generated_test_location": testLocation ?? "UNKNOWN",
@@ -156,6 +191,13 @@ struct GeneratedTestActivitySnapshot: Codable, Hashable, Sendable {
         sourceSnapshotID = eventPayload["generated_test_source_snapshot_id"]?.nonEmpty
         capabilityID = eventPayload["generated_test_capability_id"]?.nonEmpty
         assessmentID = eventPayload["generated_test_assessment_id"]?.nonEmpty
+        workspaceID = eventPayload["generated_test_workspace_id"]?.nonEmpty
+        candidatePatchPlanID = eventPayload["generated_test_candidate_patch_plan_id"]?.nonEmpty
+        candidatePatchPlanRevision = eventPayload["generated_test_candidate_patch_plan_revision"].flatMap(Int.init)
+        candidatePatchManifestID = eventPayload["generated_test_candidate_patch_manifest_id"]?.nonEmpty
+        canonicalLegacyRoot = eventPayload["generated_test_canonical_legacy_root"]?.nonEmpty
+        validationTestPlanSHA256 = eventPayload["generated_test_validation_test_plan_sha256"]?.nonEmpty
+        unifiedDiffSHA256 = eventPayload["generated_test_unified_diff_sha256"]?.nonEmpty
         validationPlanItemCount = eventPayload["generated_test_validation_plan_item_count"].flatMap(Int.init) ?? 0
         framework = eventPayload["generated_test_framework"].flatMap { $0 == "UNKNOWN" ? nil : $0 }
         testLocation = eventPayload["generated_test_location"].flatMap { $0 == "UNKNOWN" ? nil : $0 }
