@@ -4,6 +4,7 @@ protocol AgentRuntimeExecuting: Sendable {
     func submitTask(input: String, workspace: Workspace) async throws -> FDETask
     func runSafeSandboxAcceptance(input: String, workspace: Workspace) async throws -> FDETask
     func runCandidatePatchGeneration(input: String, workspace: Workspace) async throws -> FDETask
+    func runGeneratedTestPlanning(input: String, workspace: Workspace) async throws -> FDETask
     func runCandidatePatchRevert(input: String, workspace: Workspace) async throws -> FDETask
     func runCandidatePatchSandboxDestroy(input: String, workspace: Workspace) async throws -> FDETask
     func recoverTask(taskID: UUID, instruction: String, workspace: Workspace) async throws -> FDETask?
@@ -37,6 +38,9 @@ extension AgentRuntimeExecuting {
     func runCandidatePatchGeneration(input: String, workspace: Workspace) async throws -> FDETask {
         throw CandidatePatchError.blocked(.assessmentMissing)
     }
+    func runGeneratedTestPlanning(input: String, workspace: Workspace) async throws -> FDETask {
+        throw GeneratedTestError.blocked(.explicitSourceBindingRequired)
+    }
     func runCandidatePatchRevert(input: String, workspace: Workspace) async throws -> FDETask {
         throw CandidatePatchRuntimeError.runtimeUnavailable
     }
@@ -68,6 +72,7 @@ enum AgentRequestRoute: String, Codable, Hashable, Sendable {
     case workspaceReadOnlyInvestigation
     case safeSandboxAcceptance
     case candidatePatchGeneration
+    case generatedTestPlan
     case candidatePatchRevert
     case candidatePatchSandboxDestroy
     case executableTask
@@ -167,6 +172,7 @@ struct AgentRuntimeCoordinator: Sendable {
         let startsRuntime = route == .workspaceReadOnlyInvestigation
             || route == .safeSandboxAcceptance
             || route == .candidatePatchGeneration
+            || route == .generatedTestPlan
             || route == .candidatePatchRevert
             || route == .candidatePatchSandboxDestroy
             || route == .executableTask
@@ -256,6 +262,12 @@ struct AgentRuntimeCoordinator: Sendable {
         if route == .candidatePatchGeneration {
             session.setInteractionState(.working)
             let task = try await runtime.runCandidatePatchGeneration(input: safeInput, workspace: workspace)
+            return .running(task: task, recordedEvents: [userEvent])
+        }
+
+        if route == .generatedTestPlan {
+            session.setInteractionState(.waitingForUser)
+            let task = try await runtime.runGeneratedTestPlanning(input: safeInput, workspace: workspace)
             return .running(task: task, recordedEvents: [userEvent])
         }
 
@@ -351,6 +363,7 @@ struct AgentRuntimeCoordinator: Sendable {
             route = activeMissionRoute
         } else if requestRoute == .workspaceReadOnlyInvestigation
             || requestRoute == .candidatePatchGeneration
+            || requestRoute == .generatedTestPlan
             || requestRoute == .candidatePatchRevert
             || requestRoute == .candidatePatchSandboxDestroy
             || requestRoute == .safeSandboxAcceptance
@@ -560,6 +573,13 @@ struct AgentRuntimeCoordinator: Sendable {
         if route == .candidatePatchGeneration {
             session.setInteractionState(.working)
             let task = try await runtime.runCandidatePatchGeneration(input: reply, workspace: workspace)
+            return .running(task: task, recordedEvents: [recordedUserEvent])
+        }
+
+
+        if route == .generatedTestPlan {
+            session.setInteractionState(.waitingForUser)
+            let task = try await runtime.runGeneratedTestPlanning(input: reply, workspace: workspace)
             return .running(task: task, recordedEvents: [recordedUserEvent])
         }
 
@@ -836,6 +856,9 @@ struct AgentRuntimeCoordinator: Sendable {
         }
         if intent.intentType == .candidatePatchGeneration {
             return .candidatePatchGeneration
+        }
+        if intent.intentType == .generatedTestPlan {
+            return .generatedTestPlan
         }
         if intent.intentType == .safeSandboxAcceptance {
             return .safeSandboxAcceptance
@@ -1557,6 +1580,7 @@ struct AgentMissionClassifier: Sendable {
             return .executableEngineeringTask
         }
         if resolvedIntent.intentType == .candidatePatchGeneration
+            || resolvedIntent.intentType == .generatedTestPlan
             || resolvedIntent.intentType == .candidatePatchRevert
             || resolvedIntent.intentType == .candidatePatchSandboxDestroy {
             return .executableEngineeringTask
@@ -1655,6 +1679,7 @@ struct AgentMissionClassifier: Sendable {
         }
         switch resolvedIntent.intentType {
         case .candidatePatchGeneration,
+             .generatedTestPlan,
              .candidatePatchRevert,
              .candidatePatchSandboxDestroy,
              .safeSandboxAcceptance,

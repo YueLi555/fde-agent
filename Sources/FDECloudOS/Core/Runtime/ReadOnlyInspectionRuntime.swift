@@ -7,10 +7,13 @@ enum MissionExecutionSemantic: String, Codable, Hashable, Sendable {
     case candidatePatchGeneration = "CANDIDATE_PATCH_GENERATION"
     case candidatePatchRevert = "CANDIDATE_PATCH_REVERT"
     case candidatePatchSandboxDestroy = "CANDIDATE_PATCH_SANDBOX_DESTROY"
+    case generatedTestPlan = "GENERATED_TEST_PLAN"
     case engineeringModification = "ENGINEERING_MODIFICATION"
 
     init(intent: MissionIntent) {
         switch intent.intentType {
+        case .generatedTestPlan:
+            self = .generatedTestPlan
         case .candidatePatchSandboxDestroy:
             self = .candidatePatchSandboxDestroy
         case .candidatePatchRevert:

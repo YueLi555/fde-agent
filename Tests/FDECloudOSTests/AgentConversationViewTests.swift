@@ -76,4 +76,47 @@ final class AgentConversationViewTests: XCTestCase {
             XCTAssertEqual(sandboxSourceColor(for: snapshot), testCase.color)
         }
     }
+
+    func testCandidatePatchAssetUIUsesPersistedExactBindingAndExposesRequiredDetails() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let conversationSource = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/FDECloudOS/UI/Components/AgentConversationView.swift"
+            ),
+            encoding: .utf8
+        )
+        let appStoreSource = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/FDECloudOS/App/AppStore.swift"),
+            encoding: .utf8
+        )
+
+        for label in [
+            "Source Candidate Patch task ID", "Plan revision", "Manifest ID",
+            "Candidate Patch artifact SHA-256", "Source snapshot ID", "Canonical Legacy root",
+            "Capability label", "Assessment ID", "Validation-test-plan digest",
+            "Unified Diff SHA-256", "Lifecycle status", "Approval status",
+            "Files planned", "Files changed", "Source integrity"
+        ] {
+            XCTAssertTrue(conversationSource.contains(label), label)
+        }
+        XCTAssertTrue(conversationSource.contains("Prepare Generated Test Plan"))
+        XCTAssertTrue(conversationSource.contains("exactGeneratedTestSourceBinding"))
+        XCTAssertTrue(conversationSource.contains("Copy full"))
+
+        let actionSource = try XCTUnwrap(
+            appStoreSource.components(separatedBy: "func prepareGeneratedTestPlan").last?
+                .components(separatedBy: "func confirmCandidatePatchRevert").first
+        )
+        XCTAssertTrue(actionSource.contains("snapshot.exactGeneratedTestSourceBinding"))
+        XCTAssertTrue(actionSource.contains("sourceBinding: sourceBinding"))
+        let authoritySource = try XCTUnwrap(
+            actionSource.components(separatedBy: "let context = GeneratedTestPlanningContext").first
+        )
+        XCTAssertFalse(authoritySource.contains("selectedTaskID"))
+        XCTAssertFalse(actionSource.lowercased().contains("latest"))
+        XCTAssertFalse(actionSource.contains("prefix("))
+    }
 }

@@ -323,6 +323,283 @@ actor RuntimeKernel {
         }
     }
 
+    func runGeneratedTestPlanning(input: String, workspace: Workspace) async throws -> FDETask {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw RuntimeKernelError.emptyInput }
+        var task = generatedTestPlanningTask(input: trimmed, workspace: workspace)
+        try await record(
+            type: .taskCreated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Generated Test Plan requires an exact visible Candidate Patch binding",
+            payload: generatedTestZeroExecutionPayload.merging([
+                "state": task.state.rawValue,
+                "intent_type": MissionIntentType.generatedTestPlan.rawValue,
+                "mission_semantic": MissionExecutionSemantic.generatedTestPlan.rawValue,
+                "clarification_required": "true",
+                "source_binding_verified": "false",
+                "failure_category": GeneratedTestFailureCode.explicitSourceBindingRequired.rawValue,
+                "detail": "Select the exact visible Candidate Patch. A workspace-global latest Patch is never selected."
+            ]) { current, _ in current },
+            initialTask: task
+        )
+        try stateMachine.transition(&task, to: .planned)
+        try stateMachine.transition(&task, to: .running)
+        try stateMachine.transition(&task, to: .waiting)
+        try await persistence.saveTask(task)
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Exact Candidate Patch selection required",
+            payload: generatedTestZeroExecutionPayload.merging([
+                "state": task.state.rawValue,
+                "generated_test_activity_phase": GeneratedTestActivityPhase.clarificationRequired.rawValue,
+                "generated_test_lifecycle_status": GeneratedTestLifecycleStatus.clarificationRequired.rawValue,
+                "clarification_required": "true",
+                "source_binding_verified": "false",
+                "failure_category": GeneratedTestFailureCode.explicitSourceBindingRequired.rawValue,
+                "approval_request_created": "false",
+                "detail": "Select the exact visible Candidate Patch card to continue. No Patch was guessed."
+            ]) { current, _ in current }
+        )
+        return task
+    }
+
+    func runGeneratedTestPlanning(
+        input: String,
+        workspace: Workspace,
+        context: GeneratedTestPlanningContext
+    ) async throws -> FDETask {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw RuntimeKernelError.emptyInput }
+        guard let lifecycle = sandboxLifecycle else {
+            throw GeneratedTestError.blocked(.sourceBindingMismatch)
+        }
+        guard context.sourceBinding.workspaceID == workspace.id else {
+            throw GeneratedTestError.blocked(.sourceBindingMismatch)
+        }
+        if let session = try await persistence.loadSessionMetadata() {
+            guard session.userSession.id == context.authenticatedLocalSessionID,
+                  session.userSession.state == .signedIn,
+                  session.workspaceSession?.workspaceID == workspace.id,
+                  session.workspaceSession?.userSessionID == session.userSession.id,
+                  session.workspaceSession?.state == .signedIn else {
+                throw GeneratedTestError.blocked(.sourceBindingMismatch)
+            }
+        }
+        guard let sourceTask = try await persistence.loadTasks(workspaceID: workspace.id)
+                .first(where: { $0.id == context.sourceCandidatePatchTaskID }),
+              sourceTask.state == .completed else {
+            throw GeneratedTestError.blocked(.sourceBindingMismatch)
+        }
+        let sourceEvents = try await persistence.loadEvents(
+            workspaceID: workspace.id,
+            taskID: context.sourceCandidatePatchTaskID
+        )
+        guard let sourceCompletion = sourceEvents.last(where: {
+            $0.type == .taskCompleted
+                && $0.payload["completion_contract"] == RuntimeCompletionContractKind.candidatePatchGeneration.rawValue
+                && $0.payload["candidate_patch_id"] == context.patchID.rawValue
+                && $0.payload["candidate_patch_sandbox_id"] == context.sandboxID.rawValue
+        }) else {
+            throw GeneratedTestError.blocked(.sourceBindingMismatch)
+        }
+        if let persistedBindingSHA256 = sourceCompletion.payload[
+            "candidate_patch_generated_test_source_binding_sha256"
+        ], !persistedBindingSHA256.isEmpty,
+           persistedBindingSHA256 != context.sourceBinding.digest {
+            throw GeneratedTestError.blocked(.sourceBindingMismatch)
+        }
+
+        var task = generatedTestPlanningTask(input: trimmed, workspace: workspace)
+        try await record(
+            type: .taskCreated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Phase 2D.2A read-only Generated Test planning task created",
+            payload: generatedTestZeroExecutionPayload.merging([
+                "state": task.state.rawValue,
+                "intent_type": MissionIntentType.generatedTestPlan.rawValue,
+                "mission_semantic": MissionExecutionSemantic.generatedTestPlan.rawValue,
+                "source_candidate_patch_task_id": context.sourceCandidatePatchTaskID.uuidString,
+                "candidate_patch_id": context.patchID.rawValue,
+                "candidate_patch_plan_id": context.sourceBinding.candidatePatchPlanID.uuidString,
+                "candidate_patch_plan_revision": String(context.sourceBinding.candidatePatchPlanRevision),
+                "candidate_patch_manifest_id": context.sourceBinding.candidatePatchManifestID,
+                "candidate_patch_artifact_sha256": context.sourceBinding.candidatePatchArtifactSHA256,
+                "candidate_patch_generated_test_source_binding_sha256": context.sourceBinding.digest,
+                "sandbox_id": context.sandboxID.rawValue,
+                "generic_tool_execution_enabled": "false"
+            ]) { current, _ in current },
+            initialTask: task
+        )
+        try stateMachine.transition(&task, to: .planned)
+        try stateMachine.transition(&task, to: .running)
+        try await persistence.saveTask(task)
+
+        do {
+            for phase in [
+                GeneratedTestActivityPhase.validatingExactPatchBinding,
+                .verifyingCandidatePatchArtifact,
+                .loadingStructuredValidationPlan,
+                .resolvingTestEnvironment,
+                .preparingReadOnlyPlan
+            ] {
+                try await record(
+                    type: .stateUpdated,
+                    workspaceID: workspace.id,
+                    taskID: task.id,
+                    summary: phase.rawValue,
+                    payload: generatedTestZeroExecutionPayload.merging([
+                        "state": task.state.rawValue,
+                        "generated_test_activity_phase": phase.rawValue,
+                        "runtime_owned_activity": "true"
+                    ]) { current, _ in current }
+                )
+            }
+            let result = try GeneratedTestPlanningService(lifecycle: lifecycle).preparePlan(
+                GeneratedTestPlanningRequest(
+                    workspaceID: workspace.id,
+                    planningTaskID: task.id,
+                    sourceContext: context
+                )
+            )
+            let manifest = try CandidatePatchService(lifecycle: lifecycle).loadManifest(
+                sandboxID: context.sandboxID,
+                patchID: context.patchID
+            )
+            let generatedSnapshot = GeneratedTestActivitySnapshot(plan: result.plan)
+            let candidateSnapshot = CandidatePatchActivitySnapshot(manifest: manifest)
+            let terminalPhase: GeneratedTestActivityPhase = result.outcome == .clarificationRequired
+                ? .clarificationRequired
+                : .testPlanReviewReady
+            try await record(
+                type: .stateUpdated,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: terminalPhase.rawValue,
+                payload: candidateSnapshot.eventPayload
+                    .merging(generatedSnapshot.eventPayload) { current, _ in current }
+                    .merging(generatedTestZeroExecutionPayload) { current, _ in current }
+                    .merging([
+                        "state": task.state.rawValue,
+                        "generated_test_activity_phase": terminalPhase.rawValue,
+                        "generated_test_outcome": result.outcome.rawValue,
+                        "source_binding_verified": "true",
+                        "candidate_patch_artifact_verified": "true",
+                        "validation_test_plan_loaded": "true",
+                        "clarification_required": result.outcome == .clarificationRequired ? "true" : "false",
+                        "approval_request_created": "false",
+                        "detail": result.plan.markdown,
+                        "actual_result": result.plan.markdown
+                    ]) { current, _ in current }
+            )
+            try stateMachine.transition(&task, to: .completed)
+            try await persistence.saveTask(task)
+            try await record(
+                type: .taskCompleted,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: result.outcome == .clarificationRequired
+                    ? "Generated Test Plan requires bounded clarification"
+                    : "Generated Test Plan ready for human review",
+                payload: candidateSnapshot.eventPayload
+                    .merging(generatedSnapshot.eventPayload) { current, _ in current }
+                    .merging(generatedTestZeroExecutionPayload) { current, _ in current }
+                    .merging([
+                        "state": task.state.rawValue,
+                        "completion_contract": RuntimeCompletionContractKind.generatedTestPlan.rawValue,
+                        "generated_test_outcome": result.outcome.rawValue,
+                        "generated_test_plan_sha256": result.plan.planSHA256,
+                        "manifest_backed": "true",
+                        "source_binding_verified": "true",
+                        "candidate_patch_artifact_verified": "true",
+                        "validation_test_plan_loaded": "true",
+                        "framework_confirmed": result.plan.expectedFramework == nil ? "false" : "true",
+                        "test_location_confirmed": result.plan.confirmedTestLocation == nil ? "false" : "true",
+                        "bounded_environment_investigation_performed": "true",
+                        "clarification_required": result.outcome == .clarificationRequired ? "true" : "false",
+                        "every_scenario_grounded": result.plan.proposedScenarios.allSatisfy {
+                            !$0.sourceDiffHunkIDs.isEmpty
+                                && !$0.affectedSymbolReferences.isEmpty
+                                && (!$0.validationPlanItemIDs.isEmpty || !$0.relatedAssessmentBlockerIDs.isEmpty)
+                        } ? "true" : "false",
+                        "approval_request_created": "false",
+                        "detail": result.plan.markdown,
+                        "actual_result": result.plan.markdown,
+                        "success": "true"
+                    ]) { current, _ in current }
+                    .merging(runtimeStatePayload(mission: .complete, task: task.state, tool: .succeeded)) { current, _ in current }
+            )
+            return task
+        } catch {
+            try stateMachine.transition(&task, to: .failed)
+            task.failureProbability = 1
+            try await persistence.saveTask(task)
+            let code = (error as? GeneratedTestError)?.code ?? .sourceBindingMismatch
+            try await record(
+                type: .stateUpdated,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: "Generated Test planning failed closed",
+                payload: generatedTestZeroExecutionPayload.merging([
+                    "state": task.state.rawValue,
+                    "generated_test_activity_phase": GeneratedTestActivityPhase.generatedTestPlanningBlocked.rawValue,
+                    "generated_test_lifecycle_status": GeneratedTestLifecycleStatus.blocked.rawValue,
+                    "failure_category": code.rawValue,
+                    "blocker_reason": code.rawValue,
+                    "approval_request_created": "false",
+                    "success": "false"
+                ]) { current, _ in current }
+            )
+            return task
+        }
+    }
+
+    private func generatedTestPlanningTask(input: String, workspace: Workspace) -> FDETask {
+        FDETask(
+            id: UUID(),
+            workspaceID: workspace.id,
+            title: "Phase 2D.2A Generated Test Plan",
+            rawInput: input,
+            state: .created,
+            plan: GeneratedTestActivityPhase.allCases.map { phase in
+                PlanStep(
+                    id: "generated-test-plan-\(phase.rawValue.lowercased().replacingOccurrences(of: " ", with: "-"))",
+                    title: phase.rawValue,
+                    intent: "Read exact bound Sandbox evidence and persist plan metadata without creating test bytes.",
+                    kind: .reasoning,
+                    toolCallID: nil,
+                    requiresApproval: false
+                )
+            },
+            riskScore: 0,
+            failureProbability: 0,
+            performanceScore: 0,
+            createdAt: Date(),
+            updatedAt: Date()
+        )
+    }
+
+    private var generatedTestZeroExecutionPayload: [String: String] {
+        [
+            "sandbox_write_count": "0",
+            "generated_test_file_count": "0",
+            "generated_test_byte_count": "0",
+            "build_execution_count": "0",
+            "test_execution_count": "0",
+            "syntax_check_count": "0",
+            "shell_count": "0",
+            "git_count": "0",
+            "package_manager_count": "0",
+            "deployment_count": "0",
+            "candidate_patch_write_count": "0",
+            "legacy_write_count": "0",
+            "phase_2d_3_available": "false"
+        ]
+    }
+
     func runCandidatePatchRevert(input: String, workspace: Workspace) async throws -> FDETask {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw RuntimeKernelError.emptyInput }
@@ -696,36 +973,48 @@ actor RuntimeKernel {
         guard let contextJSON = String(data: encoded, encoding: .utf8) else {
             throw CandidatePatchError.blocked(.assessmentEvidenceMissing)
         }
+        let validationTestPlanSHA256 = context.validationTestPlan.map {
+            CandidatePatchArtifactAuthority.validationTestPlanSHA256($0)
+        }
+        let evidencePaths = context.evidence
+            .flatMap(\.evidenceReferences)
+            .map(\.path)
+            .reduce(into: [String]()) { values, path in
+                if !values.contains(path) { values.append(path) }
+            }
+            .joined(separator: " | ")
+        let validationExecutionAuthorized = context.validationTestPlan?.executionAuthorized == true
+            ? "true"
+            : "false"
+        let assessmentPayload: [String: String] = [
+            "lifecycle_event": "AI_ASSESSMENT_PERSISTED",
+            "assessment_id": context.assessmentID,
+            "source_snapshot_id": context.sourceSnapshotID,
+            "canonical_legacy_root": context.canonicalLegacyRoot,
+            "normalized_requested_capability_id": context.requestedCapabilityID,
+            "requested_capability_display_label": context.requestedCapabilityDisplayLabel,
+            "compatibility_decision": context.compatibilityDecision.rawValue,
+            "evidence_claim_ids": context.evidenceClaimIDs.joined(separator: " | "),
+            "supported_capabilities": context.supportedCapabilities.joined(separator: " | "),
+            "assessment_blockers": context.blockers.joined(separator: " | "),
+            "unresolved_requirements": context.unresolvedRequirements.joined(separator: " | "),
+            "evidence_paths": evidencePaths,
+            "assessment_finalization_mode": context.finalizationMode.rawValue,
+            "assessment_validation_status": context.validationStatus.rawValue,
+            "validation_test_plan_sha256": validationTestPlanSHA256 ?? "",
+            "validation_test_plan_item_count": String(context.validationTestPlan?.items.count ?? 0),
+            "validation_test_execution_authorized": validationExecutionAuthorized,
+            "candidate_patch_assessment_context": contextJSON,
+            "workspace_identity": "legacy",
+            "workspace_mutation_count": "0"
+        ]
         try await record(
             type: .stateUpdated,
             workspaceID: workspace.id,
             taskID: task.id,
             summary: "Grounded AI integration assessment persisted for Candidate Patch handoff",
-            payload: [
-                "lifecycle_event": "AI_ASSESSMENT_PERSISTED",
-                "assessment_id": context.assessmentID,
-                "source_snapshot_id": context.sourceSnapshotID,
-                "canonical_legacy_root": context.canonicalLegacyRoot,
-                "normalized_requested_capability_id": context.requestedCapabilityID,
-                "requested_capability_display_label": context.requestedCapabilityDisplayLabel,
-                "compatibility_decision": context.compatibilityDecision.rawValue,
-                "evidence_claim_ids": context.evidenceClaimIDs.joined(separator: " | "),
-                "supported_capabilities": context.supportedCapabilities.joined(separator: " | "),
-                "assessment_blockers": context.blockers.joined(separator: " | "),
-                "unresolved_requirements": context.unresolvedRequirements.joined(separator: " | "),
-                "evidence_paths": context.evidence
-                    .flatMap(\.evidenceReferences)
-                    .map(\.path)
-                    .reduce(into: [String]()) { values, path in
-                        if !values.contains(path) { values.append(path) }
-                    }
-                    .joined(separator: " | "),
-                "assessment_finalization_mode": context.finalizationMode.rawValue,
-                "assessment_validation_status": context.validationStatus.rawValue,
-                "candidate_patch_assessment_context": contextJSON,
-                "workspace_identity": "legacy",
-                "workspace_mutation_count": "0"
-            ].merging(runtimeStatePayload(mission: .complete, task: task.state)) { current, _ in current }
+            payload: assessmentPayload
+                .merging(runtimeStatePayload(mission: .complete, task: task.state)) { current, _ in current }
         )
     }
 
