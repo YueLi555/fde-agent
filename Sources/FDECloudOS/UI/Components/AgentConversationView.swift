@@ -19,6 +19,8 @@ struct AgentConversationView: View {
     var controlledEvalResultReviewAuthorizations: [ControlledEvalResultReviewAuthorization] = []
     let approvals: [ApprovalRequest]
     var showsHeader = true
+    var showsMissionPresentation = true
+    var fileArtifacts: [ArtifactFileCardModel] = []
     let onApprove: (ApprovalRequest) -> Void
     let onReject: (ApprovalRequest) -> Void
     var onRequestChanges: ((ApprovalRequest, String) -> Void)? = nil
@@ -140,41 +142,47 @@ struct AgentConversationView: View {
                     )
                 }
 
-                MissionPresentationView(
-                    state: missionPresentation,
-                    candidatePatchReviewEligibility: candidatePatchReviewEligibility,
-                    generatedTestPlanGenerationEligibility: generatedTestPlanGenerationEligibility,
-                    generatedTestArtifactReviewEligibility: generatedTestArtifactReviewEligibility,
-                    onApproveCandidatePatch: onApprove,
-                    onRejectCandidatePatch: onReject,
-                    onRequestCandidatePatchChanges: onRequestChanges,
-                    onPlanGeneratedTests: onPlanGeneratedTests,
-                    onGenerateTestArtifact: onGenerateTestArtifact,
-                    onReviewProposedTests: onReviewProposedTests,
-                    onRequestGeneratedTestArtifactChanges: onRequestGeneratedTestArtifactChanges,
-                    onRejectGeneratedTestArtifact: onRejectGeneratedTestArtifact,
-                    onApproveGeneratedTestArtifact: onApproveGeneratedTestArtifact,
-                    onReviewProductionReadiness: onReviewProductionReadiness,
-                    productionReadinessReviewEligibility: productionReadinessReviewEligibility,
-                    aiEvalPlanReviewEligibility: aiEvalPlanReviewEligibility,
-                    onReviewReadinessReport: onReviewReadinessReport,
-                    onReviewAIEvalPlan: onReviewAIEvalPlan,
-                    onPrepareControlledEvalExecution: onPrepareControlledEvalExecution,
-                    controlledEvalExecutionReviewEligibility: controlledEvalExecutionReviewEligibility,
-                    onConfirmControlledEvalExecution: onConfirmControlledEvalExecution,
-                    onConfirmAuthorizedControlledEvalExecution: onConfirmAuthorizedControlledEvalExecution,
-                    onPrepareControlledEvalResultReview: onPrepareControlledEvalResultReview,
-                    evalResultsReviewEligibility: evalResultsReviewEligibility,
-                    onReviewEvalResults: onReviewEvalResults,
-                    onUndoRun: onUndoMission,
-                    onRetryCleanup: onRetryMissionCleanup,
-                    onShowWorkDetails: { showsWorkDetails = true }
-                )
+                if showsMissionPresentation {
+                    MissionPresentationView(
+                        state: missionPresentation,
+                        candidatePatchReviewEligibility: candidatePatchReviewEligibility,
+                        generatedTestPlanGenerationEligibility: generatedTestPlanGenerationEligibility,
+                        generatedTestArtifactReviewEligibility: generatedTestArtifactReviewEligibility,
+                        onApproveCandidatePatch: onApprove,
+                        onRejectCandidatePatch: onReject,
+                        onRequestCandidatePatchChanges: onRequestChanges,
+                        onPlanGeneratedTests: onPlanGeneratedTests,
+                        onGenerateTestArtifact: onGenerateTestArtifact,
+                        onReviewProposedTests: onReviewProposedTests,
+                        onRequestGeneratedTestArtifactChanges: onRequestGeneratedTestArtifactChanges,
+                        onRejectGeneratedTestArtifact: onRejectGeneratedTestArtifact,
+                        onApproveGeneratedTestArtifact: onApproveGeneratedTestArtifact,
+                        onReviewProductionReadiness: onReviewProductionReadiness,
+                        productionReadinessReviewEligibility: productionReadinessReviewEligibility,
+                        aiEvalPlanReviewEligibility: aiEvalPlanReviewEligibility,
+                        onReviewReadinessReport: onReviewReadinessReport,
+                        onReviewAIEvalPlan: onReviewAIEvalPlan,
+                        onPrepareControlledEvalExecution: onPrepareControlledEvalExecution,
+                        controlledEvalExecutionReviewEligibility: controlledEvalExecutionReviewEligibility,
+                        onConfirmControlledEvalExecution: onConfirmControlledEvalExecution,
+                        onConfirmAuthorizedControlledEvalExecution: onConfirmAuthorizedControlledEvalExecution,
+                        onPrepareControlledEvalResultReview: onPrepareControlledEvalResultReview,
+                        evalResultsReviewEligibility: evalResultsReviewEligibility,
+                        onReviewEvalResults: onReviewEvalResults,
+                        onUndoRun: onUndoMission,
+                        onRetryCleanup: onRetryMissionCleanup,
+                        onShowWorkDetails: { showsWorkDetails = true }
+                    )
+                }
+
+                if !fileArtifacts.isEmpty {
+                    ArtifactFileCardsView(cards: fileArtifacts)
+                }
             }
 
-            if activity?.kind.isVisible == true
+            if showsMissionPresentation && (activity?.kind.isVisible == true
                 || !workStatusCards.isEmpty
-                || !workDetailDisplayItems.isEmpty {
+                || !workDetailDisplayItems.isEmpty) {
                 DisclosureGroup(isExpanded: $showsWorkDetails) {
                     VStack(alignment: .leading, spacing: 10) {
                         ForEach(workDetailDisplayItems) { item in
@@ -205,7 +213,7 @@ struct AgentConversationView: View {
             }
 
             let nonMissionApprovals = approvals.filter { $0.targetKind != .candidatePatchPlan }
-            if !nonMissionApprovals.isEmpty {
+            if showsMissionPresentation && !nonMissionApprovals.isEmpty {
                 AgentConversationApprovalView(
                     approvals: nonMissionApprovals,
                     onApprove: onApprove,
@@ -900,11 +908,9 @@ private struct AgentConversationMessageRow: View {
                     }
 
                     if message.sender == .agent {
-                        AgentMarkdownText(markdown: message.content)
-                            .font(.callout)
-                            .foregroundStyle(.primary)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
+                        StructuredAgentResponseView(
+                            response: StructuredAgentResponseProjector.response(for: message)
+                        )
                     } else {
                         Text(message.content)
                             .font(.callout)
@@ -978,14 +984,16 @@ private struct AgentStreamingMarkdownResponseRow: View {
         HStack(alignment: .top, spacing: 12) {
             AgentAvatar(tint: response.messageType.tint, symbol: response.messageType.symbol)
 
-            VStack(alignment: .leading, spacing: 6) {
-                AgentMarkdownText(markdown: response.markdown)
-                    .font(.callout)
-                    .foregroundStyle(.primary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: 680, alignment: .leading)
+            StructuredAgentResponseView(
+                response: StructuredAgentResponseProjector.response(for: AgentMessage(
+                    id: UUID(uuidString: response.id) ?? UUID(),
+                    sender: .agent,
+                    type: response.messageType,
+                    content: response.markdown,
+                    relatedEventID: response.chunks.reversed().compactMap(\.relatedEventID).first,
+                    relatedArtifactID: response.relatedArtifactID
+                ))
+            )
 
             Spacer(minLength: 48)
         }

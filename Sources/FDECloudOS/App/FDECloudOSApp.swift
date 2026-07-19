@@ -46,7 +46,7 @@ struct FDECloudOSApp: App {
         WindowGroup("FDE Agent") {
             RootView()
                 .environmentObject(store)
-                .frame(minWidth: 860, minHeight: 640)
+                .frame(minWidth: 960, minHeight: 640)
                 .onAppear {
                     AppActivationDelegate.activateMainWindow()
                 }
