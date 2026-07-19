@@ -119,10 +119,11 @@ private struct ArtifactViewerRequest: Identifiable {
 struct ArtifactFileCardsView: View {
     let cards: [ArtifactFileCardModel]
     @State private var viewerRequest: ArtifactViewerRequest?
+    @State private var hoveredCardID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(cards) { card in
+            ForEach(cards.filter { ArtifactPathAuthority.isValidatedRelativePath($0.relativePath) }) { card in
                 artifactCard(card)
             }
         }
@@ -132,68 +133,90 @@ struct ArtifactFileCardsView: View {
     }
 
     private func artifactCard(_ card: ArtifactFileCardModel) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: WorkspaceVisualStyle.Spacing.x8) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Image(systemName: "doc.text")
-                    .foregroundStyle(Color.accentColor)
+                Image(systemName: "doc.text.fill")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
                 Text(card.relativePath)
-                    .font(.callout.weight(.semibold).monospaced())
+                    .font(.system(.callout, design: .monospaced).weight(.semibold))
+                    .foregroundStyle(WorkspaceVisualStyle.color(.textPrimary))
                     .lineLimit(2)
                     .textSelection(.enabled)
                 Spacer()
                 Text(card.status.rawValue)
-                    .font(.caption.weight(.semibold))
+                    .font(WorkspaceVisualStyle.Typography.label)
                     .foregroundStyle(fileStatusColor(card.status))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(fileStatusColor(card.status).opacity(0.09), in: Capsule())
             }
 
             Text(card.purpose)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(WorkspaceVisualStyle.Typography.metadata)
+                .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
                 .fixedSize(horizontal: false, vertical: true)
 
-            HStack(spacing: 10) {
+            HStack(spacing: WorkspaceVisualStyle.Spacing.x12) {
                 Label(card.language, systemImage: "chevron.left.forwardslash.chevron.right")
                 Label(card.safeSource.rawValue, systemImage: sourceSymbol(card.safeSource))
-                if let additions = card.additions, let deletions = card.deletions {
-                    Text("+\(additions) −\(deletions)")
+                if let additions = card.additions {
+                    Text("+\(additions)")
                         .monospacedDigit()
+                        .foregroundStyle(WorkspaceVisualStyle.color(.success))
+                }
+                if let deletions = card.deletions {
+                    Text("−\(deletions)")
+                        .monospacedDigit()
+                        .foregroundStyle(WorkspaceVisualStyle.color(.danger))
                 }
             }
             .font(.caption2)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(WorkspaceVisualStyle.color(.textTertiary))
 
-            HStack(spacing: 8) {
-                Button("Open file") {
+            HStack(spacing: WorkspaceVisualStyle.Spacing.x12) {
+                Button("Open File") {
                     guard ArtifactPathAuthority.isValidatedRelativePath(card.relativePath) else { return }
                     viewerRequest = ArtifactViewerRequest(card: card, initialTab: .file)
                 }
-                Button("View diff") {
+                Button("View Diff") {
                     guard ArtifactPathAuthority.isValidatedRelativePath(card.relativePath) else { return }
                     viewerRequest = ArtifactViewerRequest(card: card, initialTab: .diff)
                 }
                 .disabled(card.unifiedDiff == nil)
-                Button("Copy relative path") {
+                Button("Copy Relative Path") {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(card.relativePath, forType: .string)
                 }
             }
             .controlSize(.small)
+            .buttonStyle(.borderless)
+            .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+            .opacity(hoveredCardID == card.id ? 1 : 0.78)
         }
-        .padding(12)
-        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
-        .overlay(
-            RoundedRectangle(cornerRadius: 9)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 0.7)
+        .padding(WorkspaceVisualStyle.Spacing.x12)
+        .background(
+            WorkspaceVisualStyle.color(.elevatedSurface),
+            in: RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.artifactCard, style: .continuous)
         )
+        .overlay {
+            RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.artifactCard, style: .continuous)
+                .stroke(WorkspaceVisualStyle.color(.borderSubtle), lineWidth: 0.7)
+        }
+        .onHover { isHovered in
+            hoveredCardID = isHovered ? card.id : nil
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(card.status.rawValue) file, \(card.relativePath)")
         .accessibilityIdentifier("artifact.fileCard")
     }
 
     private func fileStatusColor(_ status: ArtifactFileStatus) -> Color {
         switch status {
-        case .added: return .green
-        case .modified: return .orange
-        case .deleted: return .red
-        case .virtual: return .purple
+        case .added: return WorkspaceVisualStyle.color(.success)
+        case .modified: return WorkspaceVisualStyle.color(.warning)
+        case .deleted: return WorkspaceVisualStyle.color(.danger)
+        case .virtual: return WorkspaceVisualStyle.color(.accent)
         }
     }
 
@@ -218,19 +241,24 @@ private struct AppOwnedArtifactViewer: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: WorkspaceVisualStyle.Spacing.x12) {
+                Image(systemName: "doc.text")
+                    .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(card.relativePath)
-                        .font(.headline.monospaced())
+                    Text(validatedRelativePath)
+                        .font(.system(.headline, design: .monospaced))
+                        .lineLimit(2)
                     Text("\(card.safeSource.rawValue) · \(card.status.rawValue)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(WorkspaceVisualStyle.Typography.metadata)
+                        .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
                 }
                 Spacer()
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.cancelAction)
             }
-            .padding(16)
+            .padding(.horizontal, WorkspaceVisualStyle.Spacing.x16)
+            .padding(.vertical, WorkspaceVisualStyle.Spacing.x12)
+            .background(WorkspaceVisualStyle.color(.elevatedSurface))
 
             Picker("Artifact viewer", selection: $selectedTab) {
                 ForEach(ArtifactViewerTab.allCases) { tab in
@@ -238,40 +266,65 @@ private struct AppOwnedArtifactViewer: View {
                 }
             }
             .pickerStyle(.segmented)
-            .padding(.horizontal, 16)
-            .padding(.bottom, 12)
+            .controlSize(.small)
+            .padding(.horizontal, WorkspaceVisualStyle.Spacing.x16)
+            .padding(.vertical, WorkspaceVisualStyle.Spacing.x8)
+            .background(WorkspaceVisualStyle.color(.elevatedSurface))
 
             Divider()
 
-            Group {
-                switch selectedTab {
-                case .file:
-                    codePane(card.content)
-                case .diff:
-                    codePane(card.unifiedDiff ?? "No Unified Diff is available for this virtual artifact.")
-                case .metadata:
-                    detailPane(card.metadata)
-                case .evidence:
-                    evidencePane
-                case .exactBinding:
-                    detailPane(card.exactBinding)
+            if ArtifactPathAuthority.isValidatedRelativePath(card.relativePath) {
+                Group {
+                    switch selectedTab {
+                    case .file:
+                        codePane(card.content)
+                    case .diff:
+                        if let unifiedDiff = card.unifiedDiff {
+                            UnifiedDiffPane(card: card, unifiedDiff: unifiedDiff)
+                        } else {
+                            ContentUnavailableView(
+                                "No Unified Diff",
+                                systemImage: "doc.text.magnifyingglass",
+                                description: Text("No Unified Diff is available for this virtual artifact.")
+                            )
+                        }
+                    case .metadata:
+                        detailPane(card.metadata)
+                    case .evidence:
+                        evidencePane
+                    case .exactBinding:
+                        detailPane(card.exactBinding)
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ContentUnavailableView(
+                    "Invalid artifact path",
+                    systemImage: "lock.trianglebadge.exclamationmark",
+                    description: Text("This app-owned viewer accepts validated relative artifact paths only.")
+                )
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 760, minHeight: 520)
+        .frame(minWidth: 720, idealWidth: 980, minHeight: 520, idealHeight: 700)
+        .background(WorkspaceVisualStyle.color(.primarySurface))
         .accessibilityIdentifier("artifact.appOwnedViewer")
+    }
+
+    private var validatedRelativePath: String {
+        ArtifactPathAuthority.isValidatedRelativePath(card.relativePath)
+            ? card.relativePath
+            : "Unavailable artifact"
     }
 
     private func codePane(_ content: String) -> some View {
         ScrollView([.vertical, .horizontal]) {
             Text(content)
-                .font(.system(.body, design: .monospaced))
+                .font(WorkspaceVisualStyle.Typography.code)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
-                .padding(16)
+                .padding(WorkspaceVisualStyle.Spacing.x16)
         }
-        .background(Color(nsColor: .textBackgroundColor))
+        .background(WorkspaceVisualStyle.color(.primarySurface))
     }
 
     private func detailPane(_ items: [ArtifactMetadataItem]) -> some View {
@@ -308,6 +361,189 @@ private struct AppOwnedArtifactViewer: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
             .padding(18)
         }
+    }
+}
+
+private struct UnifiedDiffPane: View {
+    let card: ArtifactFileCardModel
+    let presentation: UnifiedDiffPresentation
+    @State private var isFileExpanded = true
+    @State private var expandedCollapsedSections: Set<Int> = []
+
+    init(card: ArtifactFileCardModel, unifiedDiff: String) {
+        self.card = card
+        presentation = UnifiedDiffPresentation(unifiedDiff)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: WorkspaceVisualStyle.Spacing.x12) {
+                Text("Unified Diff")
+                    .font(WorkspaceVisualStyle.Typography.label)
+                    .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+                Spacer()
+                changeCount("+\(additions)", color: WorkspaceVisualStyle.color(.success))
+                changeCount("−\(deletions)", color: WorkspaceVisualStyle.color(.danger))
+            }
+            .padding(.horizontal, WorkspaceVisualStyle.Spacing.x16)
+            .padding(.vertical, WorkspaceVisualStyle.Spacing.x8)
+            .background(WorkspaceVisualStyle.color(.elevatedSurface))
+
+            Divider()
+
+            Button {
+                isFileExpanded.toggle()
+            } label: {
+                HStack(spacing: WorkspaceVisualStyle.Spacing.x8) {
+                    Image(systemName: isFileExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(WorkspaceVisualStyle.color(.textTertiary))
+                        .frame(width: 12)
+                    Image(systemName: "doc.text")
+                        .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+                    Text(card.relativePath)
+                        .font(.system(.callout, design: .monospaced).weight(.semibold))
+                        .lineLimit(1)
+                    Spacer(minLength: WorkspaceVisualStyle.Spacing.x16)
+                    changeCount("+\(additions)", color: WorkspaceVisualStyle.color(.success))
+                    changeCount("−\(deletions)", color: WorkspaceVisualStyle.color(.danger))
+                    Text(card.status.rawValue)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+                }
+                .padding(.horizontal, WorkspaceVisualStyle.Spacing.x16)
+                .padding(.vertical, 9)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(card.relativePath), \(additions) additions, \(deletions) deletions")
+            .accessibilityValue(isFileExpanded ? "Expanded" : "Collapsed")
+            .accessibilityIdentifier("artifact.diff.fileHeader")
+
+            Divider()
+
+            if isFileExpanded {
+                ScrollView([.vertical, .horizontal]) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(presentation.displayRows()) { row in
+                            displayRow(row)
+                        }
+                    }
+                    .frame(minWidth: 900, maxWidth: .infinity, alignment: .topLeading)
+                }
+                .background(WorkspaceVisualStyle.color(.primarySurface))
+                .accessibilityIdentifier("artifact.diff.body")
+            }
+        }
+    }
+
+    private var additions: Int { card.additions ?? presentation.additionCount }
+    private var deletions: Int { card.deletions ?? presentation.deletionCount }
+
+    private func changeCount(_ value: String, color: Color) -> some View {
+        Text(value)
+            .font(.caption.weight(.semibold).monospacedDigit())
+            .foregroundStyle(color)
+    }
+
+    @ViewBuilder
+    private func displayRow(_ row: UnifiedDiffDisplayRow) -> some View {
+        switch row {
+        case let .line(line):
+            diffLine(line)
+        case let .collapsed(section):
+            VStack(alignment: .leading, spacing: 0) {
+                Button {
+                    if expandedCollapsedSections.contains(section.id) {
+                        expandedCollapsedSections.remove(section.id)
+                    } else {
+                        expandedCollapsedSections.insert(section.id)
+                    }
+                } label: {
+                    HStack(spacing: WorkspaceVisualStyle.Spacing.x8) {
+                        Color.clear.frame(width: 91, height: 1)
+                        Image(systemName: expandedCollapsedSections.contains(section.id)
+                            ? "chevron.up" : "ellipsis")
+                            .font(.caption2.weight(.semibold))
+                        Text(expandedCollapsedSections.contains(section.id)
+                            ? "Collapse \(section.hiddenLineCount) unchanged lines"
+                            : "\(section.hiddenLineCount) unchanged lines")
+                            .font(.caption.monospaced())
+                        Spacer()
+                    }
+                    .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+                    .padding(.horizontal, WorkspaceVisualStyle.Spacing.x8)
+                    .frame(minWidth: 900, minHeight: 24, alignment: .leading)
+                    .background(WorkspaceVisualStyle.color(.controlSurface))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("artifact.diff.collapsedContext")
+
+                if expandedCollapsedSections.contains(section.id) {
+                    ForEach(section.lines) { line in
+                        diffLine(line)
+                    }
+                }
+            }
+        }
+    }
+
+    private func diffLine(_ line: UnifiedDiffLine) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            lineNumber(line.oldLineNumber)
+            lineNumber(line.newLineNumber)
+            Rectangle()
+                .fill(WorkspaceVisualStyle.color(.borderSubtle))
+                .frame(width: 1, height: 22)
+            Text(line.content.isEmpty ? " " : line.content)
+                .font(WorkspaceVisualStyle.Typography.diff)
+                .foregroundStyle(diffTextColor(line.kind))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, WorkspaceVisualStyle.Spacing.x8)
+        }
+        .frame(minWidth: 900, minHeight: 22, alignment: .leading)
+        .background(diffBackground(line.kind))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(diffAccessibilityLabel(line))
+    }
+
+    private func lineNumber(_ value: Int?) -> some View {
+        Text(value.map(String.init) ?? "")
+            .font(.system(size: 11, design: .monospaced).monospacedDigit())
+            .foregroundStyle(WorkspaceVisualStyle.color(.textTertiary))
+            .frame(width: 44, alignment: .trailing)
+            .padding(.trailing, 5)
+            .textSelection(.enabled)
+    }
+
+    private func diffBackground(_ kind: UnifiedDiffLineKind) -> Color {
+        switch kind {
+        case .added: return WorkspaceVisualStyle.color(.diffAddedBackground)
+        case .removed: return WorkspaceVisualStyle.color(.diffRemovedBackground)
+        case .hunk: return WorkspaceVisualStyle.color(.controlSurface)
+        default: return .clear
+        }
+    }
+
+    private func diffTextColor(_ kind: UnifiedDiffLineKind) -> Color {
+        switch kind {
+        case .added: return WorkspaceVisualStyle.color(.diffAddedText)
+        case .removed: return WorkspaceVisualStyle.color(.diffRemovedText)
+        case .header, .metadata: return WorkspaceVisualStyle.color(.textSecondary)
+        case .hunk: return WorkspaceVisualStyle.color(.accent)
+        case .context: return WorkspaceVisualStyle.color(.textPrimary)
+        }
+    }
+
+    private func diffAccessibilityLabel(_ line: UnifiedDiffLine) -> String {
+        let old = line.oldLineNumber.map { "old line \($0)" }
+        let new = line.newLineNumber.map { "new line \($0)" }
+        let location = [old, new].compactMap { $0 }.joined(separator: ", ")
+        return [line.kind.rawValue, location, line.content]
+            .filter { !$0.isEmpty }
+            .joined(separator: ", ")
     }
 }
 
@@ -350,7 +586,7 @@ struct WorkspaceInspectorView: View {
                 .padding(12)
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor))
+        .background(WorkspaceVisualStyle.color(.sidebarSurface))
         .accessibilityIdentifier("workspace.rightInspector")
     }
 
@@ -453,18 +689,23 @@ struct WorkspaceInspectorView: View {
             DisclosureGroup(isExpanded: $previousRunsExpanded) {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(runs) { run in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(run.title)
-                                .font(.callout.weight(.semibold))
-                            Text(run.finalOutcome)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text("Read-only Mission history")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                        inspectorCardSurface {
+                            HStack(alignment: .top, spacing: WorkspaceVisualStyle.Spacing.x12) {
+                                inspectorIcon("clock.arrow.circlepath")
+                                VStack(alignment: .leading, spacing: WorkspaceVisualStyle.Spacing.x4) {
+                                    Text(run.title)
+                                        .font(.callout.weight(.semibold))
+                                        .foregroundStyle(WorkspaceVisualStyle.color(.textPrimary))
+                                    Text(run.finalOutcome)
+                                        .font(WorkspaceVisualStyle.Typography.metadata)
+                                        .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+                                    Text("Read-only Mission history")
+                                        .font(.caption2)
+                                        .foregroundStyle(WorkspaceVisualStyle.color(.textTertiary))
+                                }
+                                Spacer(minLength: 0)
+                            }
                         }
-                        .padding(10)
-                        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
                     }
                 }
                 .padding(.top, 8)
@@ -512,44 +753,80 @@ struct WorkspaceInspectorView: View {
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(events) { event in
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(StructuredAgentResponseProjector.normalizedPresentationText(event.summary))
-                            .font(.callout.weight(.semibold))
-                        Text(event.type.rawValue.replacingOccurrences(of: "_", with: " ").localizedCapitalized)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        DisclosureGroup("Exact activity details") {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Event: \(event.id.uuidString.lowercased())")
-                                Text("Sequence: \(event.sequence)")
-                                if let taskID = event.taskID {
-                                    Text("Mission: \(taskID.uuidString.lowercased())")
+                    inspectorCardSurface {
+                        HStack(alignment: .top, spacing: WorkspaceVisualStyle.Spacing.x12) {
+                            inspectorIcon("waveform.path.ecg")
+                            VStack(alignment: .leading, spacing: WorkspaceVisualStyle.Spacing.x8) {
+                                Text(StructuredAgentResponseProjector.normalizedPresentationText(event.summary))
+                                    .font(.callout.weight(.semibold))
+                                    .foregroundStyle(WorkspaceVisualStyle.color(.textPrimary))
+                                Text(event.type.rawValue.replacingOccurrences(of: "_", with: " ").localizedCapitalized)
+                                    .font(WorkspaceVisualStyle.Typography.metadata)
+                                    .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+                                DisclosureGroup("Exact activity details") {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Event: \(event.id.uuidString.lowercased())")
+                                        Text("Sequence: \(event.sequence)")
+                                        if let taskID = event.taskID {
+                                            Text("Mission: \(taskID.uuidString.lowercased())")
+                                        }
+                                    }
+                                    .font(.caption2.monospaced())
+                                    .textSelection(.enabled)
+                                    .padding(.top, 4)
                                 }
                             }
-                            .font(.caption2.monospaced())
-                            .textSelection(.enabled)
-                            .padding(.top, 4)
                         }
                     }
-                    .padding(10)
-                    .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
                 }
             }
         }
     }
 
     private func inspectorCard(_ title: String, value: String, symbol: String) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Label(title, systemImage: symbol)
-                .font(.callout.weight(.semibold))
-            Text(value)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+        inspectorCardSurface {
+            HStack(alignment: .top, spacing: WorkspaceVisualStyle.Spacing.x12) {
+                inspectorIcon(symbol)
+                VStack(alignment: .leading, spacing: WorkspaceVisualStyle.Spacing.x4) {
+                    Text(title)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(WorkspaceVisualStyle.color(.textPrimary))
+                    Text(value)
+                        .font(WorkspaceVisualStyle.Typography.metadata)
+                        .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func inspectorCardSurface<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        content()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(WorkspaceVisualStyle.Spacing.x12)
+            .background(
+                WorkspaceVisualStyle.color(.elevatedSurface),
+                in: RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.artifactCard, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.artifactCard, style: .continuous)
+                    .stroke(WorkspaceVisualStyle.color(.borderSubtle).opacity(0.7), lineWidth: 0.6)
+            }
+            .shadow(color: .black.opacity(0.025), radius: 3, y: 1)
+    }
+
+    private func inspectorIcon(_ symbol: String) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+            .frame(width: 28, height: 28)
+            .background(
+                WorkspaceVisualStyle.color(.controlSurface),
+                in: RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.control, style: .continuous)
+            )
     }
 
     private func inspectorMetric(_ title: String, value: Int) -> some View {
@@ -585,6 +862,7 @@ private struct WorkspaceHumanAction {
 
 struct HumanActionBar: View {
     @EnvironmentObject private var store: AppStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var selectedDecision: HumanReviewDecision?
     @State private var reviewNote = ""
     @State private var isSubmitting = false
@@ -599,74 +877,189 @@ struct HumanActionBar: View {
     }
 
     private func actionBar(_ action: WorkspaceHumanAction) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
-                Label("Human review", systemImage: "person.crop.circle.badge.checkmark")
-                    .font(.headline)
+        VStack(alignment: .leading, spacing: WorkspaceVisualStyle.Spacing.x16) {
+            HStack(alignment: .center, spacing: WorkspaceVisualStyle.Spacing.x8) {
+                Image(systemName: "person.crop.circle.badge.checkmark")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+                Text("Human review")
+                    .font(WorkspaceVisualStyle.Typography.messageTitle)
                 Spacer()
                 Text(action.descriptor.status)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.purple)
+                    .font(WorkspaceVisualStyle.Typography.label)
+                    .foregroundStyle(WorkspaceVisualStyle.color(.accent))
+                    .padding(.horizontal, WorkspaceVisualStyle.Spacing.x8)
+                    .padding(.vertical, 4)
+                    .background(WorkspaceVisualStyle.color(.accent).opacity(0.08), in: Capsule())
             }
 
-            Text(action.descriptor.title)
-                .font(.callout.weight(.semibold))
-            HStack(spacing: 8) {
-                Text(action.descriptor.scope)
+            HStack(alignment: .firstTextBaseline, spacing: WorkspaceVisualStyle.Spacing.x16) {
+                VStack(alignment: .leading, spacing: WorkspaceVisualStyle.Spacing.x4) {
+                    Text(action.descriptor.title)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(WorkspaceVisualStyle.color(.textPrimary))
+                    Text(action.descriptor.scope)
+                        .font(WorkspaceVisualStyle.Typography.metadata)
+                        .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: WorkspaceVisualStyle.Spacing.x12)
                 if let revision = action.descriptor.revision {
                     Text("Revision \(revision)")
+                        .font(WorkspaceVisualStyle.Typography.metadata)
+                        .foregroundStyle(WorkspaceVisualStyle.color(.textTertiary))
+                        .fixedSize()
                 }
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
 
             if action.descriptor.isReadOnly {
                 Label("This decision is finalized and read-only.", systemImage: "lock")
                     .font(.callout)
+                    .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+                    .padding(.top, WorkspaceVisualStyle.Spacing.x4)
             } else {
-                Picker("Decision", selection: $selectedDecision) {
-                    Text("Choose…").tag(Optional<HumanReviewDecision>.none)
-                    ForEach(action.descriptor.decisions) { decision in
-                        Text(decision.rawValue).tag(Optional(decision))
-                    }
-                }
-                .pickerStyle(.segmented)
-                .accessibilityIdentifier("humanAction.decisionPicker")
+                VStack(alignment: .leading, spacing: WorkspaceVisualStyle.Spacing.x8) {
+                    TextField("Optional review note…", text: $reviewNote, axis: .vertical)
+                        .lineLimit(1...3)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, WorkspaceVisualStyle.Spacing.x12)
+                        .padding(.vertical, 9)
+                        .background(
+                            WorkspaceVisualStyle.color(.controlSurface),
+                            in: RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.control, style: .continuous)
+                        )
+                        .overlay {
+                            RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.control, style: .continuous)
+                                .stroke(WorkspaceVisualStyle.color(.borderSubtle), lineWidth: 0.7)
+                        }
+                        .disabled(isSubmitting)
+                        .accessibilityIdentifier("humanAction.reviewNote")
 
-                TextField("Optional review note", text: $reviewNote, axis: .vertical)
-                    .lineLimit(1...3)
-                    .accessibilityIdentifier("humanAction.reviewNote")
-
-                HStack {
-                    if selectedDecision == .requestChanges,
-                       reviewNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text("Add a note describing the requested change.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    if let selectedDecision {
+                        selectedDecisionAction(action, decision: selectedDecision)
+                    } else {
+                        primaryDecisionActions(action)
                     }
-                    Spacer()
-                    Button("Submit decision") {
-                        submit(action)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .focusable(false)
-                    .disabled(!action.descriptor.canSubmit(
-                        decision: selectedDecision,
-                        note: reviewNote
-                    ) || isSubmitting)
-                    .accessibilityIdentifier("humanAction.submitDecision")
                 }
             }
         }
-        .padding(14)
-        .background(Color.purple.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.purple.opacity(0.32), lineWidth: 0.8)
+        .padding(WorkspaceVisualStyle.Spacing.x16)
+        .background(
+            WorkspaceVisualStyle.color(.elevatedSurface),
+            in: RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.humanReview, style: .continuous)
         )
-        .padding(.horizontal, 20)
-        .padding(.bottom, 8)
+        .overlay {
+            RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.humanReview, style: .continuous)
+                .stroke(WorkspaceVisualStyle.color(.borderSubtle), lineWidth: 0.75)
+        }
+        .shadow(color: .black.opacity(0.035), radius: 3, y: 1)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.10), value: selectedDecision)
         .accessibilityIdentifier("workspace.humanActionBar")
+    }
+
+    @ViewBuilder
+    private func primaryDecisionActions(_ action: WorkspaceHumanAction) -> some View {
+        HStack(alignment: .center, spacing: WorkspaceVisualStyle.Spacing.x12) {
+            if action.descriptor.decisions.contains(.approve) {
+                Button {
+                    submit(action, decision: .approve)
+                } label: {
+                    decisionButtonLabel("Approve", systemImage: "checkmark")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!action.descriptor.canSubmit(decision: .approve, note: reviewNote) || isSubmitting)
+                .accessibilityLabel(isSubmitting ? "Submitting approval" : "Approve")
+                .accessibilityIdentifier("humanAction.approve")
+            }
+
+            let secondaryDecisions = action.descriptor.decisions.filter { $0 != .approve }
+            if !secondaryDecisions.isEmpty {
+                Menu {
+                    ForEach(secondaryDecisions) { decision in
+                        if decision == .reject {
+                            Button(role: .destructive) {
+                                selectedDecision = decision
+                            } label: {
+                                Label(decision.rawValue, systemImage: decisionSymbol(decision))
+                            }
+                        } else {
+                            Button {
+                                selectedDecision = decision
+                            } label: {
+                                Label(decision.rawValue, systemImage: decisionSymbol(decision))
+                            }
+                        }
+                    }
+                } label: {
+                    Label("More options", systemImage: "ellipsis.circle")
+                }
+                .menuStyle(.borderedButton)
+                .disabled(isSubmitting)
+                .accessibilityLabel("More review options")
+                .accessibilityIdentifier("humanAction.secondaryDecisionMenu")
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func selectedDecisionAction(
+        _ action: WorkspaceHumanAction,
+        decision: HumanReviewDecision
+    ) -> some View {
+        HStack(alignment: .center, spacing: WorkspaceVisualStyle.Spacing.x12) {
+            VStack(alignment: .leading, spacing: WorkspaceVisualStyle.Spacing.x4) {
+                Label(decision.rawValue, systemImage: decisionSymbol(decision))
+                    .font(WorkspaceVisualStyle.Typography.label)
+                    .foregroundStyle(decision == .reject
+                        ? WorkspaceVisualStyle.color(.danger)
+                        : WorkspaceVisualStyle.color(.textSecondary))
+                if decision == .requestChanges,
+                   reviewNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text("Add a note describing the requested change.")
+                        .font(WorkspaceVisualStyle.Typography.metadata)
+                        .foregroundStyle(WorkspaceVisualStyle.color(.warning))
+                }
+            }
+            Spacer(minLength: 0)
+            Button("Cancel") {
+                selectedDecision = nil
+            }
+            .buttonStyle(.borderless)
+            .disabled(isSubmitting)
+            .accessibilityIdentifier("humanAction.secondaryDecision.cancel")
+            Button {
+                submit(action, decision: decision)
+            } label: {
+                decisionButtonLabel(decision.rawValue, systemImage: decisionSymbol(decision))
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(decision == .reject ? WorkspaceVisualStyle.color(.danger) : nil)
+            .disabled(!action.descriptor.canSubmit(decision: decision, note: reviewNote) || isSubmitting)
+            .accessibilityLabel(isSubmitting ? "Submitting decision" : decision.rawValue)
+            .accessibilityIdentifier("humanAction.submitDecision")
+        }
+    }
+
+    private func decisionButtonLabel(_ title: String, systemImage: String) -> some View {
+        HStack(spacing: WorkspaceVisualStyle.Spacing.x8) {
+            Text(title)
+            if isSubmitting {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: systemImage)
+                    .font(.caption.weight(.semibold))
+            }
+        }
+        .frame(minWidth: 112)
+    }
+
+    private func decisionSymbol(_ decision: HumanReviewDecision) -> String {
+        switch decision {
+        case .approve: return "checkmark"
+        case .requestChanges: return "arrow.uturn.backward"
+        case .reject: return "xmark"
+        }
     }
 
     private var currentAction: WorkspaceHumanAction? {
@@ -872,9 +1265,8 @@ struct HumanActionBar: View {
         )
     }
 
-    private func submit(_ action: WorkspaceHumanAction) {
-        guard action.descriptor.canSubmit(decision: selectedDecision, note: reviewNote),
-              let decision = selectedDecision,
+    private func submit(_ action: WorkspaceHumanAction, decision: HumanReviewDecision) {
+        guard action.descriptor.canSubmit(decision: decision, note: reviewNote),
               !isSubmitting else { return }
         isSubmitting = true
         let note = reviewNote.trimmingCharacters(in: .whitespacesAndNewlines)

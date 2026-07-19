@@ -880,20 +880,26 @@ private struct AgentConversationMessageRow: View {
             }
 
             HStack(alignment: .top, spacing: 10) {
-                ZStack {
-                    Circle()
-                        .fill(message.type.tint.opacity(0.14))
-                        .frame(width: 30, height: 30)
-                    Image(systemName: message.type.symbol)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(message.type.tint)
+                if message.sender != .user {
+                    ZStack {
+                        Circle()
+                            .fill(message.type.tint.opacity(0.14))
+                            .frame(width: 30, height: 30)
+                        Image(systemName: message.type.symbol)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(message.type.tint)
+                    }
                 }
 
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: message.sender == .user ? WorkspaceVisualStyle.Spacing.x8 : 4) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(message.sender == .user ? "User" : "Agent")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(message.sender == .user ? .accentColor : message.type.tint)
+                        Text(message.sender == .user ? "You" : "Agent")
+                            .font(WorkspaceVisualStyle.Typography.label)
+                            .foregroundStyle(
+                                message.sender == .user
+                                    ? WorkspaceVisualStyle.color(.textSecondary)
+                                    : message.type.tint
+                            )
                         if message.sender != .user {
                             Text(message.type.title)
                                 .font(.caption2.weight(.semibold))
@@ -913,8 +919,9 @@ private struct AgentConversationMessageRow: View {
                         )
                     } else {
                         Text(message.content)
-                            .font(.callout)
-                            .foregroundStyle(.primary)
+                            .font(WorkspaceVisualStyle.Typography.body)
+                            .foregroundStyle(WorkspaceVisualStyle.color(.textPrimary))
+                            .lineSpacing(2)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -948,12 +955,20 @@ private struct AgentConversationMessageRow: View {
                     }
                 }
             }
-            .padding(10)
+            .padding(message.sender == .user ? WorkspaceVisualStyle.Spacing.x16 : 10)
             .frame(maxWidth: 620, alignment: .leading)
-            .background(messageBubbleBackground, in: RoundedRectangle(cornerRadius: 8))
+            .background(
+                messageBubbleBackground,
+                in: RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.artifactCard, style: .continuous)
+            )
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(messageStrokeColor, lineWidth: 0.7)
+                RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.artifactCard, style: .continuous)
+                    .stroke(messageStrokeColor, lineWidth: message.sender == .user ? 0 : 0.7)
+            )
+            .shadow(
+                color: message.sender == .user ? .black.opacity(0.025) : .clear,
+                radius: 3,
+                y: 1
             )
 
             if message.sender != .user {
@@ -964,14 +979,14 @@ private struct AgentConversationMessageRow: View {
 
     private var messageBubbleBackground: Color {
         if message.sender == .user {
-            return Color(nsColor: .controlBackgroundColor)
+            return WorkspaceVisualStyle.color(.controlSurface)
         }
         return message.type.bubbleBackground
     }
 
     private var messageStrokeColor: Color {
         if message.sender == .user {
-            return Color(nsColor: .separatorColor)
+            return .clear
         }
         return message.type.tint.opacity(0.18)
     }
