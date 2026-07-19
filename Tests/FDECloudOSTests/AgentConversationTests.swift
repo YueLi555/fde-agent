@@ -68,7 +68,7 @@ final class AgentConversationTests: XCTestCase {
 
         let messages = AgentResponseComposer.messages(for: events)
 
-        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.count, 2)
         XCTAssertEqual(messages.first?.content, "Inspecting the workspace files.")
     }
 

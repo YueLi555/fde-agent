@@ -177,6 +177,8 @@ struct AgentConversationActivityMetadata: Equatable, Sendable {
 }
 
 struct AgentConversationActivity: Identifiable, Equatable, Sendable {
+    static let providerUnavailableLabel = "Unable to reach the configured AI provider."
+
     var requestID: UUID
     var startedAt: Date
     var scope: AgentConversationActivityScope
@@ -212,6 +214,20 @@ struct AgentConversationActivity: Identifiable, Equatable, Sendable {
             scope: scope,
             kind: scope == .normalChat ? .thinking : .preparingTask,
             metadata: AgentConversationActivityMetadata(dialogID: dialogID)
+        )
+    }
+
+    static func restoredProviderFailure(session: AgentSession) -> AgentConversationActivity {
+        let originatingUserMessage = session.conversation.messages.last {
+            $0.sender == .user
+        }
+        return AgentConversationActivity(
+            requestID: originatingUserMessage?.id ?? session.sessionID,
+            startedAt: originatingUserMessage?.timestamp ?? session.createdAt,
+            scope: .normalChat,
+            kind: .failed,
+            metadata: AgentConversationActivityMetadata(dialogID: session.sessionID),
+            labelOverride: providerUnavailableLabel
         )
     }
 }
@@ -536,6 +552,9 @@ struct AgentConversationActivityReducer: Sendable {
     ) -> AgentConversationActivity? {
         if let localActivity, localActivity.scope == .normalChat {
             return localActivity
+        }
+        if localActivity == nil, session.interactionState == .blockedProvider {
+            return .restoredProviderFailure(session: session)
         }
 
         let taskID: UUID?

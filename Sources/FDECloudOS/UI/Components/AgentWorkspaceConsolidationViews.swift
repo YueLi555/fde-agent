@@ -1067,7 +1067,18 @@ struct HumanActionBar: View {
     }
 
     private var currentAction: WorkspaceHumanAction? {
-        guard let summary = store.selectedMissionPresentation?.current,
+        guard let selectedSession = store.selectedAgentSession,
+              ![
+                  AgentInteractionState.draft,
+                  .idle,
+                  .responding,
+                  .waitingForUser,
+                  .blocked,
+                  .blockedProvider,
+                  .blockedPermission,
+                  .failed
+              ].contains(selectedSession.interactionState),
+              let summary = store.selectedMissionPresentation?.current,
               store.isMissionSummaryBoundToSelectedConversation(summary) else {
             return nil
         }

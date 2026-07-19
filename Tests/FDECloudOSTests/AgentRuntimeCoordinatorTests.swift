@@ -93,7 +93,7 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
 
         XCTAssertFalse(result.waitingForUser)
         XCTAssertNotNil(result.task)
-        XCTAssertEqual(session.interactionState, .working)
+        XCTAssertEqual(session.interactionState, .running)
         let submittedInputs = await runtime.submittedInputs()
         let recordedEvents = await runtime.recordedEvents()
         XCTAssertEqual(submittedInputs, ["检查 Salesforce integration"])
@@ -384,7 +384,7 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
 
         XCTAssertFalse(result.waitingForUser)
         XCTAssertNotNil(result.task)
-        XCTAssertEqual(session.interactionState, .working)
+        XCTAssertEqual(session.interactionState, .running)
         let submittedInputs = await runtime.submittedInputs()
         XCTAssertEqual(submittedInputs, [input])
         let recordedEvents = await runtime.recordedEvents()
@@ -456,7 +456,7 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
         )
 
         XCTAssertNotNil(result.task)
-        XCTAssertEqual(session.interactionState, .working)
+        XCTAssertEqual(session.interactionState, .running)
         let submittedInputs = await runtime.submittedInputs()
         XCTAssertEqual(submittedInputs, [input])
         let recordedEvents = await runtime.recordedEvents()
@@ -550,7 +550,7 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
         XCTAssertNil(result.task)
         XCTAssertFalse(result.waitingForUser)
         XCTAssertEqual(session.currentState, .executing)
-        XCTAssertEqual(session.interactionState, .working)
+        XCTAssertEqual(session.interactionState, .blockedProvider)
         XCTAssertEqual(session.conversation.messages.prefix(previousMessages.count), previousMessages[...])
         XCTAssertEqual(result.normalChatLifecycle, .failed)
         XCTAssertEqual(session.conversation.messages.suffix(2).first?.sender, .user)
@@ -611,7 +611,7 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
         XCTAssertNotEqual(result.task?.id, taskID)
         XCTAssertFalse(result.waitingForUser)
         XCTAssertEqual(session.currentState, .executing)
-        XCTAssertEqual(session.interactionState, .working)
+        XCTAssertEqual(session.interactionState, .running)
         let submittedInputs = await runtime.submittedInputs()
         let controlActions = await runtime.recordedControlActions()
         XCTAssertEqual(submittedInputs, [input])
@@ -724,7 +724,7 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
 
         XCTAssertFalse(result.waitingForUser)
         XCTAssertNotNil(result.task)
-        XCTAssertEqual(session.interactionState, .working)
+        XCTAssertEqual(session.interactionState, .running)
         let submittedInputs = await runtime.submittedInputs()
         XCTAssertEqual(submittedInputs, ["检查 Salesforce integration"])
         XCTAssertFalse(session.conversation.messages.contains {
@@ -855,7 +855,7 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
 
         XCTAssertFalse(result.waitingForUser)
         XCTAssertNotNil(result.task)
-        XCTAssertEqual(session.interactionState, .working)
+        XCTAssertEqual(session.interactionState, .running)
         let submittedInputs = await runtime.submittedInputs()
         XCTAssertEqual(submittedInputs, ["查看工作区"])
         XCTAssertEqual(
@@ -1077,7 +1077,7 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
 
         XCTAssertFalse(result.waitingForUser)
         XCTAssertNotNil(result.task)
-        XCTAssertEqual(session.interactionState, .working)
+        XCTAssertEqual(session.interactionState, .running)
         let submittedInputs = await runtime.submittedInputs()
         XCTAssertEqual(submittedInputs.count, 1)
         XCTAssertTrue(submittedInputs[0].contains("Approved implementation for AI agent integration"))
@@ -1247,7 +1247,7 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
         XCTAssertEqual(result.task?.state, .running)
         XCTAssertEqual(session.workspaceContext.runtimeTaskID, taskID)
         XCTAssertEqual(session.currentState, .executing)
-        XCTAssertEqual(session.interactionState, .working)
+        XCTAssertEqual(session.interactionState, .running)
         XCTAssertTrue(session.conversation.messages.contains {
             $0.type == .warning
                 && $0.content.contains("刚才没有成功读取任何文件")

@@ -66,15 +66,13 @@ private extension AgentSessionAsyncBinding {
         updated: AgentConversation
     ) -> AgentConversation {
         var merged = updated
-        var byID = Dictionary(uniqueKeysWithValues: current.messages.map { ($0.id, $0) })
+        merged.messages = current.messages
         for message in updated.messages {
-            byID[message.id] = message
-        }
-        merged.messages = byID.values.sorted { lhs, rhs in
-            if lhs.timestamp == rhs.timestamp {
-                return lhs.id.uuidString < rhs.id.uuidString
+            if let existingIndex = merged.messages.firstIndex(where: { $0.id == message.id }) {
+                merged.messages[existingIndex] = message
+            } else {
+                merged.append(message)
             }
-            return lhs.timestamp < rhs.timestamp
         }
         merged.updatedAt = max(current.updatedAt, updated.updatedAt)
         return merged
@@ -99,7 +97,28 @@ private extension AgentSessionAsyncBinding {
         case let (nil, updated?): merged.latestEventSequence = updated
         case (nil, nil): merged.latestEventSequence = nil
         }
+        merged.activeTurnID = current.activeTurnID ?? updated.activeTurnID
+        merged.activeUserMessageID = current.activeUserMessageID ?? updated.activeUserMessageID
+        merged.turnIDByRuntimeTaskID = mergedBindings(
+            current.turnIDByRuntimeTaskID,
+            updated.turnIDByRuntimeTaskID
+        )
+        merged.userMessageIDByRuntimeTaskID = mergedBindings(
+            current.userMessageIDByRuntimeTaskID,
+            updated.userMessageIDByRuntimeTaskID
+        )
         return merged
+    }
+
+    static func mergedBindings(
+        _ current: [UUID: UUID]?,
+        _ updated: [UUID: UUID]?
+    ) -> [UUID: UUID]? {
+        var merged = updated ?? [:]
+        for (key, value) in current ?? [:] {
+            merged[key] = value
+        }
+        return merged.isEmpty ? nil : merged
     }
 
     static func mergedByID<Element, ID: Hashable>(

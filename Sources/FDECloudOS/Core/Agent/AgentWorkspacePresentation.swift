@@ -39,7 +39,7 @@ extension AgentSession {
             userGoal: ConversationTitleGenerator.emptyConversationTitle,
             createdAt: createdAt,
             currentState: .idle,
-            interactionState: .idle,
+            interactionState: .draft,
             planApprovalStatus: .pending,
             conversation: AgentConversation(
                 sessionID: sessionID,
@@ -66,15 +66,83 @@ extension AgentSession {
         return ConversationTitleGenerator.title(for: userGoal)
     }
 
-    mutating func beginConversation(with request: String, timestamp: Date = Date()) {
+    mutating func beginConversation(
+        with request: String,
+        messageID: UUID = UUID(),
+        turnID: UUID? = nil,
+        timestamp: Date = Date()
+    ) {
         guard isEmptyConversation else {
             appendUserMessage(request, timestamp: timestamp)
             return
         }
         userGoal = request.trimmingCharacters(in: .whitespacesAndNewlines)
         currentState = .understanding
-        interactionState = .understanding
-        appendUserMessage(request, timestamp: timestamp)
+        interactionState = .responding
+        appendUserMessage(
+            request,
+            messageID: messageID,
+            turnID: turnID ?? messageID,
+            timestamp: timestamp
+        )
+    }
+}
+
+struct AgentConversationSessionRetention: Sendable {
+    static func reusableEmptyDraft(
+        in sessions: [AgentSession],
+        workspaceID: UUID,
+        selectedSessionID: UUID?,
+        drafts: [UUID: String]
+    ) -> AgentSession? {
+        let reusable = sessions.filter {
+            $0.workspaceID == workspaceID
+                && isSafelyDisposableEmptySession(
+                    $0,
+                    draftText: drafts[$0.sessionID] ?? ""
+                )
+        }
+        return reusable.first(where: { $0.sessionID == selectedSessionID })
+            ?? reusable.first
+    }
+
+    static func isSafelyDisposableEmptySession(
+        _ session: AgentSession,
+        draftText: String = "",
+        hasActivityOrAuditEvents: Bool = false,
+        hasHumanActionsOrApprovals: Bool = false
+    ) -> Bool {
+        let normalizedDraft = draftText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasRuntimeBindings = session.runtimeTaskID != nil
+            || session.workspaceContext.missionTaskIDs?.isEmpty == false
+            || session.workspaceContext.latestEventSequence != nil
+            || session.workspaceContext.activeTurnID != nil
+            || session.workspaceContext.activeUserMessageID != nil
+            || session.workspaceContext.turnIDByRuntimeTaskID?.isEmpty == false
+            || session.workspaceContext.userMessageIDByRuntimeTaskID?.isEmpty == false
+        let hasConversationData = !session.conversation.messages.isEmpty
+            || !session.messages.isEmpty
+            || !session.currentPlan.isEmpty
+            || !session.artifacts.isEmpty
+            || !session.evidence.isEmpty
+        let hasLifecycleSignal = session.currentState != .idle
+            || ![AgentInteractionState.draft, .idle].contains(session.interactionState)
+
+        return normalizedDraft.isEmpty
+            && !hasRuntimeBindings
+            && !hasConversationData
+            && !hasLifecycleSignal
+            && !hasActivityOrAuditEvents
+            && !hasHumanActionsOrApprovals
+    }
+
+    static func removingSafelyDisposableEmptySessions(
+        from sessions: [AgentSession],
+        drafts: [UUID: String]
+    ) -> [AgentSession] {
+        sessions.filter {
+            !isSafelyDisposableEmptySession($0, draftText: drafts[$0.sessionID] ?? "")
+        }
     }
 }
 

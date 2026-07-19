@@ -15,7 +15,7 @@ final class AgentWorkspaceConsolidationTests: XCTestCase {
         XCTAssertTrue(newChat.conversation.messages.isEmpty)
         XCTAssertNil(newChat.runtimeTaskID)
         XCTAssertEqual(newChat.currentState, .idle)
-        XCTAssertEqual(newChat.interactionState, .idle)
+        XCTAssertEqual(newChat.interactionState, .draft)
     }
 
     func testNewChatPreservesWorkspaceAndProjectScope() {

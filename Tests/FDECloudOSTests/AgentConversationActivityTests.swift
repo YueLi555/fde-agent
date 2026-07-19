@@ -44,6 +44,23 @@ final class AgentConversationActivityTests: XCTestCase {
         XCTAssertEqual(result.recordedEvents.last?.payload["chat_lifecycle"], NormalChatLifecycle.failed.rawValue)
     }
 
+    func testRestoredProviderFailureKeepsProviderSpecificWorkStatus() {
+        var session = AgentSession(workspaceID: UUID(), userGoal: "Are you there?")
+        session.currentState = .failed
+        session.setInteractionState(.blockedProvider)
+
+        let projected = AgentConversationActivityReducer.activity(
+            session: session,
+            events: [],
+            localActivity: nil
+        )
+
+        XCTAssertEqual(projected?.scope, .normalChat)
+        XCTAssertEqual(projected?.kind, .failed)
+        XCTAssertEqual(projected?.label, AgentConversationActivity.providerUnavailableLabel)
+        XCTAssertNil(projected?.metadata.taskID)
+    }
+
     func testNormalChatCompletionKeepsCanonicalAnswerAndHidesThinkingActivity() async throws {
         let workspace = Workspace.default()
         var session = AgentSession(workspace: workspace, userGoal: "Are you there?")
@@ -466,9 +483,9 @@ final class AgentConversationActivityTests: XCTestCase {
             events: events
         )
 
-        XCTAssertEqual(session.conversation.messages.filter { $0.sender == .agent }.count, 1)
+        XCTAssertEqual(session.conversation.messages.filter { $0.sender == .agent }.count, 6)
         XCTAssertTrue(session.conversation.messages.last?.content.contains("Canonical grounded report") == true)
-        XCTAssertEqual(visible.count, 2)
+        XCTAssertEqual(visible.count, 7)
         XCTAssertFalse(AgentConversationWorkUnitAdapter.workStatusCards(
             conversation: session.conversation,
             events: events

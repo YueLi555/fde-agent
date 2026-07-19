@@ -2,7 +2,7 @@ import XCTest
 @testable import FDECloudOS
 
 final class AgentConversationWorkUnitAdapterTests: XCTestCase {
-    func testRuntimeEventMessagesStayOutOfConversationAndRemainInWorkStatusMetadata() {
+    func testRuntimeEventMessagesRemainInConversationAndWorkStatusMetadata() {
         let workspaceID = UUID()
         let taskID = UUID()
         let createdAt = Date(timeIntervalSince1970: 0)
@@ -58,9 +58,9 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
         )
 
         XCTAssertEqual(messageCount, 1)
-        XCTAssertEqual(streamingResponses.count, 1)
+        XCTAssertEqual(streamingResponses.count, 3)
         XCTAssertEqual(streamingResponses.last?.chunks.count, 1)
-        XCTAssertEqual(streamingResponses.last?.markdown, "I've started a runtime execution for this mission.")
+        XCTAssertEqual(streamingResponses.last?.markdown, "Confirmed the current workspace path and recorded it as evidence.")
         XCTAssertEqual(workUnitCards.count, 1)
         XCTAssertEqual(workUnitCards.first?.completedSteps, ["Inspect workspace"])
         XCTAssertEqual(workUnitCards.first?.toolsUsed, ["/bin/pwd"])
@@ -146,7 +146,7 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
             .first
         )
 
-        XCTAssertTrue(responses.isEmpty)
+        XCTAssertEqual(responses.map(\.markdown), ["LLM narration after replacement"])
         XCTAssertEqual(card.narration, "LLM narration after replacement")
     }
 
@@ -193,7 +193,7 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
             ).first
         )
 
-        XCTAssertTrue(responses.isEmpty)
+        XCTAssertEqual(responses.map(\.markdown), ["Completed checks:\n- Current directory"])
         XCTAssertEqual(card.narration, "Completed checks:\n- Current directory")
     }
 
@@ -239,7 +239,9 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
             events: [firstCheck, repeatedCheck]
         )
 
-        XCTAssertTrue(responses.isEmpty)
+        XCTAssertEqual(responses.count, 2)
+        XCTAssertEqual(Set(responses.map(\.markdown)).count, 1)
+        XCTAssertNotEqual(responses[0].id, responses[1].id)
         XCTAssertEqual(cards.count, 2)
     }
 
@@ -284,7 +286,8 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
             events: [event, event]
         )
 
-        XCTAssertTrue(responses.isEmpty)
+        XCTAssertEqual(responses.count, 1)
+        XCTAssertEqual(responses.first?.markdown, "Checking the current workspace path.")
         XCTAssertEqual(cards.count, 1)
         XCTAssertEqual(cards.first?.rawEvents.map(\.id), [event.id])
     }
@@ -692,7 +695,7 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
 
         XCTAssertEqual(task.state, .completed)
         XCTAssertFalse(events.isEmpty)
-        XCTAssertEqual(streamingResponseCount, 0)
+        XCTAssertEqual(streamingResponseCount, runtimeMessageCount)
         XCTAssertLessThan(workUnitCardCount, runtimeMessageCount)
         XCTAssertEqual(liveTrace.timeline.count, events.count)
     }

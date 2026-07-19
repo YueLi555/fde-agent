@@ -38,6 +38,20 @@ struct AgentSessionMissionScope: Equatable, Sendable {
 }
 
 enum AgentSessionAuthorityEvaluator {
+    static func approvalIsEligibleForSubmission(
+        _ approval: ApprovalRequest,
+        task: FDETask?,
+        interactionState: AgentInteractionState
+    ) -> Bool {
+        guard interactionState == .waitingForApproval,
+              approval.state == .pending,
+              let task,
+              approval.taskID == task.id else {
+            return false
+        }
+        return task.state != .blocked && task.state != .failed
+    }
+
     static func approvalIsBound(
         _ approval: ApprovalRequest,
         scope: AgentSessionMissionScope?,

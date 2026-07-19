@@ -95,83 +95,35 @@ struct AgentConversationWorkUnitAdapter: Sendable {
             events: orderedEvents
         )
             .filter(shouldRenderAsConversationCard)
-        let canonicalAnswerEventIDs = Set(orderedEvents.filter(isCanonicalAnswerEvent).map(\.id))
         let workUnitIDByEventID = Dictionary(
             uniqueKeysWithValues: workUnits.flatMap { unit in
                 unit.eventIDs.map { ($0, unit.id) }
             }
         )
-        let items = conversationMessages.compactMap { message -> AgentConversationDisplayItem? in
-            if message.sender == .agent,
-               let eventID = message.relatedEventID,
-               orderedEvents.contains(where: { $0.id == eventID }),
-               !canonicalAnswerEventIDs.contains(eventID) {
-                return nil
-            }
+        return conversationMessages.enumerated().compactMap { index, message -> AgentConversationDisplayItem? in
             if shouldRenderAsStreamingResponse(message),
                let response = streamingResponse(for: message, workUnitIDByEventID: workUnitIDByEventID) {
                 return AgentConversationDisplayItem(
                     id: response.id,
                     timestamp: response.timestamp,
-                    sortRank: 1,
+                    sortRank: index,
                     content: .streamingResponse(response)
                 )
             }
             return AgentConversationDisplayItem(
                 id: "message-\(message.id.uuidString)",
                 timestamp: message.timestamp,
-                sortRank: 0,
+                sortRank: index,
                 content: .message(message)
             )
         }
-
-        return items.sorted { lhs, rhs in
-            if lhs.timestamp == rhs.timestamp {
-                if lhs.sortRank == rhs.sortRank {
-                    return lhs.id < rhs.id
-                }
-                return lhs.sortRank < rhs.sortRank
-            }
-            return lhs.timestamp < rhs.timestamp
-        }
     }
 
-    /// Conversation-first visibility keeps the latest ordinary Agent reply
-    /// visible even when it is represented as a streaming response. Mission
-    /// assets may replace only their own duplicated terminal result card.
     static func conciseDisplayItems(
         from displayItems: [AgentConversationDisplayItem],
         hasMissionAssets: Bool
     ) -> [AgentConversationDisplayItem] {
-        let lastAgentID = displayItems.reversed().first(where: { item in
-            switch item.content {
-            case let .message(message): return message.sender == .agent
-            case .streamingResponse: return true
-            }
-        })?.id
-
-        return displayItems.filter { item in
-            switch item.content {
-            case let .message(message):
-                if item.id == lastAgentID,
-                   !(hasMissionAssets && message.type == .result) {
-                    return true
-                }
-                return message.sender == .user
-                    || !message.options.isEmpty
-                    || message.type == .question
-                    || message.type == .decisionRequest
-                    || message.type == .warning
-                    || (!hasMissionAssets && message.type == .result)
-            case let .streamingResponse(response):
-                if item.id == lastAgentID,
-                   !(hasMissionAssets && response.messageType == .result) {
-                    return true
-                }
-                return response.messageType == .warning
-                    || (!hasMissionAssets && response.messageType == .result)
-            }
-        }
+        displayItems
     }
 
     static func workStatusCards(

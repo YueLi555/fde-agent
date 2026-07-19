@@ -326,6 +326,7 @@ final class AgentSessionTests: XCTestCase {
 
     func testInitialUserMessageEventDoesNotDuplicateUserGoal() {
         var session = AgentSession(workspace: Workspace.default(), userGoal: "Investigate API")
+        let initialMessageID = session.conversation.messages[0].id
 
         session.apply(
             event: makeEvent(
@@ -336,6 +337,7 @@ final class AgentSessionTests: XCTestCase {
                 summary: "User mission received",
                 payload: [
                     "session_id": session.sessionID.uuidString,
+                    "client_message_id": initialMessageID.uuidString,
                     "message": "Investigate API"
                 ]
             )

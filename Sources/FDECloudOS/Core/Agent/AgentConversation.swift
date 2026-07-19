@@ -48,6 +48,12 @@ struct AgentMessage: Identifiable, Codable, Hashable, Sendable {
     var sender: AgentMessageSender
     var type: AgentMessageType
     var content: String
+    /// Stable identity shared by every message that belongs to one user turn.
+    /// Legacy persisted messages decode this as nil and retain their original
+    /// chronological order.
+    var turnID: UUID?
+    /// Exact user message answered by this Agent message.
+    var inReplyToMessageID: UUID?
     var options: [AgentMessageOption]
     var selectedOptionID: String?
     var relatedEventID: UUID?
@@ -59,6 +65,8 @@ struct AgentMessage: Identifiable, Codable, Hashable, Sendable {
         sender: AgentMessageSender = .agent,
         type: AgentMessageType,
         content: String,
+        turnID: UUID? = nil,
+        inReplyToMessageID: UUID? = nil,
         options: [AgentMessageOption] = [],
         selectedOptionID: String? = nil,
         relatedEventID: UUID? = nil,
@@ -69,24 +77,35 @@ struct AgentMessage: Identifiable, Codable, Hashable, Sendable {
         self.sender = sender
         self.type = type
         self.content = content
+        self.turnID = turnID ?? (sender == .user ? id : nil)
+        self.inReplyToMessageID = inReplyToMessageID
         self.options = options
         self.selectedOptionID = selectedOptionID
         self.relatedEventID = relatedEventID
         self.relatedArtifactID = relatedArtifactID
     }
 
-    static func userRequest(_ content: String, timestamp: Date = Date()) -> AgentMessage {
+    static func userRequest(
+        _ content: String,
+        id: UUID = UUID(),
+        turnID: UUID? = nil,
+        timestamp: Date = Date()
+    ) -> AgentMessage {
         AgentMessage(
+            id: id,
             timestamp: timestamp,
             sender: .user,
             type: .text,
-            content: content
+            content: content,
+            turnID: turnID ?? id
         )
     }
 
     static func question(
         _ content: String,
         options: [AgentMessageOption],
+        turnID: UUID? = nil,
+        inReplyToMessageID: UUID? = nil,
         timestamp: Date = Date()
     ) -> AgentMessage {
         AgentMessage(
@@ -94,6 +113,8 @@ struct AgentMessage: Identifiable, Codable, Hashable, Sendable {
             sender: .agent,
             type: .question,
             content: content,
+            turnID: turnID,
+            inReplyToMessageID: inReplyToMessageID,
             options: options
         )
     }
@@ -101,6 +122,8 @@ struct AgentMessage: Identifiable, Codable, Hashable, Sendable {
     static func decisionRequest(
         _ content: String,
         options: [AgentMessageOption],
+        turnID: UUID? = nil,
+        inReplyToMessageID: UUID? = nil,
         timestamp: Date = Date()
     ) -> AgentMessage {
         AgentMessage(
@@ -108,6 +131,8 @@ struct AgentMessage: Identifiable, Codable, Hashable, Sendable {
             sender: .agent,
             type: .decisionRequest,
             content: content,
+            turnID: turnID,
+            inReplyToMessageID: inReplyToMessageID,
             options: options
         )
     }
@@ -250,7 +275,21 @@ struct AgentConversation: Identifiable, Codable, Hashable, Sendable {
 
     mutating func append(_ message: AgentMessage) {
         guard !messages.contains(where: { $0.id == message.id }) else { return }
-        messages.append(message)
+        if message.sender == .agent,
+           let turnID = message.turnID,
+           let userIndex = messages.lastIndex(where: {
+               $0.sender == .user && ($0.turnID ?? $0.id) == turnID
+           }) {
+            var insertionIndex = userIndex + 1
+            while insertionIndex < messages.endIndex,
+                  messages[insertionIndex].turnID == turnID,
+                  messages[insertionIndex].sender != .user {
+                insertionIndex += 1
+            }
+            messages.insert(message, at: insertionIndex)
+        } else {
+            messages.append(message)
+        }
         updatedAt = max(updatedAt, message.timestamp)
     }
 
@@ -277,6 +316,9 @@ struct AgentConversation: Identifiable, Codable, Hashable, Sendable {
         guard let index = messages.firstIndex(where: { $0.relatedEventID == relatedEventID }) else { return false }
         messages[index].content = message.content
         messages[index].type = message.type
+        messages[index].turnID = message.turnID ?? messages[index].turnID
+        messages[index].inReplyToMessageID = message.inReplyToMessageID
+            ?? messages[index].inReplyToMessageID
         messages[index].relatedArtifactID = message.relatedArtifactID
         updatedAt = max(updatedAt, message.timestamp)
         return true
