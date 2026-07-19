@@ -720,6 +720,7 @@ private extension MissionPresentationProjector {
             || session.interactionState == .understanding
             || session.interactionState == .planning
             || session.interactionState == .working
+            || session.interactionState == .running
         return (
             .assess,
             .assessing,
@@ -794,14 +795,14 @@ private extension MissionPresentationProjector {
               lineage.cleanup?.freezesMissionActions != true else {
             return false
         }
-        guard let patch = lineage.patch else { return true }
-        let needsAppliedAuthority = patch.projectionState == .patchReady
+        guard let patch = lineage.patch else { return false }
+        let hasReversibleMutation = patch.projectionState == .patchReady
             || patch.projectionState == .reverted
-            || patch.projectionState == .sandboxDestroyed
             || patch.status == .reviewReady
             || patch.status == .applied
             || patch.status == .reverted
         guard patch.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)) == lineage.identity.missionRunID,
+              hasReversibleMutation,
               patch.patchID != nil,
               patch.planID.flatMap(UUID.init(uuidString:)) != nil,
               (patch.planRevision ?? 0) > 0,
@@ -810,12 +811,9 @@ private extension MissionPresentationProjector {
               patch.assessmentID != nil else {
             return false
         }
-        if needsAppliedAuthority {
-            return patch.sandboxID.flatMap(SandboxID.init(rawValue:)) != nil
-                && patch.candidatePatchArtifactSHA256?.count == 64
-                && patch.manifestID != nil
-        }
-        return true
+        return patch.sandboxID.flatMap(SandboxID.init(rawValue:)) != nil
+            && patch.candidatePatchArtifactSHA256?.count == 64
+            && patch.manifestID != nil
     }
 
     static func isOlder(_ lhs: ResolvedMission, _ rhs: ResolvedMission) -> Bool {

@@ -82,20 +82,29 @@ enum AgentState: String, Codable, CaseIterable, Hashable, Identifiable, Sendable
 }
 
 enum AgentInteractionState: String, Codable, CaseIterable, Hashable, Identifiable, Sendable {
+    case draft = "DRAFT"
     case idle = "IDLE"
+    case responding = "RESPONDING"
     case understanding = "UNDERSTANDING"
     case planning = "PLANNING"
     case working = "WORKING"
+    case running = "RUNNING"
     case waitingForUser = "WAITING_FOR_USER"
     case waitingForApproval = "WAITING_FOR_APPROVAL"
     case verifying = "VERIFYING"
     case blocked = "BLOCKED"
+    case blockedProvider = "BLOCKED_PROVIDER"
+    case blockedPermission = "BLOCKED_PERMISSION"
     case completed = "COMPLETED"
     case failed = "FAILED"
 
     var id: String { rawValue }
 
     static func state(for event: ExecutionEvent) -> AgentInteractionState? {
+        if let explicitState = event.payload["interaction_state"]
+            .flatMap(AgentInteractionState.init(rawValue:)) {
+            return explicitState
+        }
         switch event.type {
         case .taskCreated, .contextCompiled:
             return .understanding
@@ -110,7 +119,7 @@ enum AgentInteractionState: String, Codable, CaseIterable, Hashable, Identifiabl
              .executionDispatched,
              .executionReceived,
              .workerTaskReceived:
-            return .working
+            return .running
         case .stateUpdated:
             switch event.payload["state"].flatMap(TaskState.init(rawValue:))
                 ?? event.payload["task_state"].flatMap(TaskState.init(rawValue:)) {
@@ -123,7 +132,7 @@ enum AgentInteractionState: String, Codable, CaseIterable, Hashable, Identifiabl
             case .pendingApproval, .waiting:
                 return .waitingForApproval
             default:
-                return .working
+                return .running
             }
         case .stepExecuted,
              .nodeExecutionCompleted,
@@ -137,13 +146,14 @@ enum AgentInteractionState: String, Codable, CaseIterable, Hashable, Identifiabl
              .recoveryAttempted,
              .nodeExecutionFailed,
              .workerTaskFailed:
-            return .working
+            return .running
         case .taskCompleted,
              .feedbackGenerated,
              .policyUpdated:
             return .completed
+        case .authorizationDenied:
+            return .blockedPermission
         case .humanRejected,
-             .authorizationDenied,
              .userApprovalRejected:
             return .failed
         case .sessionStarted,

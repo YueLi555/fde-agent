@@ -552,6 +552,7 @@ private enum LegacyMissionPresentationProjector {
             || session.interactionState == .understanding
             || session.interactionState == .planning
             || session.interactionState == .working
+            || session.interactionState == .running
         return (
             .assess,
             .assessing,

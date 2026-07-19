@@ -83,6 +83,91 @@ enum AgentRequestRoute: String, Codable, Hashable, Sendable {
     case activeMissionResume
 }
 
+struct AgentRuntimePreflightContext: Equatable, Sendable {
+    var hasExactProductionReadinessReport: Bool
+
+    static let empty = AgentRuntimePreflightContext(
+        hasExactProductionReadinessReport: false
+    )
+}
+
+enum ConversationRuntimePreflightReason: String, Equatable, Sendable {
+    case missingAssessmentTarget
+    case missingPatchScope
+    case missingInspectionTarget
+    case missingProductionReadinessReport
+    case productionReadinessReviewRequiresHumanAction
+}
+
+struct ConversationRuntimePreflightResult: Equatable, Sendable {
+    var reason: ConversationRuntimePreflightReason
+    var question: String
+}
+
+enum ConversationRuntimePreflight {
+    static func evaluate(
+        _ input: String,
+        context: AgentRuntimePreflightContext = .empty
+    ) -> ConversationRuntimePreflightResult? {
+        let normalized = input
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".,!?;:。！？；："))
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+
+        if normalized.contains("review production readiness")
+            || normalized == "production readiness review" {
+            if context.hasExactProductionReadinessReport {
+                return ConversationRuntimePreflightResult(
+                    reason: .productionReadinessReviewRequiresHumanAction,
+                    question: "The exact Production Readiness Report is available for this Mission. Review it through the scoped Human Action so the decision remains bound to this conversation and artifact revision."
+                )
+            }
+            return ConversationRuntimePreflightResult(
+                reason: .missingProductionReadinessReport,
+                question: "This conversation and Mission do not have an exact Production Readiness Report. Select the Mission that owns the report, or generate the prerequisite report before requesting review."
+            )
+        }
+
+        if [
+            "assess an ai integration",
+            "assess ai integration",
+            "assess an ai agent integration",
+            "evaluate an ai integration"
+        ].contains(normalized) {
+            return ConversationRuntimePreflightResult(
+                reason: .missingAssessmentTarget,
+                question: "Which module, API, workflow, or subsystem should I assess for the AI integration?"
+            )
+        }
+
+        if [
+            "propose an isolated patch",
+            "prepare an isolated patch",
+            "propose a candidate patch",
+            "prepare a candidate patch"
+        ].contains(normalized) {
+            return ConversationRuntimePreflightResult(
+                reason: .missingPatchScope,
+                question: "What behavior should change, and which component or files are in scope for the isolated patch?"
+            )
+        }
+
+        if [
+            "inspect a customer system",
+            "inspect the customer system",
+            "inspect customer system"
+        ].contains(normalized) {
+            return ConversationRuntimePreflightResult(
+                reason: .missingInspectionTarget,
+                question: "Which customer system, root, repository, integration, or other target should I inspect?"
+            )
+        }
+
+        return nil
+    }
+}
+
 struct AgentRuntimeCoordinatorResult: Sendable {
     var task: FDETask?
     var recordedEvents: [ExecutionEvent]
@@ -149,7 +234,8 @@ struct AgentRuntimeCoordinator: Sendable {
         workspace: Workspace,
         session: inout AgentSession,
         runtime: any AgentRuntimeExecuting,
-        userMessageID: UUID? = nil
+        userMessageID: UUID? = nil,
+        preflightContext: AgentRuntimePreflightContext = .empty
     ) async throws -> AgentRuntimeCoordinatorResult {
         session.refreshSelectedWorkspace(workspace)
         let safeInput = AgentPresentationSanitizer.safeMarkdownContent(input, fallback: "User mission")
@@ -161,13 +247,19 @@ struct AgentRuntimeCoordinator: Sendable {
             intent: intent,
             hasActiveRuntimeTask: false
         )
-        let route = route(
-            input: safeInput,
-            intent: intent,
-            isCapabilityQuestion: isCapabilityQuestion,
-            isExplicitMission: isExplicitMission,
-            selectedMode: selectedMode
+        let preflight = ConversationRuntimePreflight.evaluate(
+            safeInput,
+            context: preflightContext
         )
+        let route = preflight == nil
+            ? route(
+                input: safeInput,
+                intent: intent,
+                isCapabilityQuestion: isCapabilityQuestion,
+                isExplicitMission: isExplicitMission,
+                selectedMode: selectedMode
+            )
+            : .clarificationRequired
         let missionSemantic = MissionExecutionSemantic(intent: intent)
         let startsRuntime = route == .workspaceReadOnlyInvestigation
             || route == .safeSandboxAcceptance
@@ -176,7 +268,6 @@ struct AgentRuntimeCoordinator: Sendable {
             || route == .candidatePatchRevert
             || route == .candidatePatchSandboxDestroy
             || route == .executableTask
-            || route == .clarificationRequired
         let shouldAnswerInChat = route == .conversationalChat
         let needsClarification = route == .clarificationRequired
         let decision = route == .conversationalChat || route == .workspaceQuestion
@@ -186,7 +277,12 @@ struct AgentRuntimeCoordinator: Sendable {
                 isCapabilityQuestion: isCapabilityQuestion,
                 needsClarification: needsClarification
             )
-        let logicalUserEventID = userMessageID ?? UUID()
+        let logicalUserEventID = userMessageID
+            ?? session.workspaceContext.activeUserMessageID
+            ?? session.conversation.messages.last(where: { $0.sender == .user })?.id
+            ?? UUID()
+        session.workspaceContext.activeTurnID = session.workspaceContext.activeTurnID ?? logicalUserEventID
+        session.workspaceContext.activeUserMessageID = logicalUserEventID
         let userEvent = try await runtime.recordUserSubmissionAuditEvent(
             logicalEventID: logicalUserEventID,
             workspaceID: workspace.id,
@@ -195,6 +291,7 @@ struct AgentRuntimeCoordinator: Sendable {
             payload: [
                 "session_id": session.sessionID.uuidString,
                 "client_message_id": logicalUserEventID.uuidString,
+                "turn_id": (session.workspaceContext.activeTurnID ?? logicalUserEventID).uuidString,
                 "message": safeInput,
                 "intent_type": intent.intentType.rawValue,
                 "intent_confidence": String(intent.confidence),
@@ -260,7 +357,7 @@ struct AgentRuntimeCoordinator: Sendable {
         }
 
         if route == .candidatePatchGeneration {
-            session.setInteractionState(.working)
+            session.setInteractionState(.running)
             let task = try await runtime.runCandidatePatchGeneration(input: safeInput, workspace: workspace)
             return .running(task: task, recordedEvents: [userEvent])
         }
@@ -284,7 +381,7 @@ struct AgentRuntimeCoordinator: Sendable {
         }
 
         if route == .safeSandboxAcceptance {
-            session.setInteractionState(.working)
+            session.setInteractionState(.running)
             let task = try await runtime.runSafeSandboxAcceptance(input: safeInput, workspace: workspace)
             return .running(task: task, recordedEvents: [userEvent])
         }
@@ -292,7 +389,9 @@ struct AgentRuntimeCoordinator: Sendable {
         if route == .clarificationRequired {
             askForMissionClarification(
                 session: &session,
-                question: intent.clarificationQuestion ?? "What would you like me to do in this workspace?",
+                question: preflight?.question
+                    ?? intent.clarificationQuestion
+                    ?? "What would you like me to do in this workspace?",
                 language: intent.detectedLanguage
             )
             let questionEvent = try await runtime.recordAuditEvent(
@@ -305,13 +404,17 @@ struct AgentRuntimeCoordinator: Sendable {
                     "interaction_state": session.interactionState.rawValue,
                     "agent_loop_phase": "wait",
                     "selected_route": route.rawValue,
-                    "runtime_mode": AgentRuntimeMode.agentTask.rawValue
+                    "runtime_mode": AgentRuntimeMode.chat.rawValue,
+                    "chat_only": "true",
+                    "turn_id": (session.workspaceContext.activeTurnID ?? logicalUserEventID).uuidString,
+                    "user_message_id": logicalUserEventID.uuidString,
+                    "preflight_reason": preflight?.reason.rawValue ?? "intent_clarification"
                 ].merging(decision.auditPayload) { current, _ in current }
             )
             return .waiting(recordedEvents: [userEvent, questionEvent])
         }
 
-        session.setInteractionState(.working)
+        session.setInteractionState(.running)
         let task = try await runtime.submitTask(input: safeInput, workspace: workspace)
         return .running(task: task, recordedEvents: [userEvent])
     }
@@ -323,7 +426,8 @@ struct AgentRuntimeCoordinator: Sendable {
         runtime: any AgentRuntimeExecuting,
         continuation: Bool = false,
         userMessageAlreadyAppended: Bool = false,
-        userMessageID: UUID? = nil
+        userMessageID: UUID? = nil,
+        preflightContext: AgentRuntimePreflightContext = .empty
     ) async throws -> AgentRuntimeCoordinatorResult {
         session.refreshSelectedWorkspace(workspace)
         let interactionStateBeforeReply = session.interactionState
@@ -350,13 +454,19 @@ struct AgentRuntimeCoordinator: Sendable {
             session: session,
             events: linkedTaskEvents
         )
-        let requestRoute = route(
-            input: reply,
-            intent: replyIntent,
-            isCapabilityQuestion: isCapabilityQuestion,
-            isExplicitMission: isExplicitMission,
-            selectedMode: selectedMode
+        let preflight = ConversationRuntimePreflight.evaluate(
+            reply,
+            context: preflightContext
         )
+        let requestRoute = preflight == nil
+            ? route(
+                input: reply,
+                intent: replyIntent,
+                isCapabilityQuestion: isCapabilityQuestion,
+                isExplicitMission: isExplicitMission,
+                selectedMode: selectedMode
+            )
+            : .clarificationRequired
         let route: AgentRequestRoute
         if let activeMissionRoute,
            activeMissionRoute == .activeMissionRetry || activeMissionRoute == .activeMissionResume {
@@ -430,7 +540,12 @@ struct AgentRuntimeCoordinator: Sendable {
         } else {
             event = interactionController.receiveUserReply(reply, session: &session)
         }
-        let logicalUserEventID = userMessageID ?? UUID()
+        let logicalUserEventID = userMessageID
+            ?? session.workspaceContext.activeUserMessageID
+            ?? session.conversation.messages.last(where: { $0.sender == .user })?.id
+            ?? UUID()
+        session.workspaceContext.activeTurnID = session.workspaceContext.activeTurnID ?? logicalUserEventID
+        session.workspaceContext.activeUserMessageID = logicalUserEventID
         let recordedUserEvent = try await runtime.recordUserSubmissionAuditEvent(
             logicalEventID: logicalUserEventID,
             workspaceID: workspace.id,
@@ -438,6 +553,7 @@ struct AgentRuntimeCoordinator: Sendable {
             summary: event.summary,
             payload: event.payload.merging([
                 "client_message_id": logicalUserEventID.uuidString,
+                "turn_id": (session.workspaceContext.activeTurnID ?? logicalUserEventID).uuidString,
                 "agent_loop_phase": "resume",
                 "selected_route": route.rawValue,
                 "mission_semantic": missionSemantic.rawValue,
@@ -571,7 +687,7 @@ struct AgentRuntimeCoordinator: Sendable {
         }
 
         if route == .candidatePatchGeneration {
-            session.setInteractionState(.working)
+            session.setInteractionState(.running)
             let task = try await runtime.runCandidatePatchGeneration(input: reply, workspace: workspace)
             return .running(task: task, recordedEvents: [recordedUserEvent])
         }
@@ -598,13 +714,13 @@ struct AgentRuntimeCoordinator: Sendable {
         }
 
         if route == .safeSandboxAcceptance {
-            session.setInteractionState(.working)
+            session.setInteractionState(.running)
             let task = try await runtime.runSafeSandboxAcceptance(input: reply, workspace: workspace)
             return .running(task: task, recordedEvents: [recordedUserEvent])
         }
 
         if route == .workspaceReadOnlyInvestigation {
-            session.setInteractionState(.working)
+            session.setInteractionState(.running)
             let task = try await runtime.submitTask(input: reply, workspace: workspace)
             return .running(task: task, recordedEvents: [recordedUserEvent])
         }
@@ -613,7 +729,9 @@ struct AgentRuntimeCoordinator: Sendable {
             if route == .clarificationRequired {
                 askForMissionClarification(
                     session: &session,
-                    question: replyIntent.clarificationQuestion ?? "What would you like me to do in this workspace?",
+                    question: preflight?.question
+                        ?? replyIntent.clarificationQuestion
+                        ?? "What would you like me to do in this workspace?",
                     language: replyIntent.detectedLanguage
                 )
                 let clarificationEvent = try await runtime.recordAuditEvent(
@@ -627,6 +745,10 @@ struct AgentRuntimeCoordinator: Sendable {
                         "agent_loop_phase": "wait",
                         "selected_route": route.rawValue,
                         "runtime_mode": AgentRuntimeMode.agentTask.rawValue,
+                        "chat_only": "true",
+                        "turn_id": (session.workspaceContext.activeTurnID ?? logicalUserEventID).uuidString,
+                        "user_message_id": logicalUserEventID.uuidString,
+                        "preflight_reason": preflight?.reason.rawValue ?? "intent_clarification",
                         "intent_type": replyIntent.intentType.rawValue,
                         "intent_confidence": String(replyIntent.confidence)
                     ].merging(decision.auditPayload) { current, _ in current }
@@ -634,7 +756,7 @@ struct AgentRuntimeCoordinator: Sendable {
                 return .waiting(recordedEvents: [recordedUserEvent, clarificationEvent])
             }
 
-            session.setInteractionState(.working)
+            session.setInteractionState(.running)
             let task = try await runtime.submitTask(input: resumedMissionInput(reply: reply, session: session), workspace: workspace)
             return .running(task: task, recordedEvents: [recordedUserEvent])
         }
@@ -655,7 +777,7 @@ struct AgentRuntimeCoordinator: Sendable {
 
             if decision.nextAction == .changeApproach {
                 await runtime.changeTaskApproach(taskID: taskID, instruction: reply)
-                session.setInteractionState(.working)
+                session.setInteractionState(.running)
                 session.appendInteractionMessage(
                     AgentMessage(
                         sender: .agent,
@@ -744,7 +866,7 @@ struct AgentRuntimeCoordinator: Sendable {
                 )
                 return .waiting(recordedEvents: [clarificationEvent])
             }
-            session.setInteractionState(.working)
+            session.setInteractionState(.running)
             let task = try await runtime.submitTask(
                 input: resumedMissionInput(reply: safeDecision, session: session),
                 workspace: workspace
@@ -766,7 +888,7 @@ struct AgentRuntimeCoordinator: Sendable {
         runtime: any AgentRuntimeExecuting
     ) async throws -> AgentRuntimeCoordinatorResult {
         let input = approvedImplementationInput(for: session)
-        session.setInteractionState(.working)
+        session.setInteractionState(.running)
         session.appendInteractionMessage(
             AgentMessage(
                 sender: .agent,
@@ -985,7 +1107,7 @@ struct AgentRuntimeCoordinator: Sendable {
         if let restoreInteractionState {
             session.setInteractionState(restoreInteractionState)
         } else if session.runtimeTaskID == nil {
-            session.setInteractionState(.idle)
+            session.setInteractionState(.responding)
         }
         let response: AgentChatResponse
         if missionClassifier.isPriorWorkQuestion(input) {
@@ -1001,10 +1123,6 @@ struct AgentRuntimeCoordinator: Sendable {
                 includeActiveTaskContext: includeActiveTaskContext
             )
         }
-        // Provider failure is still a completed conversational turn from the
-        // user's perspective. Persist the honest fallback as the single Agent
-        // reply; the separate failed lifecycle remains transient status and
-        // diagnostic metadata, not a substitute for conversation content.
         session.appendInteractionMessage(
             AgentMessage(
                 sender: .agent,
@@ -1012,9 +1130,12 @@ struct AgentRuntimeCoordinator: Sendable {
                 content: response.content
             )
         )
-        session.setInteractionState(restoreInteractionState ?? .idle)
+        let lifecycle = chatLifecycle(for: response)
+        session.setInteractionState(
+            lifecycle == .failed ? .blockedProvider : (restoreInteractionState ?? .idle)
+        )
         if session.runtimeTaskID == nil {
-            session.currentState = .idle
+            session.currentState = lifecycle == .failed ? .failed : .idle
         }
         return response
     }
@@ -1519,7 +1640,7 @@ struct AgentRuntimeCoordinator: Sendable {
             session.setInteractionState(.planning)
         case .running:
             session.currentState = .executing
-            session.setInteractionState(.working)
+            session.setInteractionState(.running)
         case .waiting, .pendingApproval:
             session.currentState = .waitingApproval
             session.setInteractionState(.waitingForApproval)

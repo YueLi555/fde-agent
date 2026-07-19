@@ -186,8 +186,22 @@ final class AppStore: ObservableObject {
     }
 
     var selectedTaskPendingApprovals: [ApprovalRequest] {
-        guard let scope = selectedConversationScope, scope.hasLinkedMission else { return [] }
-        return pendingApprovals.filter { scope.containsMissionTask($0.taskID) }
+        guard let scope = selectedConversationScope,
+              scope.hasLinkedMission,
+              let interactionState = selectedAgentSession?.interactionState else {
+            return []
+        }
+        return pendingApprovals.filter { approval in
+            guard scope.containsMissionTask(approval.taskID) else { return false }
+            let task = approval.taskID.flatMap { taskID in
+                tasks.first(where: { $0.id == taskID })
+            }
+            return AgentSessionAuthorityEvaluator.approvalIsEligibleForSubmission(
+                approval,
+                task: task,
+                interactionState: interactionState
+            )
+        }
     }
 
     func isApprovalBoundToSelectedConversation(_ approval: ApprovalRequest) -> Bool {
@@ -670,9 +684,29 @@ final class AppStore: ObservableObject {
         cancelCandidatePatchRevertConfirmation()
         cancelCandidatePatchDestructionConfirmation()
 
-        let newSession = AgentSession.newConversation(in: workspace)
-        agentSessions.insert(newSession, at: 0)
-        selectedAgentSessionID = newSession.sessionID
+        if let reusable = AgentConversationSessionRetention.reusableEmptyDraft(
+            in: agentSessions,
+            workspaceID: workspace.id,
+            selectedSessionID: selectedAgentSessionID,
+            drafts: composerDrafts
+        ) {
+            agentSessions.removeAll {
+                $0.workspaceID == workspace.id
+                    && $0.sessionID != reusable.sessionID
+                    && AgentConversationSessionRetention.isSafelyDisposableEmptySession(
+                        $0,
+                        draftText: composerDrafts[$0.sessionID] ?? ""
+                    )
+            }
+            composerDrafts = composerDrafts.filter { id, _ in
+                agentSessions.contains(where: { $0.sessionID == id })
+            }
+            selectedAgentSessionID = reusable.sessionID
+        } else {
+            let newSession = AgentSession.newConversation(in: workspace)
+            agentSessions.insert(newSession, at: 0)
+            selectedAgentSessionID = newSession.sessionID
+        }
         selectedTaskID = nil
         lastError = nil
         composerFocusRequestID = UUID()
@@ -689,7 +723,12 @@ final class AppStore: ObservableObject {
         let input = commandText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty else { return }
 
-        guard hasRequiredProjectScope(for: input, workspace: workspace) else {
+        let preflightContext = selectedRuntimePreflightContext
+        let requiresClarification = ConversationRuntimePreflight.evaluate(
+            input,
+            context: preflightContext
+        ) != nil
+        guard requiresClarification || hasRequiredProjectScope(for: input, workspace: workspace) else {
             lastError = missingProjectScopeMessage(for: input)
             return
         }
@@ -705,7 +744,11 @@ final class AppStore: ObservableObject {
             }
             if agentSessions[index].isEmptyConversation {
                 let requestID = UUID()
-                agentSessions[index].beginConversation(with: input)
+                agentSessions[index].beginConversation(
+                    with: input,
+                    messageID: requestID,
+                    turnID: requestID
+                )
                 let scope = activityScope(for: input, session: agentSessions[index])
                 commandText = ""
                 lastError = nil
@@ -731,7 +774,8 @@ final class AppStore: ObservableObject {
                             workspace: workspace,
                             session: &session,
                             runtime: environment.runtime,
-                            userMessageID: requestID
+                            userMessageID: requestID,
+                            preflightContext: preflightContext
                         )
                         guard AgentSessionAsyncBinding.commit(
                             originatingSession: originatingSession,
@@ -761,7 +805,11 @@ final class AppStore: ObservableObject {
             }
             let requestID = UUID()
             let scope = activityScope(for: input, session: agentSessions[index])
-            agentSessions[index].appendUserMessage(input)
+            agentSessions[index].appendUserMessage(
+                input,
+                messageID: requestID,
+                turnID: requestID
+            )
             commandText = ""
             lastError = nil
             beginSubmission(
@@ -783,8 +831,12 @@ final class AppStore: ObservableObject {
             return
         }
 
-        let agentSessionID = createAgentSession(goal: input, workspace: workspace)
         let requestID = UUID()
+        let agentSessionID = createAgentSession(
+            goal: input,
+            workspace: workspace,
+            requestID: requestID
+        )
         let fingerprint = submissionFingerprint(input)
         let scope = agentSessions.first(where: { $0.sessionID == agentSessionID })
             .map { activityScope(for: input, session: $0) }
@@ -815,7 +867,8 @@ final class AppStore: ObservableObject {
                     workspace: workspace,
                     session: &session,
                     runtime: environment.runtime,
-                    userMessageID: requestID
+                    userMessageID: requestID,
+                    preflightContext: preflightContext
                 )
                 guard AgentSessionAsyncBinding.commit(
                     originatingSession: originatingSession,
@@ -2611,8 +2664,17 @@ final class AppStore: ObservableObject {
     }
 
     @discardableResult
-    private func createAgentSession(goal: String, workspace: Workspace) -> UUID {
-        let session = AgentSession(workspace: workspace, userGoal: goal)
+    private func createAgentSession(
+        goal: String,
+        workspace: Workspace,
+        requestID: UUID
+    ) -> UUID {
+        var session = AgentSession.newConversation(in: workspace)
+        session.beginConversation(
+            with: goal,
+            messageID: requestID,
+            turnID: requestID
+        )
         agentSessions.insert(session, at: 0)
         selectedAgentSessionID = session.sessionID
         selectedTaskID = nil
@@ -2630,10 +2692,15 @@ final class AppStore: ObservableObject {
     ) {
         let state = workspaceUIStateStore.load()
         var restoredSessionIDs = Set<UUID>()
-        let validSessions = state.sessions.filter {
+        let uniqueSessions = state.sessions.filter {
             validWorkspaceIDs.contains($0.workspaceID)
                 && restoredSessionIDs.insert($0.sessionID).inserted
         }
+        let validSessions = AgentConversationSessionRetention
+            .removingSafelyDisposableEmptySessions(
+                from: uniqueSessions,
+                drafts: state.drafts
+            )
         let validSessionIDs = Set(validSessions.map(\.sessionID))
         let activeSessionIDs = Set(validSessions.filter {
             activeWorkspaceID == nil || $0.workspaceID == activeWorkspaceID
@@ -2652,10 +2719,18 @@ final class AppStore: ObservableObject {
 
     private func persistWorkspaceUIStateIfNeeded() {
         guard !isRestoringWorkspaceUIState else { return }
+        let durableSessions = AgentConversationSessionRetention
+            .removingSafelyDisposableEmptySessions(
+                from: agentSessions,
+                drafts: composerDrafts
+            )
+        let durableSessionIDs = Set(durableSessions.map(\.sessionID))
         workspaceUIStateStore.save(AgentWorkspacePersistedUIState(
-            sessions: agentSessions,
-            selectedSessionID: selectedAgentSessionID,
-            drafts: composerDrafts,
+            sessions: durableSessions,
+            selectedSessionID: selectedAgentSessionID.flatMap {
+                durableSessionIDs.contains($0) ? $0 : nil
+            },
+            drafts: composerDrafts.filter { durableSessionIDs.contains($0.key) },
             isInspectorPresented: isInspectorPresented
         ))
     }
@@ -2854,6 +2929,7 @@ final class AppStore: ObservableObject {
               }) else {
             return
         }
+        let preflightContext = runtimePreflightContext(for: originatingSession)
         Task {
             defer { endSubmission(inputFingerprint, sessionID: sessionID) }
             do {
@@ -2865,7 +2941,8 @@ final class AppStore: ObservableObject {
                     runtime: environment.runtime,
                     continuation: continuation,
                     userMessageAlreadyAppended: true,
-                    userMessageID: requestID
+                    userMessageID: requestID,
+                    preflightContext: preflightContext
                 )
                 guard AgentSessionAsyncBinding.commit(
                     originatingSession: originatingSession,
@@ -3023,6 +3100,13 @@ final class AppStore: ObservableObject {
         inputFingerprint: UInt64,
         reactivatesCurrentTask: Bool
     ) {
+        if let index = agentSessions.firstIndex(where: {
+            $0.sessionID == session.sessionID && $0.workspaceID == session.workspaceID
+        }) {
+            agentSessions[index].setInteractionState(
+                scope == .normalChat ? .responding : .running
+            )
+        }
         var activity = AgentConversationActivity.local(
             requestID: requestID,
             dialogID: session.sessionID,
@@ -3054,7 +3138,7 @@ final class AppStore: ObservableObject {
             switch lifecycle {
             case .failed:
                 activity.kind = .failed
-                activity.labelOverride = "Unable to reach the configured AI provider."
+                activity.labelOverride = AgentConversationActivity.providerUnavailableLabel
                 activity.metadata.blockerReason = "the AI provider could not be reached"
             case .completed, .idle:
                 activity.kind = .completed
@@ -3146,6 +3230,28 @@ final class AppStore: ObservableObject {
         return normalized.utf8.reduce(UInt64(14_695_981_039_346_656_037)) { hash, byte in
             (hash ^ UInt64(byte)) &* 1_099_511_628_211
         }
+    }
+
+    private var selectedRuntimePreflightContext: AgentRuntimePreflightContext {
+        guard let session = selectedAgentSession else { return .empty }
+        return runtimePreflightContext(for: session)
+    }
+
+    private func runtimePreflightContext(
+        for session: AgentSession
+    ) -> AgentRuntimePreflightContext {
+        guard session.sessionID == selectedAgentSessionID,
+              let summary = selectedMissionPresentation?.current,
+              summary.missionID == session.runtimeTaskID,
+              let report = summary.productionReadinessReport,
+              report.sourceBinding.workspaceID == session.workspaceID,
+              report.sourceBinding.missionRunID == summary.missionID,
+              (try? ProductionReadinessArtifactValidator.validate(report)) != nil else {
+            return .empty
+        }
+        return AgentRuntimePreflightContext(
+            hasExactProductionReadinessReport: true
+        )
     }
 
     private func hasRequiredProjectScope(for input: String, workspace: Workspace) -> Bool {

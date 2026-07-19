@@ -73,8 +73,23 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
         )
     }
 
-    mutating func appendUserMessage(_ content: String, timestamp: Date = Date()) {
-        appendConversationMessage(AgentMessage.userRequest(content, timestamp: timestamp))
+    @discardableResult
+    mutating func appendUserMessage(
+        _ content: String,
+        messageID: UUID = UUID(),
+        turnID: UUID? = nil,
+        timestamp: Date = Date()
+    ) -> UUID {
+        let resolvedTurnID = turnID ?? messageID
+        appendConversationMessage(AgentMessage.userRequest(
+            content,
+            id: messageID,
+            turnID: resolvedTurnID,
+            timestamp: timestamp
+        ))
+        workspaceContext.activeTurnID = resolvedTurnID
+        workspaceContext.activeUserMessageID = messageID
+        return messageID
     }
 
     mutating func refreshSelectedWorkspace(_ workspace: Workspace) {
@@ -84,7 +99,18 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
     }
 
     mutating func appendInteractionMessage(_ message: AgentMessage) {
-        appendConversationMessage(message)
+        var bound = message
+        if bound.sender == .user {
+            let turnID = bound.turnID ?? bound.id
+            bound.turnID = turnID
+            workspaceContext.activeTurnID = turnID
+            workspaceContext.activeUserMessageID = bound.id
+        } else if bound.sender == .agent, bound.turnID == nil {
+            bound.turnID = workspaceContext.activeTurnID
+            bound.inReplyToMessageID = bound.inReplyToMessageID
+                ?? workspaceContext.activeUserMessageID
+        }
+        appendConversationMessage(bound)
     }
 
     mutating func markOptionSelected(messageID: UUID, optionID: String) {
@@ -122,7 +148,11 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
     }
 
     mutating func linkRuntimeTask(_ task: FDETask) {
-        workspaceContext.linkRuntimeTask(task)
+        workspaceContext.linkRuntimeTask(
+            task,
+            turnID: workspaceContext.activeTurnID,
+            userMessageID: workspaceContext.activeUserMessageID
+        )
         currentPlan = task.plan
     }
 
@@ -130,7 +160,11 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
         if runtimeTaskID == nil {
             linkRuntimeTask(task)
         } else {
-            workspaceContext.linkRuntimeTask(task)
+            workspaceContext.linkRuntimeTask(
+                task,
+                turnID: workspaceContext.activeTurnID,
+                userMessageID: workspaceContext.activeUserMessageID
+            )
         }
         currentPlan = task.plan
         switch task.state {
@@ -154,7 +188,7 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
             interactionState = .planning
         case .running:
             currentState = .executing
-            interactionState = .working
+            interactionState = .running
         }
     }
 
@@ -206,6 +240,11 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
             } else {
                 workspaceContext.runtimeTaskID = taskID
             }
+            workspaceContext.bindRuntimeTask(
+                taskID,
+                turnID: workspaceContext.activeTurnID,
+                userMessageID: workspaceContext.activeUserMessageID
+            )
         }
         workspaceContext.latestEventSequence = event.sequence
 
@@ -215,7 +254,8 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
         }
 
         if event.payload["chat_only"] == "true" {
-            interactionState = .idle
+            interactionState = event.payload["interaction_state"]
+                .flatMap(AgentInteractionState.init(rawValue:)) ?? .idle
         } else {
             if let mappedState = AgentState.state(for: event) {
                 currentState = mappedState
@@ -240,15 +280,18 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
             let message = AgentResponseComposer.message(for: event)
             if shouldAppendUserMessage(from: event, message: message) {
                 appendConversationMessage(message)
+                workspaceContext.activeTurnID = message.turnID ?? message.id
+                workspaceContext.activeUserMessageID = message.id
             }
         } else if !isUserInteractionEvent(event.type), AgentResponseComposer.shouldComposeNarration(event) {
-            if AgentResponseComposer.isCanonicalGroundedAnswerEvent(event) {
-                conversation.messages.removeAll {
-                    $0.sender == .agent && $0.relatedEventID != nil
-                }
-                messages = conversation.messages
-            }
-            let message = AgentResponseComposer.message(for: event)
+            var message = AgentResponseComposer.message(for: event)
+            let identity = workspaceContext.interactionIdentity(
+                taskID: event.taskID ?? event.exactParentMissionRunID
+            )
+            message.turnID = message.turnID ?? identity.turnID ?? workspaceContext.activeTurnID
+            message.inReplyToMessageID = message.inReplyToMessageID
+                ?? identity.userMessageID
+                ?? workspaceContext.activeUserMessageID
             if AgentResponseComposer.shouldAppend(message, to: conversation.messages) {
                 appendConversationMessage(message)
             }
@@ -304,25 +347,15 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
 
     private func shouldAppendUserMessage(from event: ExecutionEvent, message: AgentMessage) -> Bool {
         guard message.sender == .user else { return false }
-        if conversation.messages.contains(where: { $0.relatedEventID == event.id }) {
+        if conversation.messages.contains(where: {
+            $0.id == message.id || $0.relatedEventID == event.id
+        }) {
             return false
         }
 
         let content = normalizedUserMessage(message.content)
         guard !content.isEmpty else { return false }
-
-        if normalizedUserMessage(userGoal) == content,
-           conversation.messages.contains(where: { $0.sender == .user && $0.relatedEventID == nil && normalizedUserMessage($0.content) == content }) {
-            return false
-        }
-
-        return !conversation.messages.suffix(10).contains { existing in
-            guard existing.sender == .user,
-                  normalizedUserMessage(existing.content) == content else {
-                return false
-            }
-            return abs(existing.timestamp.timeIntervalSince(message.timestamp)) < 120
-        }
+        return true
     }
 
     private func normalizedUserMessage(_ value: String) -> String {

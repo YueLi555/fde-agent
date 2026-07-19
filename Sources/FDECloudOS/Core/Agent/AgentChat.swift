@@ -159,19 +159,19 @@ struct AgentRuntimeProfile: Codable, Hashable, Sendable {
         hasRuntimeTask: Bool
     ) -> MissionState {
         switch interactionState {
-        case .idle:
+        case .draft, .idle:
             return hasRuntimeTask ? .ready : .idle
-        case .understanding:
+        case .responding, .understanding:
             return .understand
         case .planning:
             return .plan
-        case .working:
+        case .working, .running:
             return .execute
         case .waitingForUser, .waitingForApproval:
             return .waitingHuman
         case .verifying:
             return .verifying
-        case .blocked:
+        case .blocked, .blockedProvider, .blockedPermission:
             return .blocked
         case .completed:
             return .complete

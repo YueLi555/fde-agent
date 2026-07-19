@@ -109,9 +109,9 @@ struct AgentConversationView: View {
                     Label("Conversation", systemImage: "bubble.left.and.bubble.right")
                         .font(.headline)
                     Spacer()
-                    Text(activity?.conversationTitle ?? session.interactionState.conversationTitle)
+                    Text(session.interactionState.conversationTitle)
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(activity?.conversationColor ?? session.interactionState.conversationColor)
+                        .foregroundStyle(session.interactionState.conversationColor)
                 }
             }
 
@@ -1633,14 +1633,19 @@ private extension AgentKind {
 extension AgentInteractionState {
     var conversationTitle: String {
         switch self {
+        case .draft: return "Draft"
         case .idle: return "Idle"
+        case .responding: return "Responding"
         case .understanding: return "Understanding"
         case .planning: return "Planning"
         case .working: return "Working"
+        case .running: return "Running"
         case .waitingForUser: return "Waiting For User"
         case .waitingForApproval: return "Waiting For Approval"
         case .verifying: return "Verifying"
         case .blocked: return "Blocked"
+        case .blockedProvider: return "Provider Unavailable"
+        case .blockedPermission: return "Permission Required"
         case .completed: return "Completed"
         case .failed: return "Failed"
         }
@@ -1648,12 +1653,14 @@ extension AgentInteractionState {
 
     var conversationColor: Color {
         switch self {
+        case .draft: return .secondary
         case .idle: return .secondary
+        case .responding: return .accentColor
         case .understanding, .planning: return .accentColor
-        case .working: return .blue
+        case .working, .running: return .blue
         case .waitingForUser, .waitingForApproval: return .purple
         case .verifying: return .teal
-        case .blocked: return .orange
+        case .blocked, .blockedProvider, .blockedPermission: return .orange
         case .completed: return .green
         case .failed: return .red
         }
@@ -1661,14 +1668,19 @@ extension AgentInteractionState {
 
     var conversationSymbol: String {
         switch self {
+        case .draft: return "square.and.pencil"
         case .idle: return "circle"
+        case .responding: return "ellipsis.bubble"
         case .understanding: return "brain.head.profile"
         case .planning: return "list.bullet.clipboard"
         case .working: return "terminal"
+        case .running: return "terminal.fill"
         case .waitingForUser: return "person.crop.circle.badge.questionmark"
         case .waitingForApproval: return "checkmark.shield"
         case .verifying: return "checkmark.magnifyingglass"
         case .blocked: return "exclamationmark.octagon"
+        case .blockedProvider: return "network.slash"
+        case .blockedPermission: return "lock.trianglebadge.exclamationmark"
         case .completed: return "checkmark.seal"
         case .failed: return "xmark.octagon"
         }

@@ -103,11 +103,18 @@ struct AgentResponseComposer: Sendable {
     }
 
     static func message(for event: ExecutionEvent) -> AgentMessage {
-        AgentMessage(
+        let stableMessageID = event.type == .userMessageReceived
+            ? event.payload["client_message_id"].flatMap(UUID.init(uuidString:)) ?? event.id
+            : event.id
+        return AgentMessage(
+            id: stableMessageID,
             timestamp: event.timestamp,
             sender: sender(for: event.type),
             type: messageType(for: event.type),
             content: content(for: event),
+            turnID: event.payload["turn_id"].flatMap(UUID.init(uuidString:))
+                ?? (event.type == .userMessageReceived ? stableMessageID : nil),
+            inReplyToMessageID: event.payload["user_message_id"].flatMap(UUID.init(uuidString:)),
             relatedEventID: event.id,
             relatedArtifactID: relatedArtifactID(for: event)
         )
@@ -349,10 +356,10 @@ struct AgentResponseComposer: Sendable {
     }
 
     static func shouldAppend(_ message: AgentMessage, to existingMessages: [AgentMessage]) -> Bool {
-        guard message.sender == .agent else { return true }
-        let key = dedupeKey(for: message)
-        return !existingMessages.suffix(8).contains { existing in
-            existing.sender == .agent && dedupeKey(for: existing) == key
+        guard !existingMessages.contains(where: { $0.id == message.id }) else { return false }
+        guard let eventID = message.relatedEventID else { return true }
+        return !existingMessages.contains {
+            $0.sender == message.sender && $0.relatedEventID == eventID
         }
     }
 

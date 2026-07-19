@@ -9,6 +9,10 @@ struct AgentWorkspaceContext: Codable, Hashable, Sendable {
     var runtimeTaskTitle: String?
     var missionTaskIDs: [UUID]?
     var latestEventSequence: Int64?
+    var activeTurnID: UUID?
+    var activeUserMessageID: UUID?
+    var turnIDByRuntimeTaskID: [UUID: UUID]?
+    var userMessageIDByRuntimeTaskID: [UUID: UUID]?
 
     init(
         workspaceID: UUID,
@@ -18,7 +22,11 @@ struct AgentWorkspaceContext: Codable, Hashable, Sendable {
         runtimeTaskID: UUID? = nil,
         runtimeTaskTitle: String? = nil,
         missionTaskIDs: [UUID]? = nil,
-        latestEventSequence: Int64? = nil
+        latestEventSequence: Int64? = nil,
+        activeTurnID: UUID? = nil,
+        activeUserMessageID: UUID? = nil,
+        turnIDByRuntimeTaskID: [UUID: UUID]? = nil,
+        userMessageIDByRuntimeTaskID: [UUID: UUID]? = nil
     ) {
         self.workspaceID = workspaceID
         self.workspaceName = workspaceName
@@ -28,6 +36,10 @@ struct AgentWorkspaceContext: Codable, Hashable, Sendable {
         self.runtimeTaskTitle = runtimeTaskTitle
         self.missionTaskIDs = missionTaskIDs
         self.latestEventSequence = latestEventSequence
+        self.activeTurnID = activeTurnID
+        self.activeUserMessageID = activeUserMessageID
+        self.turnIDByRuntimeTaskID = turnIDByRuntimeTaskID
+        self.userMessageIDByRuntimeTaskID = userMessageIDByRuntimeTaskID
     }
 
     init(workspace: Workspace) {
@@ -39,7 +51,11 @@ struct AgentWorkspaceContext: Codable, Hashable, Sendable {
         )
     }
 
-    mutating func linkRuntimeTask(_ task: FDETask) {
+    mutating func linkRuntimeTask(
+        _ task: FDETask,
+        turnID: UUID? = nil,
+        userMessageID: UUID? = nil
+    ) {
         var missionIDs = missionTaskIDs ?? []
         if let runtimeTaskID, !missionIDs.contains(runtimeTaskID) {
             missionIDs.append(runtimeTaskID)
@@ -50,6 +66,32 @@ struct AgentWorkspaceContext: Codable, Hashable, Sendable {
         missionTaskIDs = missionIDs
         runtimeTaskID = task.id
         runtimeTaskTitle = task.title
+        bindRuntimeTask(task.id, turnID: turnID, userMessageID: userMessageID)
+    }
+
+    mutating func bindRuntimeTask(
+        _ taskID: UUID,
+        turnID: UUID?,
+        userMessageID: UUID?
+    ) {
+        if let turnID {
+            var bindings = turnIDByRuntimeTaskID ?? [:]
+            bindings[taskID] = turnID
+            turnIDByRuntimeTaskID = bindings
+        }
+        if let userMessageID {
+            var bindings = userMessageIDByRuntimeTaskID ?? [:]
+            bindings[taskID] = userMessageID
+            userMessageIDByRuntimeTaskID = bindings
+        }
+    }
+
+    func interactionIdentity(taskID: UUID?) -> (turnID: UUID?, userMessageID: UUID?) {
+        guard let taskID else { return (activeTurnID, activeUserMessageID) }
+        return (
+            turnIDByRuntimeTaskID?[taskID] ?? activeTurnID,
+            userMessageIDByRuntimeTaskID?[taskID] ?? activeUserMessageID
+        )
     }
 
     mutating func refreshSelectedWorkspace(_ workspace: Workspace) {

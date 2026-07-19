@@ -841,15 +841,15 @@ private struct AgentPlanDecisionPanel: View {
 
     private var activeStepIndex: Int {
         switch session.interactionState {
-        case .idle, .understanding:
+        case .draft, .idle, .responding, .understanding:
             return 0
         case .planning:
             return min(1, max(session.currentPlan.count - 1, 0))
-        case .working, .waitingForUser, .waitingForApproval:
+        case .working, .running, .waitingForUser, .waitingForApproval:
             return min(2, max(session.currentPlan.count - 1, 0))
         case .verifying:
             return max(session.currentPlan.count - 1, 0)
-        case .blocked:
+        case .blocked, .blockedProvider, .blockedPermission:
             return min(2, max(session.currentPlan.count - 1, 0))
         case .completed:
             return session.currentPlan.count

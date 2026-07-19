@@ -147,6 +147,36 @@ final class SessionScopedConversationRegressionTests: XCTestCase {
         ))
     }
 
+    func testDirectApprovalFailsClosedForBlockedFailedOrNonWaitingTask() {
+        let workspace = Workspace.default()
+        let taskID = UUID()
+        let request = approval(workspaceID: workspace.id, taskID: taskID)
+        let blocked = task(id: taskID, workspaceID: workspace.id, state: .blocked)
+        let failed = task(id: taskID, workspaceID: workspace.id, state: .failed)
+        let pending = task(id: taskID, workspaceID: workspace.id, state: .pendingApproval)
+
+        XCTAssertFalse(AgentSessionAuthorityEvaluator.approvalIsEligibleForSubmission(
+            request,
+            task: blocked,
+            interactionState: .waitingForApproval
+        ))
+        XCTAssertFalse(AgentSessionAuthorityEvaluator.approvalIsEligibleForSubmission(
+            request,
+            task: failed,
+            interactionState: .waitingForApproval
+        ))
+        XCTAssertFalse(AgentSessionAuthorityEvaluator.approvalIsEligibleForSubmission(
+            request,
+            task: pending,
+            interactionState: .blockedPermission
+        ))
+        XCTAssertTrue(AgentSessionAuthorityEvaluator.approvalIsEligibleForSubmission(
+            request,
+            task: pending,
+            interactionState: .waitingForApproval
+        ))
+    }
+
     func testMissionAndUndoAuthorityRestoreOnlyForOwningBusinessConversation() {
         let workspace = Workspace.default()
         let missionID = UUID()
@@ -163,7 +193,7 @@ final class SessionScopedConversationRegressionTests: XCTestCase {
         ).current
         let casual = AgentSession.newConversation(in: workspace)
 
-        XCTAssertTrue(current.undoEligible)
+        XCTAssertFalse(current.undoEligible)
         XCTAssertTrue(AgentSessionAuthorityEvaluator.missionIsBound(
             current,
             current: current,
@@ -316,6 +346,22 @@ final class SessionScopedConversationRegressionTests: XCTestCase {
             decidedAt: nil,
             expiresAt: nil,
             metadata: [:]
+        )
+    }
+
+    private func task(id: UUID, workspaceID: UUID, state: TaskState) -> FDETask {
+        FDETask(
+            id: id,
+            workspaceID: workspaceID,
+            title: "Exact task",
+            rawInput: "Review exact task",
+            state: state,
+            plan: [],
+            riskScore: 0,
+            failureProbability: 0,
+            performanceScore: 0,
+            createdAt: Date(timeIntervalSince1970: 1),
+            updatedAt: Date(timeIntervalSince1970: 1)
         )
     }
 }
