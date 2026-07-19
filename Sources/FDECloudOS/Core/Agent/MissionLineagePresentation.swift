@@ -11,7 +11,10 @@ enum MissionPresentationProjector {
         generatedTestPlans: [GeneratedTestActivitySnapshot],
         generatedTestArtifacts: [GeneratedTestArtifact],
         approvals: [ApprovalRequest],
-        cleanupStates: [MissionCleanupState] = []
+        cleanupStates: [MissionCleanupState] = [],
+        productionReadinessReports: [ProductionReadinessReport] = [],
+        aiEvalPlans: [AIEvalPlan] = [],
+        phase3ARestorationFailure: String? = nil
     ) -> MissionPresentationState {
         let selectedTaskID = session.runtimeTaskID ?? session.sessionID
         let baseMissionID = exactMissionRunID(
@@ -158,13 +161,29 @@ enum MissionPresentationProjector {
                 taskRank: taskOrder[baseMissionID] ?? 0
             )
 
+        let currentSummary = attachPhase3AArtifacts(
+            to: currentResolved.summary,
+            reports: productionReadinessReports,
+            evalPlans: aiEvalPlans,
+            restorationFailure: phase3ARestorationFailure
+        )
         let previousRuns = resolved
             .filter { $0.summary.missionID != currentResolved.summary.missionID }
             .sorted { isOlder($1, $0) }
-            .map(historyEntry)
+            .map { mission in
+                historyEntry(
+                    mission,
+                    summary: attachPhase3AArtifacts(
+                        to: mission.summary,
+                        reports: productionReadinessReports,
+                        evalPlans: aiEvalPlans,
+                        exposesActions: false
+                    )
+                )
+            }
 
         return MissionPresentationState(
-            current: currentResolved.summary,
+            current: currentSummary,
             previousRuns: previousRuns,
             previousRunsExpandedByDefault: false
         )
@@ -778,8 +797,8 @@ private extension MissionPresentationProjector {
         return lhs.summary.missionID.uuidString < rhs.summary.missionID.uuidString
     }
 
-    static func historyEntry(_ mission: ResolvedMission) -> MissionHistoryEntry {
-        let summary = mission.summary
+    static func historyEntry(_ mission: ResolvedMission, summary: MissionSummary? = nil) -> MissionHistoryEntry {
+        let summary = summary ?? mission.summary
         return MissionHistoryEntry(
             historyID: "mission-run:\(summary.missionID.uuidString.lowercased())",
             missionID: summary.missionID,
@@ -796,6 +815,137 @@ private extension MissionPresentationProjector {
             timeline: mission.timeline,
             exactDetails: summary.exactDetails
         )
+    }
+
+    static func attachPhase3AArtifacts(
+        to summary: MissionSummary,
+        reports: [ProductionReadinessReport],
+        evalPlans: [AIEvalPlan],
+        restorationFailure: String? = nil,
+        exposesActions: Bool = true
+    ) -> MissionSummary {
+        var updated = summary
+        if exposesActions, let restorationFailure {
+            updated.phase3APlanningFailureReason = restorationFailure
+            updated.postReadyAction = nil
+            updated.result = "Persisted Phase 3A planning artifacts could not be restored. This run failed closed."
+            return updated
+        }
+        let missionReports = reports.filter {
+            $0.sourceBinding.missionRunID == summary.missionID
+                && $0.sourceBinding.workspaceID == summary.lineage?.workspaceID
+        }
+        let missionPlans = evalPlans.filter {
+            $0.sourceBinding.readinessSourceBinding.missionRunID == summary.missionID
+                && $0.sourceBinding.readinessSourceBinding.workspaceID == summary.lineage?.workspaceID
+        }
+        guard !missionReports.isEmpty || !missionPlans.isEmpty else {
+            if exposesActions,
+               summary.phase == .ready,
+               summary.lineageState == .exact,
+               summary.generatedTestArtifact?.currentRevision.flatMap({
+                   summary.generatedTestArtifact?.reviewState(for: $0.revision)
+               }) == .approved {
+                updated.postReadyAction = .reviewProductionReadiness
+            }
+            return updated
+        }
+        guard missionReports.count == 1,
+              missionPlans.count == 1,
+              let report = missionReports.first,
+              let plan = missionPlans.first,
+              report.sourceBinding == plan.sourceBinding.readinessSourceBinding,
+              phase3ABindingMatches(report.sourceBinding, summary: summary),
+              (try? ProductionReadinessArtifactValidator.validate(report)) != nil,
+              (try? ProductionReadinessArtifactValidator.validate(plan)) != nil else {
+            updated.lineageState = .contradictory
+            updated.lineageFailureReason = "Production Readiness or AI Eval artifacts contradict the exact Mission Run authority."
+            updated.primaryAction = nil
+            updated.postReadyAction = nil
+            updated.undoEligible = false
+            updated.result = "Conflicting Phase 3A planning authority was isolated. This run failed closed."
+            return updated
+        }
+        updated.productionReadinessReport = report
+        updated.aiEvalPlan = plan
+        if exposesActions, summary.phase == .ready, summary.cleanup?.freezesMissionActions != true {
+            updated.postReadyAction = .reviewProductionReadiness
+        }
+        if let revision = report.currentRevision {
+            updated.exactDetails += [
+                MissionExactDetail(label: "Production Readiness Report ID", value: report.reportID.uuidString.lowercased()),
+                MissionExactDetail(label: "Production Readiness Report revision", value: String(revision.revision)),
+                MissionExactDetail(label: "Production Readiness Report SHA-256", value: revision.digest.sha256),
+                MissionExactDetail(label: "Production Readiness source binding SHA-256", value: report.sourceBinding.sourceBindingSHA256)
+            ]
+        }
+        if let revision = plan.currentRevision {
+            updated.exactDetails += [
+                MissionExactDetail(label: "AI Eval Plan ID", value: plan.planID.uuidString.lowercased()),
+                MissionExactDetail(label: "AI Eval Plan revision", value: String(revision.revision)),
+                MissionExactDetail(label: "AI Eval Plan SHA-256", value: revision.digest.sha256),
+                MissionExactDetail(label: "AI Eval source binding SHA-256", value: plan.sourceBinding.sourceBindingSHA256)
+            ]
+        }
+        return updated
+    }
+
+    static func phase3ABindingMatches(
+        _ binding: ProductionReadinessSourceBinding,
+        summary: MissionSummary
+    ) -> Bool {
+        guard let identity = summary.lineage,
+              let artifact = summary.generatedTestArtifact,
+              let artifactRevision = artifact.currentRevision else {
+            return false
+        }
+        let source = artifact.sourceBinding.generatedTestSourceBinding
+        return binding.isSelfValidating
+            && binding.missionRunID == identity.missionRunID
+            && binding.workspaceID == identity.workspaceID
+            && binding.sourceCandidatePatchTaskID == identity.sourceCandidatePatchTaskID
+            && binding.canonicalLegacyRoot == identity.canonicalLegacyRoot
+            && binding.sourceSnapshotID == identity.sourceSnapshotID
+            && binding.assessmentID == identity.assessmentID
+            && binding.candidatePatchID.rawValue == identity.candidatePatchID
+            && binding.candidatePatchPlanID.uuidString.lowercased() == identity.candidatePatchPlanID?.lowercased()
+            && binding.candidatePatchPlanRevision == identity.candidatePatchPlanRevision
+            && binding.candidatePatchManifestID == identity.candidatePatchManifestID
+            && binding.candidatePatchArtifactSHA256 == identity.candidatePatchArtifactSHA256
+            && binding.sandboxID.rawValue == identity.sandboxID
+            && binding.generatedTestPlanningTaskID.uuidString.lowercased() == identity.generatedTestPlanningTaskID?.lowercased()
+            && binding.generatedTestPlanID.uuidString.lowercased() == identity.generatedTestPlanID?.lowercased()
+            && binding.generatedTestPlanRevision == identity.generatedTestPlanRevision
+            && binding.generatedTestPlanSHA256 == identity.generatedTestPlanSHA256
+            && binding.generatedTestArtifactID.uuidString.lowercased() == identity.generatedTestArtifactID?.lowercased()
+            && binding.generatedTestArtifactRevision == identity.generatedTestArtifactRevision
+            && binding.generatedTestArtifactSHA256 == identity.generatedTestArtifactSHA256
+            && binding.workspaceID == source.workspaceID
+            && binding.sourceCandidatePatchTaskID == source.sourceCandidatePatchTaskID
+            && binding.canonicalLegacyRoot == source.canonicalLegacyRoot
+            && binding.sourceSnapshotID == source.sourceSnapshotID
+            && binding.assessmentID == source.validatedAssessmentID
+            && binding.candidatePatchID == source.patchID
+            && binding.candidatePatchPlanID == source.candidatePatchPlanID
+            && binding.candidatePatchPlanRevision == source.candidatePatchPlanRevision
+            && binding.candidatePatchManifestID == source.candidatePatchManifestID
+            && binding.candidatePatchArtifactSHA256 == source.candidatePatchArtifactSHA256
+            && binding.candidatePatchApprovalProvenanceSHA256 == source.candidatePatchApprovalProvenanceSHA256
+            && binding.sandboxID == source.sandboxID
+            && binding.generatedTestPlanningTaskID == source.generatedTestPlanningTaskID
+            && binding.generatedTestPlanID == artifact.sourceBinding.generatedTestPlanID
+            && binding.generatedTestPlanRevision == artifact.sourceBinding.generatedTestPlanRevision
+            && binding.generatedTestPlanSHA256 == artifact.sourceBinding.generatedTestPlanSHA256
+            && binding.generatedTestArtifactID == artifact.artifactID
+            && binding.generatedTestArtifactRevision == artifactRevision.revision
+            && binding.generatedTestArtifactSHA256 == artifactRevision.digest.sha256
+            && binding.normalizedCapabilityID == source.normalizedCapabilityID
+            && binding.capabilityDisplayLabel == (source.capabilityDisplayLabel ?? source.normalizedCapabilityID)
+            && binding.authenticatedLocalSessionID == source.authenticatedLocalSessionID
+            && binding.appSessionID == source.appSessionID
+            && binding.candidatePatchReviewOutcome == CandidatePatchApprovalDecision.approve.rawValue
+            && binding.generatedTestArtifactReviewOutcome == GeneratedTestReviewDecisionKind.approve.rawValue
+            && artifact.reviewState(for: artifactRevision.revision) == .approved
     }
 
     static func historicalOutcome(_ summary: MissionSummary) -> String {
