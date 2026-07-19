@@ -76,6 +76,9 @@ final class AppStore: ObservableObject {
     @Published private var generatedTestArtifactReviewSessionsInFlight: Set<UUID> = []
     @Published private var candidatePatchReviewActionsInFlight: Set<UUID> = []
     @Published private(set) var missionCleanupStates: [MissionCleanupState] = []
+    @Published private(set) var productionReadinessReports: [ProductionReadinessReport] = []
+    @Published private(set) var aiEvalPlans: [AIEvalPlan] = []
+    @Published private(set) var productionReadinessRestoreFailure: String?
 
     private let environment: AppEnvironment
     private let startupIssue: String?
@@ -315,6 +318,20 @@ final class AppStore: ObservableObject {
             missionCleanupStates = (try? MissionCleanupStore(
                 storageRoot: environment.sandboxLifecycle.storageRoot
             ).loadAll(workspaceID: workspace.id)) ?? []
+            let readinessStore = ProductionReadinessArtifactStore(
+                storageRoot: environment.sandboxLifecycle.storageRoot
+            )
+            do {
+                let restored = try readinessStore.loadAllPairs(workspaceID: workspace.id)
+                productionReadinessReports = restored.reports
+                aiEvalPlans = restored.evalPlans
+                productionReadinessRestoreFailure = nil
+            } catch {
+                productionReadinessReports = []
+                aiEvalPlans = []
+                productionReadinessRestoreFailure = "Phase 3A persistence validation failed: \(error.localizedDescription)"
+                lastError = productionReadinessRestoreFailure
+            }
             conversationAssetProjection = AgentConversationAssetProjector.project(
                 workspaceID: workspace.id,
                 events: workspaceEvents,
@@ -989,7 +1006,10 @@ final class AppStore: ObservableObject {
             generatedTestPlans: conversationAssetProjection.generatedTestPlans,
             generatedTestArtifacts: conversationAssetProjection.generatedTestArtifacts,
             approvals: selectedTaskPendingApprovals,
-            cleanupStates: missionCleanupStates
+            cleanupStates: missionCleanupStates,
+            productionReadinessReports: productionReadinessReports,
+            aiEvalPlans: aiEvalPlans,
+            phase3ARestorationFailure: productionReadinessRestoreFailure
         )
         .current
         guard summary.undoEligible,
@@ -1114,9 +1134,174 @@ final class AppStore: ObservableObject {
             generatedTestPlans: conversationAssetProjection.generatedTestPlans,
             generatedTestArtifacts: conversationAssetProjection.generatedTestArtifacts,
             approvals: selectedTaskPendingApprovals,
-            cleanupStates: missionCleanupStates
+            cleanupStates: missionCleanupStates,
+            productionReadinessReports: productionReadinessReports,
+            aiEvalPlans: aiEvalPlans,
+            phase3ARestorationFailure: productionReadinessRestoreFailure
         )
         .current
+    }
+
+    func reviewProductionReadiness(_ summary: MissionSummary) {
+        guard summary.postReadyAction == .reviewProductionReadiness,
+              productionReadinessRestoreFailure == nil,
+              summary.phase == .ready,
+              summary.lineageState == .exact,
+              summary.cleanup?.freezesMissionActions != true,
+              let workspace = selectedWorkspace,
+              workspace.id == summary.lineage?.workspaceID,
+              let authenticatedLocalSessionID = session?.id,
+              session?.workspaceID == workspace.id,
+              let patchID = summary.lineage?.candidatePatchID.flatMap(CandidatePatchID.init(rawValue:)),
+              let sandboxID = summary.lineage?.sandboxID.flatMap(SandboxID.init(rawValue:)),
+              let planningTaskID = summary.lineage?.generatedTestPlanningTaskID.flatMap(UUID.init(uuidString:)),
+              let artifact = summary.generatedTestArtifact,
+              artifact.sourceBinding.generatedTestSourceBinding.authenticatedLocalSessionID == authenticatedLocalSessionID,
+              artifact.sourceBinding.generatedTestSourceBinding.appSessionID == appSessionID else {
+            lastError = "The exact current-app-session authority for this Ready mission is unavailable."
+            return
+        }
+        do {
+            let manifest = try CandidatePatchManifestStore(
+                lifecycle: environment.sandboxLifecycle
+            ).load(sandboxID: sandboxID, patchID: patchID)
+            let generatedPlan = try GeneratedTestPlanStore(
+                storageRoot: environment.sandboxLifecycle.storageRoot
+            ).load(workspaceID: workspace.id, planningTaskID: planningTaskID)
+            let service = ProductionReadinessPlanningService()
+            let binding = try service.makeSourceBinding(
+                missionRunID: summary.missionID,
+                manifest: manifest,
+                generatedTestPlan: generatedPlan,
+                generatedTestArtifact: artifact,
+                cleanupStatus: summary.cleanup?.phase.rawValue
+            )
+            let artifacts = try service.generate(sourceBinding: binding)
+            guard artifacts.safetyCounters.hasZeroExecutionAuthority else {
+                throw ProductionReadinessFailure.invalidClaim
+            }
+            let store = ProductionReadinessArtifactStore(
+                storageRoot: environment.sandboxLifecycle.storageRoot
+            )
+            try store.save(artifacts)
+            Task { await refresh() }
+        } catch {
+            lastError = error.localizedDescription
+            Task { await refresh() }
+        }
+    }
+
+    func productionReadinessReviewEligibility(
+        _ report: ProductionReadinessReport
+    ) -> ProductionReadinessReviewEligibility {
+        guard let current = exactCurrentMissionSummary(),
+              productionReadinessRestoreFailure == nil,
+              current.lineageState == .exact,
+              current.missionID == report.sourceBinding.missionRunID,
+              current.productionReadinessReport?.reportID == report.reportID,
+              current.aiEvalPlan != nil,
+              current.cleanup?.freezesMissionActions != true,
+              selectedWorkspace?.id == report.sourceBinding.workspaceID,
+              session?.id == report.sourceBinding.authenticatedLocalSessionID,
+              appSessionID == report.sourceBinding.appSessionID,
+              let revision = report.currentRevision,
+              report.reviewDecision(for: revision.revision) == nil else {
+            return .unavailable("This report is historical, already decided, or lacks exact current-session review authority.")
+        }
+        return .available
+    }
+
+    func aiEvalPlanReviewEligibility(
+        _ plan: AIEvalPlan
+    ) -> ProductionReadinessReviewEligibility {
+        let binding = plan.sourceBinding.readinessSourceBinding
+        guard let current = exactCurrentMissionSummary(),
+              productionReadinessRestoreFailure == nil,
+              current.lineageState == .exact,
+              current.missionID == binding.missionRunID,
+              current.aiEvalPlan?.planID == plan.planID,
+              current.productionReadinessReport != nil,
+              current.cleanup?.freezesMissionActions != true,
+              selectedWorkspace?.id == binding.workspaceID,
+              session?.id == binding.authenticatedLocalSessionID,
+              appSessionID == binding.appSessionID,
+              let revision = plan.currentRevision,
+              plan.reviewDecision(for: revision.revision) == nil else {
+            return .unavailable("This Eval Plan is historical, already decided, or lacks exact current-session review authority.")
+        }
+        return .available
+    }
+
+    func reviewReadinessReport(
+        _ report: ProductionReadinessReport,
+        decision: ProductionReadinessReviewDecisionKind,
+        instructions: String?
+    ) {
+        let eligibility = productionReadinessReviewEligibility(report)
+        guard eligibility.isAvailable, let revision = report.currentRevision else {
+            lastError = eligibility.unavailableReason
+            return
+        }
+        let binding = report.sourceBinding
+        let context = ProductionReadinessReviewContext(
+            missionRunID: binding.missionRunID,
+            workspaceID: binding.workspaceID,
+            artifactID: report.reportID,
+            revision: revision.revision,
+            artifactSHA256: revision.digest.sha256,
+            authenticatedLocalSessionID: binding.authenticatedLocalSessionID,
+            appSessionID: binding.appSessionID
+        )
+        do {
+            let updated = try ProductionReadinessPlanningService().reviewReport(
+                report,
+                decision: decision,
+                instructions: instructions,
+                context: context
+            )
+            try ProductionReadinessArtifactStore(
+                storageRoot: environment.sandboxLifecycle.storageRoot
+            ).save(updated)
+            Task { await refresh() }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func reviewAIEvalPlan(
+        _ plan: AIEvalPlan,
+        decision: ProductionReadinessReviewDecisionKind,
+        instructions: String?
+    ) {
+        let eligibility = aiEvalPlanReviewEligibility(plan)
+        guard eligibility.isAvailable, let revision = plan.currentRevision else {
+            lastError = eligibility.unavailableReason
+            return
+        }
+        let binding = plan.sourceBinding.readinessSourceBinding
+        let context = ProductionReadinessReviewContext(
+            missionRunID: binding.missionRunID,
+            workspaceID: binding.workspaceID,
+            artifactID: plan.planID,
+            revision: revision.revision,
+            artifactSHA256: revision.digest.sha256,
+            authenticatedLocalSessionID: binding.authenticatedLocalSessionID,
+            appSessionID: binding.appSessionID
+        )
+        do {
+            let updated = try ProductionReadinessPlanningService().reviewEvalPlan(
+                plan,
+                decision: decision,
+                instructions: instructions,
+                context: context
+            )
+            try ProductionReadinessArtifactStore(
+                storageRoot: environment.sandboxLifecycle.storageRoot
+            ).save(updated)
+            Task { await refresh() }
+        } catch {
+            lastError = error.localizedDescription
+        }
     }
 
     private func exactMissionContinuationAppSessionID(

@@ -9,6 +9,9 @@ struct AgentConversationView: View {
     var candidatePatchAssets: [CandidatePatchActivitySnapshot] = []
     var generatedTestAssets: [GeneratedTestActivitySnapshot] = []
     var generatedTestArtifactAssets: [GeneratedTestArtifact] = []
+    var productionReadinessReports: [ProductionReadinessReport] = []
+    var aiEvalPlans: [AIEvalPlan] = []
+    var productionReadinessRestoreFailure: String? = nil
     let approvals: [ApprovalRequest]
     var showsHeader = true
     let onApprove: (ApprovalRequest) -> Void
@@ -26,6 +29,11 @@ struct AgentConversationView: View {
     var onApproveGeneratedTestArtifact: ((GeneratedTestArtifact) -> Void)? = nil
     var candidatePatchReviewEligibility: ((ApprovalRequest) -> Bool)? = nil
     var generatedTestArtifactReviewEligibility: ((GeneratedTestArtifact) -> GeneratedTestArtifactReviewEligibility)? = nil
+    var onReviewProductionReadiness: ((MissionSummary) -> Void)? = nil
+    var productionReadinessReviewEligibility: ((ProductionReadinessReport) -> ProductionReadinessReviewEligibility)? = nil
+    var aiEvalPlanReviewEligibility: ((AIEvalPlan) -> ProductionReadinessReviewEligibility)? = nil
+    var onReviewReadinessReport: ((ProductionReadinessReport, ProductionReadinessReviewDecisionKind, String?) -> Void)? = nil
+    var onReviewAIEvalPlan: ((AIEvalPlan, ProductionReadinessReviewDecisionKind, String?) -> Void)? = nil
     var missionCleanupStates: [MissionCleanupState] = []
     var onUndoMission: ((MissionSummary) -> Void)? = nil
     var onRetryMissionCleanup: ((MissionSummary) -> Void)? = nil
@@ -53,7 +61,10 @@ struct AgentConversationView: View {
             generatedTestPlans: generatedTestAssets,
             generatedTestArtifacts: generatedTestArtifactAssets,
             approvals: approvals,
-            cleanupStates: missionCleanupStates
+            cleanupStates: missionCleanupStates,
+            productionReadinessReports: productionReadinessReports,
+            aiEvalPlans: aiEvalPlans,
+            phase3ARestorationFailure: productionReadinessRestoreFailure
         )
     }
 
@@ -126,6 +137,11 @@ struct AgentConversationView: View {
                     onRequestGeneratedTestArtifactChanges: onRequestGeneratedTestArtifactChanges,
                     onRejectGeneratedTestArtifact: onRejectGeneratedTestArtifact,
                     onApproveGeneratedTestArtifact: onApproveGeneratedTestArtifact,
+                    onReviewProductionReadiness: onReviewProductionReadiness,
+                    productionReadinessReviewEligibility: productionReadinessReviewEligibility,
+                    aiEvalPlanReviewEligibility: aiEvalPlanReviewEligibility,
+                    onReviewReadinessReport: onReviewReadinessReport,
+                    onReviewAIEvalPlan: onReviewAIEvalPlan,
                     onUndoRun: onUndoMission,
                     onRetryCleanup: onRetryMissionCleanup,
                     onShowWorkDetails: { showsWorkDetails = true }

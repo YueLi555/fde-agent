@@ -66,6 +66,16 @@ enum MissionPrimaryAction: String, Codable, CaseIterable, Hashable, Sendable {
     }
 }
 
+enum MissionPostReadyAction: String, Codable, CaseIterable, Hashable, Sendable {
+    case reviewProductionReadiness
+
+    var label: String {
+        switch self {
+        case .reviewProductionReadiness: "Review production readiness"
+        }
+    }
+}
+
 typealias MissionGeneratedTestReviewAction = (
     _ summary: MissionSummary,
     _ completion: @escaping (GeneratedTestArtifact?) -> Void
@@ -228,6 +238,10 @@ struct MissionSummary: Hashable, Sendable, Identifiable {
     var lineageState: MissionLineageState = .incomplete
     var lineageFailureReason: String? = nil
     var undoEligible: Bool = false
+    var productionReadinessReport: ProductionReadinessReport? = nil
+    var aiEvalPlan: AIEvalPlan? = nil
+    var postReadyAction: MissionPostReadyAction? = nil
+    var phase3APlanningFailureReason: String? = nil
     var exactDetails: [MissionExactDetail]
 
     var id: UUID { missionID }

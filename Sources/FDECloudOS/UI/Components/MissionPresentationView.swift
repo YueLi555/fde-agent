@@ -15,6 +15,11 @@ struct MissionPresentationView: View {
     let onRequestGeneratedTestArtifactChanges: ((GeneratedTestArtifact, String) -> Void)?
     let onRejectGeneratedTestArtifact: ((GeneratedTestArtifact) -> Void)?
     let onApproveGeneratedTestArtifact: ((GeneratedTestArtifact) -> Void)?
+    let onReviewProductionReadiness: ((MissionSummary) -> Void)?
+    let productionReadinessReviewEligibility: ((ProductionReadinessReport) -> ProductionReadinessReviewEligibility)?
+    let aiEvalPlanReviewEligibility: ((AIEvalPlan) -> ProductionReadinessReviewEligibility)?
+    let onReviewReadinessReport: ((ProductionReadinessReport, ProductionReadinessReviewDecisionKind, String?) -> Void)?
+    let onReviewAIEvalPlan: ((AIEvalPlan, ProductionReadinessReviewDecisionKind, String?) -> Void)?
     let onUndoRun: ((MissionSummary) -> Void)?
     let onRetryCleanup: ((MissionSummary) -> Void)?
     let onShowWorkDetails: () -> Void
@@ -23,6 +28,8 @@ struct MissionPresentationView: View {
     @State private var showsFileWorkspace = false
     @State private var showsHistory = false
     @State private var showsAdvancedDetails = false
+    @State private var showsProductionReadinessWorkspace = false
+    @State private var awaitsProductionReadinessWorkspace = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -70,6 +77,35 @@ struct MissionPresentationView: View {
             if let artifact = state.current.generatedTestArtifact {
                 GeneratedTestFileWorkspace(artifact: artifact)
             }
+        }
+        .sheet(isPresented: $showsProductionReadinessWorkspace) {
+            if let report = state.current.productionReadinessReport,
+               let evalPlan = state.current.aiEvalPlan {
+                ProductionReadinessReviewWorkspace(
+                    report: report,
+                    evalPlan: evalPlan,
+                    reportReviewEligibility: productionReadinessReviewEligibility?(report)
+                        ?? .unavailable("The exact Production Readiness Report review authority is unavailable."),
+                    evalPlanReviewEligibility: aiEvalPlanReviewEligibility?(evalPlan)
+                        ?? .unavailable("The exact AI Eval Plan review authority is unavailable."),
+                    onReviewReport: { decision, instructions in
+                        onReviewReadinessReport?(report, decision, instructions)
+                    },
+                    onReviewEvalPlan: { decision, instructions in
+                        onReviewAIEvalPlan?(evalPlan, decision, instructions)
+                    },
+                    onClose: { showsProductionReadinessWorkspace = false }
+                )
+            }
+        }
+        .onChange(of: state.current.productionReadinessReport?.reportID) { _, reportID in
+            guard awaitsProductionReadinessWorkspace,
+                  reportID != nil,
+                  state.current.aiEvalPlan != nil else {
+                return
+            }
+            awaitsProductionReadinessWorkspace = false
+            showsProductionReadinessWorkspace = true
         }
     }
 
@@ -139,6 +175,10 @@ struct MissionPresentationView: View {
                 MissionPartialCleanupView(cleanup: cleanup)
             }
 
+            if state.current.phase == .ready {
+                productionReadinessContinuation
+            }
+
             if let action = state.current.primaryAction {
                 Button {
                     perform(action)
@@ -190,7 +230,61 @@ struct MissionPresentationView: View {
             showsAdvancedDetails = state.advancedDetailsExpandedByDefault
             reviewTarget = nil
             showsFileWorkspace = false
+            showsProductionReadinessWorkspace = false
+            awaitsProductionReadinessWorkspace = false
         }
+    }
+
+    private var productionReadinessContinuation: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Production readiness")
+                .font(.callout.weight(.semibold))
+            if let failure = state.current.phase3APlanningFailureReason {
+                Text("Unavailable — persisted planning artifacts failed validation")
+                    .font(.headline)
+                    .foregroundStyle(.red)
+                Text(failure)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let revision = state.current.productionReadinessReport?.currentRevision {
+                Text(revision.overallResult.rawValue)
+                    .font(.headline)
+                Text("\(revision.blockers.count) blockers · \(revision.unknownCount) unknowns")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("No deployment or production validation occurred.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else {
+                Text("Not evaluated yet")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let action = state.current.postReadyAction {
+                Button(action.label) {
+                    if state.current.productionReadinessReport != nil,
+                       state.current.aiEvalPlan != nil {
+                        showsProductionReadinessWorkspace = true
+                    } else {
+                        awaitsProductionReadinessWorkspace = true
+                        onReviewProductionReadiness?(state.current)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    state.current.productionReadinessReport == nil
+                        && onReviewProductionReadiness == nil
+                )
+                .accessibilityIdentifier("mission.current.productionReadiness.primaryAction")
+            }
+            Text("Eval execution is unavailable in Phase 3A.0. Production rollout remains unavailable.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(10)
+        .background(Color.accentColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("mission.current.productionReadiness")
     }
 
     private var previousRuns: some View {

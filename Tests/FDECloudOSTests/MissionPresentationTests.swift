@@ -227,6 +227,85 @@ final class MissionPresentationTests: XCTestCase {
         XCTAssertEqual(decided.current.phase, .ready)
     }
 
+    func testPhase3AArtifactsRemainChildrenOfExactReadyMissionWithOneCTA() throws {
+        let fixture = Fixture()
+        let patch = fixture.patch(revision: 1, state: .patchReady)
+        let plan = fixture.plan(status: .testPlanReviewReady)
+        let artifact = fixture.artifact(review: .approved)
+        let before = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [patch],
+            plans: [plan],
+            artifacts: [artifact]
+        )
+        XCTAssertEqual(before.current.phase, .ready)
+        XCTAssertEqual(before.current.postReadyAction, .reviewProductionReadiness)
+
+        let phase3A = try fixture.phase3Artifacts(for: artifact)
+        let restored = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [patch],
+            plans: [plan],
+            artifacts: [artifact],
+            readinessReports: [phase3A.report],
+            evalPlans: [phase3A.evalPlan]
+        )
+        XCTAssertEqual(restored.current.missionID, fixture.missionID)
+        XCTAssertEqual(restored.current.productionReadinessReport?.reportID, phase3A.report.reportID)
+        XCTAssertEqual(restored.current.aiEvalPlan?.planID, phase3A.evalPlan.planID)
+        XCTAssertEqual(restored.current.postReadyAction, .reviewProductionReadiness)
+        XCTAssertEqual(restored.previousRuns.count, 0)
+        XCTAssertTrue(restored.current.undoEligible)
+        let undo = try XCTUnwrap(MissionUndoRequest(summary: restored.current, workspaceID: fixture.workspaceID))
+        XCTAssertEqual(undo.missionID, fixture.missionID)
+        XCTAssertEqual(undo.patchID, patch.patchID)
+        XCTAssertEqual(undo.sandboxID, patch.sandboxID)
+    }
+
+    func testApprovedReadyMissionWithoutPhase3PairExposesExactlyOneProductionReadinessCTA() {
+        let fixture = Fixture()
+        let artifact = fixture.artifact(review: .approved)
+        let state = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [fixture.patch(revision: 1, state: .patchReady)],
+            plans: [fixture.plan(status: .testPlanReviewReady)],
+            artifacts: [artifact],
+            readinessReports: [],
+            evalPlans: []
+        )
+
+        XCTAssertEqual(state.current.phase, .ready)
+        XCTAssertEqual(state.current.lineageState, .exact)
+        XCTAssertEqual(
+            artifact.currentRevision.map { artifact.reviewState(for: $0.revision) },
+            .approved
+        )
+        XCTAssertNil(state.current.productionReadinessReport)
+        XCTAssertNil(state.current.aiEvalPlan)
+        XCTAssertEqual(
+            [state.current.primaryAction?.label, state.current.postReadyAction?.label]
+                .compactMap { $0 },
+            ["Review production readiness"]
+        )
+        XCTAssertTrue(state.current.undoEligible)
+        XCTAssertEqual(state.previousRuns.count, 0)
+    }
+
+    func testPhase3ARestorationFailureSuppressesReviewWithoutChangingExactUndoAuthority() {
+        let fixture = Fixture()
+        let state = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [fixture.patch(revision: 1, state: .patchReady)],
+            plans: [fixture.plan(status: .testPlanReviewReady)],
+            artifacts: [fixture.artifact(review: .approved)],
+            phase3ARestorationFailure: "Persisted artifact digest mismatch"
+        )
+        XCTAssertEqual(state.current.lineageState, .exact)
+        XCTAssertTrue(state.current.undoEligible)
+        XCTAssertNil(state.current.postReadyAction)
+        XCTAssertNotNil(state.current.phase3APlanningFailureReason)
+    }
+
     func testAdvancedDetailsKeepFullExactValuesOutOfDefaultSummary() throws {
         let fixture = Fixture()
         let patch = fixture.patch(revision: 1, state: .patchReady)
@@ -930,6 +1009,45 @@ private struct Fixture {
         )
     }
 
+    func phase3Artifacts(for artifact: GeneratedTestArtifact) throws -> ProductionReadinessArtifacts {
+        let source = artifact.sourceBinding.generatedTestSourceBinding
+        let revision = try XCTUnwrap(artifact.currentRevision)
+        var binding = ProductionReadinessSourceBinding(
+            missionRunID: source.sourceCandidatePatchTaskID,
+            workspaceID: source.workspaceID,
+            canonicalLegacyRoot: source.canonicalLegacyRoot,
+            sourceSnapshotID: source.sourceSnapshotID,
+            assessmentID: source.validatedAssessmentID,
+            assessmentSHA256: String(repeating: "3", count: 64),
+            sourceCandidatePatchTaskID: source.sourceCandidatePatchTaskID,
+            candidatePatchID: source.patchID,
+            candidatePatchPlanID: source.candidatePatchPlanID,
+            candidatePatchPlanRevision: source.candidatePatchPlanRevision,
+            candidatePatchManifestID: source.candidatePatchManifestID,
+            candidatePatchArtifactSHA256: source.candidatePatchArtifactSHA256,
+            candidatePatchApprovalProvenanceSHA256: source.candidatePatchApprovalProvenanceSHA256,
+            candidatePatchReviewOutcome: CandidatePatchApprovalDecision.approve.rawValue,
+            sandboxID: source.sandboxID,
+            sandboxLifecycle: CandidatePatchStatus.reviewReady.rawValue,
+            generatedTestPlanningTaskID: source.generatedTestPlanningTaskID,
+            generatedTestPlanID: artifact.sourceBinding.generatedTestPlanID,
+            generatedTestPlanRevision: artifact.sourceBinding.generatedTestPlanRevision,
+            generatedTestPlanSHA256: artifact.sourceBinding.generatedTestPlanSHA256,
+            generatedTestArtifactID: artifact.artifactID,
+            generatedTestArtifactRevision: revision.revision,
+            generatedTestArtifactSHA256: revision.digest.sha256,
+            generatedTestArtifactReviewOutcome: GeneratedTestReviewDecisionKind.approve.rawValue,
+            cleanupStatus: nil,
+            normalizedCapabilityID: source.normalizedCapabilityID,
+            capabilityDisplayLabel: source.capabilityDisplayLabel ?? source.normalizedCapabilityID,
+            authenticatedLocalSessionID: source.authenticatedLocalSessionID,
+            appSessionID: source.appSessionID,
+            sourceBindingSHA256: ""
+        )
+        binding.sourceBindingSHA256 = binding.canonicalDigest
+        return try ProductionReadinessPlanningService().generate(sourceBinding: binding)
+    }
+
     func cleanup(phase: MissionCleanupPhase) -> MissionCleanupState {
         MissionCleanupState(
             missionID: missionID,
@@ -958,7 +1076,10 @@ private struct Fixture {
         plans: [GeneratedTestActivitySnapshot] = [],
         artifacts: [GeneratedTestArtifact] = [],
         approvals: [ApprovalRequest] = [],
-        cleanup: [MissionCleanupState] = []
+        cleanup: [MissionCleanupState] = [],
+        readinessReports: [ProductionReadinessReport] = [],
+        evalPlans: [AIEvalPlan] = [],
+        phase3ARestorationFailure: String? = nil
     ) -> MissionPresentationState {
         MissionPresentationProjector.project(
             session: session,
@@ -967,7 +1088,10 @@ private struct Fixture {
             generatedTestPlans: plans,
             generatedTestArtifacts: artifacts,
             approvals: approvals,
-            cleanupStates: cleanup
+            cleanupStates: cleanup,
+            productionReadinessReports: readinessReports,
+            aiEvalPlans: evalPlans,
+            phase3ARestorationFailure: phase3ARestorationFailure
         )
     }
 }
