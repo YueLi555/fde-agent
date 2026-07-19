@@ -23,7 +23,7 @@ final class AgentConversationActivityTests: XCTestCase {
         XCTAssertFalse(session.conversation.messages.contains { $0.content == "Thinking…" })
     }
 
-    func testNormalChatProviderFailureReturnsFailedLifecycleWithoutPersistingPlaceholder() async throws {
+    func testNormalChatProviderFailureReturnsFailedLifecycleWithOneCanonicalReply() async throws {
         let workspace = Workspace.default()
         var session = AgentSession(workspace: workspace, userGoal: "Are you there?")
         let runtime = ActivityTestRuntime()
@@ -37,8 +37,10 @@ final class AgentConversationActivityTests: XCTestCase {
         )
 
         XCTAssertEqual(result.normalChatLifecycle, .failed)
-        XCTAssertEqual(session.conversation.messages.count, 1)
+        XCTAssertEqual(session.conversation.messages.count, 2)
         XCTAssertEqual(session.conversation.messages.first?.sender, .user)
+        XCTAssertEqual(session.conversation.messages.last?.sender, .agent)
+        XCTAssertEqual(session.conversation.messages.last?.content, "Unable to reach the configured AI provider.")
         XCTAssertEqual(result.recordedEvents.last?.payload["chat_lifecycle"], NormalChatLifecycle.failed.rawValue)
     }
 
@@ -264,6 +266,7 @@ final class AgentConversationActivityTests: XCTestCase {
         let workspaceID = UUID()
         let taskID = UUID()
         var session = AgentSession(workspaceID: workspaceID, userGoal: "Inspect")
+        session.workspaceContext.runtimeTaskID = taskID
         let partial = event(.stateUpdated, 1, workspaceID, taskID, payload: [
             "state": TaskState.blocked.rawValue,
             "partial_completion_state": "BLOCKED_WITH_PARTIAL_RESULT",

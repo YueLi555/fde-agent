@@ -478,6 +478,79 @@ final class AgentWorkspaceConsolidationTests: XCTestCase {
         XCTAssertFalse(method.contains("runtimeCoordinator"))
     }
 
+    func testInspectorUsesMissionScopeAndTruthfulCasualEmptyStates() throws {
+        let source = try workspaceConsolidationSource()
+
+        XCTAssertTrue(source.contains("store.selectedConversationScope?.hasLinkedMission != true"))
+        XCTAssertTrue(source.contains("ContentUnavailableView(\"No artifacts yet\""))
+        XCTAssertTrue(source.contains("ContentUnavailableView(\"No evidence yet\""))
+        XCTAssertTrue(source.contains("ContentUnavailableView(\"No activity yet\""))
+        XCTAssertTrue(source.contains("if let summary = store.selectedMissionPresentation?.current"))
+        XCTAssertTrue(source.contains("store.selectedAgentSessionEvents"))
+    }
+
+    func testSidebarAndHeaderUseSharedSelectedConversationStatusProjection() throws {
+        let repositoryRoot = try repositoryRoot()
+        let appStore = try source(
+            at: "Sources/FDECloudOS/App/AppStore.swift",
+            repositoryRoot: repositoryRoot
+        )
+        let sidebar = try source(
+            at: "Sources/FDECloudOS/UI/Screens/SidebarView.swift",
+            repositoryRoot: repositoryRoot
+        )
+        let workspace = try source(
+            at: "Sources/FDECloudOS/UI/Components/AgentWorkspaceView.swift",
+            repositoryRoot: repositoryRoot
+        )
+
+        XCTAssertTrue(appStore.contains("var selectedConversationStatus: AgentInteractionState?"))
+        XCTAssertTrue(appStore.contains("func conversationStatus(for sessionID: UUID)"))
+        XCTAssertTrue(sidebar.contains("store.conversationStatus(for: session.sessionID)"))
+        XCTAssertTrue(workspace.contains("store.selectedConversationStatus ?? .idle"))
+        XCTAssertFalse(sidebar.contains("session.currentState.sidebarTitle"))
+    }
+
+    func testAsyncCoordinatorResultsUseOriginatingSessionBinding() throws {
+        let appStore = try source(
+            at: "Sources/FDECloudOS/App/AppStore.swift",
+            repositoryRoot: try repositoryRoot()
+        )
+
+        XCTAssertTrue(appStore.contains("AgentSessionAsyncBinding.commit"))
+        XCTAssertTrue(appStore.contains("let originatingSession = agentSessions[index]"))
+        XCTAssertTrue(appStore.contains("if self.selectedAgentSessionID == sessionID"))
+        XCTAssertFalse(appStore.contains("selectedAgentSessionID = agentSessions[index].sessionID"))
+    }
+
+    func testTaskAndEventBindingRequireExactSessionAndWorkspace() throws {
+        let appStore = try source(
+            at: "Sources/FDECloudOS/App/AppStore.swift",
+            repositoryRoot: try repositoryRoot()
+        )
+
+        XCTAssertTrue(appStore.contains("session.sessionID == sessionID && session.workspaceID == task.workspaceID"))
+        XCTAssertFalse(appStore.contains("session.sessionID == sessionID || session.runtimeTaskID == task.id"))
+        XCTAssertTrue(appStore.contains("$0.runtimeTaskID == taskID && $0.workspaceID == event.workspaceID"))
+        XCTAssertTrue(appStore.contains("$0.runtimeTaskID == parentMissionRunID && $0.workspaceID == event.workspaceID"))
+    }
+
+    func testHumanActionSubmissionRevalidatesExactSelectedConversation() throws {
+        let repositoryRoot = try repositoryRoot()
+        let appStore = try source(
+            at: "Sources/FDECloudOS/App/AppStore.swift",
+            repositoryRoot: repositoryRoot
+        )
+        let actionBar = try workspaceConsolidationSource()
+
+        XCTAssertTrue(actionBar.contains("actionIsStillBoundToSelectedConversation(action)"))
+        XCTAssertTrue(actionBar.contains("store.isApprovalBoundToSelectedConversation(approval)"))
+        XCTAssertTrue(actionBar.contains("store.isMissionSummaryBoundToSelectedConversation(summary)"))
+        XCTAssertTrue(appStore.contains("AgentSessionAuthorityEvaluator.approvalIsBound"))
+        XCTAssertTrue(appStore.contains("AgentSessionAuthorityEvaluator.missionIsBound"))
+        XCTAssertTrue(appStore.contains("current.missionID == confirmation.request.missionID"))
+    }
+
     private func action(id: String, domain: HumanActionDomain) -> HumanActionDescriptor {
         HumanActionDescriptor(
             id: id,

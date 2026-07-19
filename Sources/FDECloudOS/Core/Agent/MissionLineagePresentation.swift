@@ -4,6 +4,22 @@ import Foundation
 /// selected independently: every child must join through its authoritative
 /// parent chain before it can appear in an actionable Current Run.
 enum MissionPresentationProjector {
+    static func selectedMissionRunID(
+        for session: AgentSession,
+        candidatePatches: [CandidatePatchActivitySnapshot],
+        generatedTestPlans: [GeneratedTestActivitySnapshot],
+        generatedTestArtifacts: [GeneratedTestArtifact]
+    ) -> UUID? {
+        guard let runtimeTaskID = session.runtimeTaskID else { return nil }
+        return exactMissionRunID(
+            for: runtimeTaskID,
+            workspaceID: session.workspaceID,
+            candidatePatches: candidatePatches,
+            generatedTestPlans: generatedTestPlans,
+            generatedTestArtifacts: generatedTestArtifacts
+        ) ?? runtimeTaskID
+    }
+
     static func project(
         session: AgentSession,
         activity: AgentConversationActivity?,
@@ -21,10 +37,10 @@ enum MissionPresentationProjector {
         controlledEvalExecutionAuthorizations: [ControlledEvalExecutionAuthorization] = [],
         controlledEvalResultReviewAuthorizations: [ControlledEvalResultReviewAuthorization] = []
     ) -> MissionPresentationState {
+        let sessionScope = AgentSessionMissionScope(session: session)
         let selectedTaskID = session.runtimeTaskID ?? session.sessionID
-        let baseMissionID = exactMissionRunID(
-            for: selectedTaskID,
-            workspaceID: session.workspaceID,
+        let baseMissionID = selectedMissionRunID(
+            for: session,
             candidatePatches: candidatePatches,
             generatedTestPlans: generatedTestPlans,
             generatedTestArtifacts: generatedTestArtifacts
@@ -39,9 +55,9 @@ enum MissionPresentationProjector {
 
         for (index, patch) in candidatePatches.enumerated() {
             guard let missionID = patch.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)) else {
-                aggregates[baseMissionID]?.unscopedAuthority.append("Candidate Patch")
                 continue
             }
+            guard sessionScope.containsMissionTask(missionID) else { continue }
             var aggregate = aggregates[missionID] ?? MissionAggregate(
                 missionID: missionID,
                 workspaceID: session.workspaceID,
@@ -54,9 +70,9 @@ enum MissionPresentationProjector {
 
         for (index, plan) in generatedTestPlans.enumerated() {
             guard let missionID = plan.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)) else {
-                aggregates[baseMissionID]?.unscopedAuthority.append("Generated Test Plan")
                 continue
             }
+            guard sessionScope.containsMissionTask(missionID) else { continue }
             var aggregate = aggregates[missionID] ?? MissionAggregate(
                 missionID: missionID,
                 workspaceID: session.workspaceID,
@@ -70,6 +86,7 @@ enum MissionPresentationProjector {
         for (index, artifact) in generatedTestArtifacts.enumerated() {
             let binding = artifact.sourceBinding.generatedTestSourceBinding
             let missionID = binding.sourceCandidatePatchTaskID
+            guard sessionScope.containsMissionTask(missionID) else { continue }
             var aggregate = aggregates[missionID] ?? MissionAggregate(
                 missionID: missionID,
                 workspaceID: session.workspaceID,
@@ -86,9 +103,9 @@ enum MissionPresentationProjector {
 
         for approval in approvals where approval.targetKind == .candidatePatchPlan {
             guard let missionID = approval.taskID else {
-                aggregates[baseMissionID]?.unscopedAuthority.append("Candidate Patch review")
                 continue
             }
+            guard sessionScope.containsMissionTask(missionID) else { continue }
             var aggregate = aggregates[missionID] ?? MissionAggregate(
                 missionID: missionID,
                 workspaceID: session.workspaceID,
@@ -100,6 +117,7 @@ enum MissionPresentationProjector {
         }
 
         for cleanup in cleanupStates {
+            guard sessionScope.containsMissionTask(cleanup.missionID) else { continue }
             var aggregate = aggregates[cleanup.missionID] ?? MissionAggregate(
                 missionID: cleanup.missionID,
                 workspaceID: session.workspaceID,
@@ -110,7 +128,9 @@ enum MissionPresentationProjector {
             aggregates[cleanup.missionID] = aggregate
         }
 
-        let activityTaskID = activity?.metadata.taskID
+        let activityTaskID = activity?.metadata.taskID.flatMap { taskID in
+            sessionScope.containsMissionTask(taskID) ? taskID : nil
+        }
         let activityMissionID = activityTaskID.flatMap {
             exactMissionRunID(
                 for: $0,
@@ -139,22 +159,8 @@ enum MissionPresentationProjector {
                 taskRank: taskOrder[$0.missionID] ?? -1
             )
         }
-        let authoritativeNonterminal = resolved.filter {
-            $0.summary.lineageState == .exact && !$0.summary.isTerminal
-        }
-        let authoritativeCompleted = resolved.filter {
-            $0.summary.lineageState == .exact && $0.summary.isTerminal
-        }
-        let selectionPool: [ResolvedMission]
-        if !authoritativeNonterminal.isEmpty {
-            selectionPool = authoritativeNonterminal
-        } else if !authoritativeCompleted.isEmpty {
-            selectionPool = authoritativeCompleted
-        } else {
-            selectionPool = resolved
-        }
-        let selectedMissionPool = selectionPool.filter { $0.summary.missionID == baseMissionID }
-        let currentResolved = (selectedMissionPool.isEmpty ? selectionPool : selectedMissionPool)
+        let selectedMissionPool = resolved.filter { $0.summary.missionID == baseMissionID }
+        let currentResolved = selectedMissionPool
             .max(by: isOlder)
             ?? resolve(
                 aggregate: MissionAggregate(
@@ -391,7 +397,9 @@ private extension MissionPresentationProjector {
             lineage: lineage.identity,
             lineageState: lineage.state,
             lineageFailureReason: lineage.reason,
-            undoEligible: undoEligible(lineage),
+            undoEligible: aggregate.isSelectedSessionMission
+                && session.runtimeTaskID != nil
+                && undoEligible(lineage),
             exactDetails: exactDetails
         )
         return ResolvedMission(
