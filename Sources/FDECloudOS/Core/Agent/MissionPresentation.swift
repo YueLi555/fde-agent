@@ -76,6 +76,28 @@ enum MissionPostReadyAction: String, Codable, CaseIterable, Hashable, Sendable {
     }
 }
 
+enum MissionControlledEvalAction: String, Codable, CaseIterable, Hashable, Sendable {
+    case reviewControlledEvalExecution
+    case reauthorizeControlledEvalExecution
+    case viewControlledEvalBlocker
+    case reviewEvalResults
+    case authorizeEvalResultReview
+    case reauthorizeEvalResultReview
+    case viewEvalResults
+
+    var label: String {
+        switch self {
+        case .reviewControlledEvalExecution: "Review controlled eval execution"
+        case .reauthorizeControlledEvalExecution: "Reauthorize controlled eval execution"
+        case .viewControlledEvalBlocker: "View blocker"
+        case .reviewEvalResults: "Review eval results"
+        case .authorizeEvalResultReview: "Authorize eval result review"
+        case .reauthorizeEvalResultReview: "Reauthorize eval result review"
+        case .viewEvalResults: "View eval results"
+        }
+    }
+}
+
 typealias MissionGeneratedTestReviewAction = (
     _ summary: MissionSummary,
     _ completion: @escaping (GeneratedTestArtifact?) -> Void
@@ -242,6 +264,11 @@ struct MissionSummary: Hashable, Sendable, Identifiable {
     var aiEvalPlan: AIEvalPlan? = nil
     var postReadyAction: MissionPostReadyAction? = nil
     var phase3APlanningFailureReason: String? = nil
+    var evalRun: EvalRun? = nil
+    var controlledEvalAction: MissionControlledEvalAction? = nil
+    var controlledEvalEligibility: ControlledEvalExecutionEligibility? = nil
+    var controlledEvalResultReviewEligibility: ControlledEvalResultReviewEligibility? = nil
+    var controlledEvalRestorationFailureReason: String? = nil
     var exactDetails: [MissionExactDetail]
 
     var id: UUID { missionID }

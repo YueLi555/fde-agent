@@ -20,6 +20,13 @@ struct MissionPresentationView: View {
     let aiEvalPlanReviewEligibility: ((AIEvalPlan) -> ProductionReadinessReviewEligibility)?
     let onReviewReadinessReport: ((ProductionReadinessReport, ProductionReadinessReviewDecisionKind, String?) -> Void)?
     let onReviewAIEvalPlan: ((AIEvalPlan, ProductionReadinessReviewDecisionKind, String?) -> Void)?
+    let onPrepareControlledEvalExecution: ((MissionSummary) -> Void)?
+    let controlledEvalExecutionReviewEligibility: ((EvalRun) -> ProductionReadinessReviewEligibility)?
+    let onConfirmControlledEvalExecution: ((EvalRun) -> Void)?
+    let onConfirmAuthorizedControlledEvalExecution: ((MissionSummary) -> Void)?
+    let onPrepareControlledEvalResultReview: ((MissionSummary) -> Void)?
+    let evalResultsReviewEligibility: ((EvalRun) -> ProductionReadinessReviewEligibility)?
+    let onReviewEvalResults: ((EvalRun, EvalRunReviewDecisionKind, String?) -> Void)?
     let onUndoRun: ((MissionSummary) -> Void)?
     let onRetryCleanup: ((MissionSummary) -> Void)?
     let onShowWorkDetails: () -> Void
@@ -30,6 +37,11 @@ struct MissionPresentationView: View {
     @State private var showsAdvancedDetails = false
     @State private var showsProductionReadinessWorkspace = false
     @State private var awaitsProductionReadinessWorkspace = false
+    @State private var showsControlledEvalExecutionWorkspace = false
+    @State private var showsControlledEvalAuthorizationWorkspace = false
+    @State private var showsControlledEvalBlockerWorkspace = false
+    @State private var showsEvalResultsWorkspace = false
+    @State private var showsEvalResultAuthorizationWorkspace = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -95,6 +107,90 @@ struct MissionPresentationView: View {
                         onReviewAIEvalPlan?(evalPlan, decision, instructions)
                     },
                     onClose: { showsProductionReadinessWorkspace = false }
+                )
+            }
+        }
+        .sheet(isPresented: $showsControlledEvalExecutionWorkspace) {
+            if let run = state.current.evalRun {
+                ControlledEvalExecutionReviewWorkspace(
+                    run: run,
+                    reviewEligibility: controlledEvalExecutionReviewEligibility?(run)
+                        ?? .unavailable("The exact controlled Eval Run execution authority is unavailable."),
+                    onConfirm: {
+                        showsControlledEvalExecutionWorkspace = false
+                        onConfirmControlledEvalExecution?(run)
+                    },
+                    onClose: { showsControlledEvalExecutionWorkspace = false }
+                )
+            } else if let eligibility = state.current.controlledEvalEligibility,
+                      eligibility.state == .finalExecutionReview,
+                      let proposal = eligibility.proposal,
+                      let authorization = eligibility.authorization {
+                ControlledEvalAuthorizedExecutionReviewWorkspace(
+                    proposal: proposal,
+                    authorization: authorization,
+                    onConfirm: {
+                        showsControlledEvalExecutionWorkspace = false
+                        onConfirmAuthorizedControlledEvalExecution?(state.current)
+                    },
+                    onClose: { showsControlledEvalExecutionWorkspace = false }
+                )
+            }
+        }
+        .sheet(isPresented: $showsControlledEvalAuthorizationWorkspace) {
+            if let eligibility = state.current.controlledEvalEligibility,
+               let proposal = eligibility.proposal,
+               eligibility.state == .currentAuthorizationReview
+                    || eligibility.state == .reauthorizationReview {
+                ControlledEvalAuthorizationWorkspace(
+                    proposal: proposal,
+                    isReauthorization: eligibility.state == .reauthorizationReview,
+                    onConfirm: {
+                        showsControlledEvalAuthorizationWorkspace = false
+                        onPrepareControlledEvalExecution?(state.current)
+                    },
+                    onClose: { showsControlledEvalAuthorizationWorkspace = false }
+                )
+            }
+        }
+        .sheet(isPresented: $showsControlledEvalBlockerWorkspace) {
+            ControlledEvalBlockerWorkspace(
+                reason: state.current.controlledEvalResultReviewEligibility?.blockerReason
+                    ?? state.current.controlledEvalEligibility?.blockerReason
+                    ?? state.current.controlledEvalRestorationFailureReason
+                    ?? state.current.lineageFailureReason
+                    ?? "The exact controlled Eval authority is unavailable.",
+                onClose: { showsControlledEvalBlockerWorkspace = false }
+            )
+        }
+        .sheet(isPresented: $showsEvalResultAuthorizationWorkspace) {
+            if let run = state.current.evalRun,
+               let eligibility = state.current.controlledEvalResultReviewEligibility,
+               let proposal = eligibility.proposal,
+               eligibility.state == .currentAuthorizationReview
+                    || eligibility.state == .reauthorizationReview {
+                ControlledEvalResultReviewAuthorizationWorkspace(
+                    run: run,
+                    proposal: proposal,
+                    isReauthorization: eligibility.state == .reauthorizationReview,
+                    onConfirm: {
+                        showsEvalResultAuthorizationWorkspace = false
+                        onPrepareControlledEvalResultReview?(state.current)
+                    },
+                    onClose: { showsEvalResultAuthorizationWorkspace = false }
+                )
+            }
+        }
+        .sheet(isPresented: $showsEvalResultsWorkspace) {
+            if let run = state.current.evalRun {
+                EvalResultsWorkspace(
+                    run: run,
+                    reviewEligibility: evalResultsReviewEligibility?(run)
+                        ?? .unavailable("The exact Eval Results review authority is unavailable."),
+                    onReview: { decision, instructions in
+                        onReviewEvalResults?(run, decision, instructions)
+                    },
+                    onClose: { showsEvalResultsWorkspace = false }
                 )
             }
         }
@@ -177,6 +273,7 @@ struct MissionPresentationView: View {
 
             if state.current.phase == .ready {
                 productionReadinessContinuation
+                controlledEvalContinuation
             }
 
             if let action = state.current.primaryAction {
@@ -232,6 +329,9 @@ struct MissionPresentationView: View {
             showsFileWorkspace = false
             showsProductionReadinessWorkspace = false
             awaitsProductionReadinessWorkspace = false
+            showsControlledEvalExecutionWorkspace = false
+            showsEvalResultsWorkspace = false
+            showsEvalResultAuthorizationWorkspace = false
         }
     }
 
@@ -285,6 +385,130 @@ struct MissionPresentationView: View {
         .background(Color.accentColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("mission.current.productionReadiness")
+    }
+
+    @ViewBuilder
+    private var controlledEvalContinuation: some View {
+        if state.current.controlledEvalAction != nil
+            || state.current.evalRun != nil
+            || state.current.controlledEvalRestorationFailureReason != nil {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Controlled AI eval")
+                    .font(.callout.weight(.semibold))
+                if let failure = state.current.controlledEvalRestorationFailureReason {
+                    Text("Unavailable — persisted Eval Run artifacts failed validation")
+                        .font(.headline)
+                        .foregroundStyle(.red)
+                    Text(failure)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if let run = state.current.evalRun,
+                          let revision = run.currentRevision {
+                    Text((run.currentState ?? revision.state).displayName)
+                        .font(.headline)
+                    Text("Result: \(revision.overallResult.rawValue) · Attempt \(revision.attempt)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(controlledEvalStatusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let action = state.current.controlledEvalAction {
+                    Button(action.label) {
+                        switch action {
+                        case .reviewControlledEvalExecution:
+                            if state.current.evalRun != nil {
+                                showsControlledEvalExecutionWorkspace = true
+                            } else if state.current.controlledEvalEligibility?.state == .finalExecutionReview {
+                                showsControlledEvalExecutionWorkspace = true
+                            } else {
+                                showsControlledEvalAuthorizationWorkspace = true
+                            }
+                        case .reauthorizeControlledEvalExecution:
+                            showsControlledEvalAuthorizationWorkspace = true
+                        case .viewControlledEvalBlocker:
+                            showsControlledEvalBlockerWorkspace = true
+                        case .reviewEvalResults:
+                            showsEvalResultsWorkspace = true
+                        case .authorizeEvalResultReview:
+                            showsEvalResultAuthorizationWorkspace = true
+                        case .reauthorizeEvalResultReview:
+                            showsEvalResultAuthorizationWorkspace = true
+                        case .viewEvalResults:
+                            showsEvalResultsWorkspace = true
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(
+                        controlledEvalActionIsUnavailable(action)
+                    )
+                    .accessibilityIdentifier(
+                        [.reviewEvalResults, .authorizeEvalResultReview, .reauthorizeEvalResultReview, .viewEvalResults].contains(action)
+                            ? "mission.current.evalResults.primaryAction"
+                            : "mission.current.controlledEval.primaryAction"
+                    )
+                }
+                Text("Eval PASS is bounded evidence only. It is not production approval or deployment authorization.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                Text("Phase 3B Controlled Rollout and production deployment remain unavailable.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(10)
+            .background(Color.purple.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("mission.current.controlledEval")
+        }
+    }
+
+    private var controlledEvalStatusText: String {
+        if let eligibility = state.current.controlledEvalResultReviewEligibility {
+            return switch eligibility.state {
+            case .currentAuthorizationReview:
+                "The exact result is ready for current-session review authorization."
+            case .reauthorizationReview:
+                "The exact immutable result from a prior app session requires result-review reauthorization."
+            case .finalDecisionReview:
+                "A current single-use result-review authorization is ready for final review."
+            case .finalizedReadOnly:
+                "The exact Eval Result has a final immutable review decision."
+            case .blocker:
+                "Result review is blocked because exact authority validation failed closed."
+            }
+        }
+        return switch state.current.controlledEvalEligibility?.state {
+        case .reauthorizationReview:
+            "Exact approved artifacts from a prior app session require explicit reauthorization."
+        case .finalExecutionReview:
+            "A current single-use authorization is ready for final execution review."
+        case .blocker:
+            "Execution is blocked because exact authority validation failed closed."
+        case .currentAuthorizationReview, .none:
+            "Approved plans are ready for an exact bounded authorization review."
+        }
+    }
+
+    private func controlledEvalActionIsUnavailable(_ action: MissionControlledEvalAction) -> Bool {
+        switch action {
+        case .reviewControlledEvalExecution:
+            if state.current.evalRun != nil {
+                return onConfirmControlledEvalExecution == nil
+            }
+            if state.current.controlledEvalEligibility?.state == .finalExecutionReview {
+                return onConfirmAuthorizedControlledEvalExecution == nil
+            }
+            return onPrepareControlledEvalExecution == nil
+        case .reauthorizeControlledEvalExecution:
+            return onPrepareControlledEvalExecution == nil
+        case .reviewEvalResults:
+            return false
+        case .authorizeEvalResultReview, .reauthorizeEvalResultReview:
+            return onPrepareControlledEvalResultReview == nil
+        case .viewControlledEvalBlocker, .viewEvalResults:
+            return false
+        }
     }
 
     private var previousRuns: some View {

@@ -14,7 +14,12 @@ enum MissionPresentationProjector {
         cleanupStates: [MissionCleanupState] = [],
         productionReadinessReports: [ProductionReadinessReport] = [],
         aiEvalPlans: [AIEvalPlan] = [],
-        phase3ARestorationFailure: String? = nil
+        phase3ARestorationFailure: String? = nil,
+        evalRuns: [EvalRun] = [],
+        controlledEvalRestorationFailure: String? = nil,
+        controlledEvalSessionAuthority: ControlledEvalSessionAuthority? = nil,
+        controlledEvalExecutionAuthorizations: [ControlledEvalExecutionAuthorization] = [],
+        controlledEvalResultReviewAuthorizations: [ControlledEvalResultReviewAuthorization] = []
     ) -> MissionPresentationState {
         let selectedTaskID = session.runtimeTaskID ?? session.sessionID
         let baseMissionID = exactMissionRunID(
@@ -161,11 +166,19 @@ enum MissionPresentationProjector {
                 taskRank: taskOrder[baseMissionID] ?? 0
             )
 
-        let currentSummary = attachPhase3AArtifacts(
+        let phase3ACurrentSummary = attachPhase3AArtifacts(
             to: currentResolved.summary,
             reports: productionReadinessReports,
             evalPlans: aiEvalPlans,
             restorationFailure: phase3ARestorationFailure
+        )
+        let currentSummary = attachControlledEvalArtifacts(
+            to: phase3ACurrentSummary,
+            evalRuns: evalRuns,
+            restorationFailure: controlledEvalRestorationFailure,
+            sessionAuthority: controlledEvalSessionAuthority,
+            authorizations: controlledEvalExecutionAuthorizations,
+            resultReviewAuthorizations: controlledEvalResultReviewAuthorizations
         )
         let previousRuns = resolved
             .filter { $0.summary.missionID != currentResolved.summary.missionID }
@@ -173,10 +186,17 @@ enum MissionPresentationProjector {
             .map { mission in
                 historyEntry(
                     mission,
-                    summary: attachPhase3AArtifacts(
-                        to: mission.summary,
-                        reports: productionReadinessReports,
-                        evalPlans: aiEvalPlans,
+                    summary: attachControlledEvalArtifacts(
+                        to: attachPhase3AArtifacts(
+                            to: mission.summary,
+                            reports: productionReadinessReports,
+                            evalPlans: aiEvalPlans,
+                            exposesActions: false
+                        ),
+                        evalRuns: evalRuns,
+                        sessionAuthority: controlledEvalSessionAuthority,
+                        authorizations: controlledEvalExecutionAuthorizations,
+                        resultReviewAuthorizations: controlledEvalResultReviewAuthorizations,
                         exposesActions: false
                     )
                 )
@@ -862,6 +882,11 @@ private extension MissionPresentationProjector {
             updated.lineageFailureReason = "Production Readiness or AI Eval artifacts contradict the exact Mission Run authority."
             updated.primaryAction = nil
             updated.postReadyAction = nil
+            if exposesActions {
+                let reason = "Production Readiness or AI Eval artifacts contradict the exact Mission Run authority."
+                updated.controlledEvalEligibility = ControlledEvalExecutionEligibilityEvaluator.blocker(reason)
+                updated.controlledEvalAction = .viewControlledEvalBlocker
+            }
             updated.undoEligible = false
             updated.result = "Conflicting Phase 3A planning authority was isolated. This run failed closed."
             return updated
@@ -886,6 +911,158 @@ private extension MissionPresentationProjector {
                 MissionExactDetail(label: "AI Eval Plan SHA-256", value: revision.digest.sha256),
                 MissionExactDetail(label: "AI Eval source binding SHA-256", value: plan.sourceBinding.sourceBindingSHA256)
             ]
+        }
+        return updated
+    }
+
+    static func attachControlledEvalArtifacts(
+        to summary: MissionSummary,
+        evalRuns: [EvalRun],
+        restorationFailure: String? = nil,
+        sessionAuthority: ControlledEvalSessionAuthority? = nil,
+        authorizations: [ControlledEvalExecutionAuthorization] = [],
+        resultReviewAuthorizations: [ControlledEvalResultReviewAuthorization] = [],
+        exposesActions: Bool = true
+    ) -> MissionSummary {
+        var updated = summary
+        if exposesActions, let restorationFailure {
+            updated.controlledEvalRestorationFailureReason = restorationFailure
+            updated.postReadyAction = nil
+            updated.controlledEvalEligibility = ControlledEvalExecutionEligibilityEvaluator.blocker(restorationFailure)
+            updated.controlledEvalResultReviewEligibility = ControlledEvalResultReviewEligibilityEvaluator.blocker(restorationFailure)
+            updated.controlledEvalAction = .viewControlledEvalBlocker
+            updated.result = "Persisted controlled Eval Run artifacts could not be restored. This run failed closed."
+            return updated
+        }
+        guard let report = summary.productionReadinessReport,
+              let reportRevision = report.currentRevision,
+              let plan = summary.aiEvalPlan,
+              let planRevision = plan.currentRevision else {
+            return updated
+        }
+        let reportApproved = report.reviewDecision(for: reportRevision.revision)?.decision == .approvePlan
+        let planApproved = plan.reviewDecision(for: planRevision.revision)?.decision == .approvePlan
+        let missionRuns = evalRuns.filter {
+            $0.request.authority.missionRunID == summary.missionID
+                && $0.request.authority.workspaceID == summary.lineage?.workspaceID
+        }
+        guard missionRuns.count <= 1 else {
+            updated.lineageState = .contradictory
+            updated.lineageFailureReason = "Multiple controlled Eval Runs claim the same exact Mission Run authority."
+            updated.primaryAction = nil
+            updated.postReadyAction = nil
+            if exposesActions {
+                let reason = "Multiple controlled Eval Runs claim the same exact Mission Run authority."
+                updated.controlledEvalEligibility = ControlledEvalExecutionEligibilityEvaluator.blocker(reason)
+                updated.controlledEvalResultReviewEligibility = ControlledEvalResultReviewEligibilityEvaluator.blocker(reason)
+                updated.controlledEvalAction = .viewControlledEvalBlocker
+            }
+            updated.undoEligible = false
+            updated.result = "Conflicting Eval Run authority was isolated. This run failed closed."
+            return updated
+        }
+        guard let run = missionRuns.first else {
+            if exposesActions,
+               reportApproved,
+               planApproved,
+               summary.phase == .ready,
+               summary.cleanup?.freezesMissionActions != true {
+                updated.postReadyAction = nil
+                let eligibility = ControlledEvalExecutionEligibilityEvaluator.evaluate(
+                    report: report,
+                    evalPlan: plan,
+                    context: sessionAuthority?.context(missionRunID: summary.missionID),
+                    authorizations: authorizations
+                )
+                updated.controlledEvalEligibility = eligibility
+                switch eligibility.state {
+                case .currentAuthorizationReview, .finalExecutionReview:
+                    updated.controlledEvalAction = .reviewControlledEvalExecution
+                case .reauthorizationReview:
+                    updated.controlledEvalAction = .reauthorizeControlledEvalExecution
+                case .blocker:
+                    updated.controlledEvalAction = .viewControlledEvalBlocker
+                }
+            }
+            return updated
+        }
+        let authority = run.request.authority
+        guard (try? ControlledEvalArtifactValidator.validate(run)) != nil,
+              authority.readinessSourceBinding == report.sourceBinding,
+              authority.productionReadinessReportID == report.reportID,
+              authority.productionReadinessReportRevision == reportRevision.revision,
+              authority.productionReadinessReportSHA256 == reportRevision.digest.sha256,
+              authority.aiEvalPlanID == plan.planID,
+              authority.aiEvalPlanRevision == planRevision.revision,
+              authority.aiEvalPlanSHA256 == planRevision.digest.sha256 else {
+            updated.lineageState = .contradictory
+            updated.lineageFailureReason = "The controlled Eval Run contradicts its exact approved Phase 3A.0 authority."
+            updated.primaryAction = nil
+            updated.postReadyAction = nil
+            if exposesActions {
+                let reason = "The controlled Eval Run contradicts its exact approved Phase 3A.0 authority."
+                updated.controlledEvalEligibility = ControlledEvalExecutionEligibilityEvaluator.blocker(reason)
+                updated.controlledEvalResultReviewEligibility = ControlledEvalResultReviewEligibilityEvaluator.blocker(reason)
+                updated.controlledEvalAction = .viewControlledEvalBlocker
+            }
+            updated.undoEligible = false
+            updated.result = "Contradictory Eval Run authority was isolated. This run failed closed."
+            return updated
+        }
+        updated.evalRun = run
+        updated.postReadyAction = nil
+        if let revision = run.currentRevision {
+            updated.result = (run.currentState ?? revision.state).displayName
+            updated.exactDetails += [
+                MissionExactDetail(label: "Eval Run ID", value: run.runID.uuidString.lowercased()),
+                MissionExactDetail(label: "Eval Run revision", value: String(revision.revision)),
+                MissionExactDetail(label: "Eval Run SHA-256", value: revision.digest.sha256),
+                MissionExactDetail(label: "Execution policy SHA-256", value: run.request.policy.policySHA256),
+                MissionExactDetail(label: "Dataset manifest SHA-256", value: run.request.dataset.manifestSHA256),
+                MissionExactDetail(label: "Evaluator", value: "\(authority.evaluatorID) · \(authority.evaluatorVersion)"),
+                MissionExactDetail(label: "Workspace session", value: authority.workspaceSessionID.uuidString.lowercased())
+            ]
+            if exposesActions, summary.cleanup?.freezesMissionActions != true {
+                switch run.currentState ?? revision.state {
+                case .awaitingExecutionApproval:
+                    if let context = sessionAuthority?.context(missionRunID: summary.missionID),
+                       authority.missionRunID == context.missionRunID,
+                       authority.workspaceID == context.workspaceID,
+                       authority.authenticatedLocalSessionID == context.authenticatedLocalSessionID,
+                       authority.workspaceSessionID == context.workspaceSessionID,
+                       authority.appSessionID == context.appSessionID {
+                        updated.controlledEvalAction = .reviewControlledEvalExecution
+                    } else {
+                        let reason = "This unexecuted Eval Run lacks exact current-session execution authority."
+                        updated.controlledEvalEligibility = ControlledEvalExecutionEligibilityEvaluator.blocker(reason)
+                        updated.controlledEvalAction = .viewControlledEvalBlocker
+                    }
+                case .executionCompleted, .resultsAwaitingReview, .resultsApproved,
+                     .resultsRejected, .resultsChangeRequested, .stoppedFailClosed, .cancelled:
+                    let resultEligibility = ControlledEvalResultReviewEligibilityEvaluator.evaluate(
+                        run: run,
+                        report: report,
+                        evalPlan: plan,
+                        context: sessionAuthority?.context(missionRunID: summary.missionID),
+                        authorizations: resultReviewAuthorizations
+                    )
+                    updated.controlledEvalResultReviewEligibility = resultEligibility
+                    switch resultEligibility.state {
+                    case .currentAuthorizationReview:
+                        updated.controlledEvalAction = .authorizeEvalResultReview
+                    case .finalDecisionReview:
+                        updated.controlledEvalAction = .reviewEvalResults
+                    case .reauthorizationReview:
+                        updated.controlledEvalAction = .reauthorizeEvalResultReview
+                    case .finalizedReadOnly:
+                        updated.controlledEvalAction = .viewEvalResults
+                    case .blocker:
+                        updated.controlledEvalAction = .viewControlledEvalBlocker
+                    }
+                default:
+                    updated.controlledEvalAction = nil
+                }
+            }
         }
         return updated
     }
