@@ -3,26 +3,31 @@ import SwiftUI
 
 struct CommandBarView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @EnvironmentObject private var store: AppStore
     @State private var editorHeight: CGFloat = 34
+    @State private var isEditorFocused = false
+    @State private var isHovering = false
+    @State private var isSendHovering = false
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 10) {
+        VStack(alignment: .leading, spacing: WorkspaceVisualStyle.Spacing.x8) {
             ZStack(alignment: .topLeading) {
                 AutoGrowingComposer(
                     text: $store.commandText,
                     height: $editorHeight,
                     focusRequestID: store.composerFocusRequestID,
                     isEnabled: store.selectedWorkspaceHasProjectScope,
-                    onSubmit: store.submitCommand
+                    onSubmit: store.submitCommand,
+                    onFocusChanged: { isEditorFocused = $0 }
                 )
                 .frame(height: editorHeight)
 
                 if store.commandText.isEmpty {
                     Text(prompt)
-                        .font(.body)
-                        .foregroundStyle(.tertiary)
-                        .padding(.leading, 2)
+                        .font(WorkspaceVisualStyle.Typography.body)
+                        .foregroundStyle(WorkspaceVisualStyle.color(.textTertiary))
+                        .padding(.leading, 3)
                         .padding(.top, 5)
                         .allowsHitTesting(false)
                 }
@@ -31,30 +36,62 @@ struct CommandBarView: View {
             .accessibilityIdentifier("workspace.composer.multiline")
             .layoutPriority(1)
 
-            Button {
-                store.submitCommand()
-            } label: {
-                Image(systemName: store.isRunning ? "arrow.up.message.fill" : "paperplane.fill")
-                    .font(.system(size: 13, weight: .semibold))
-                    .frame(width: 22, height: 22)
+            HStack(spacing: WorkspaceVisualStyle.Spacing.x8) {
+                Spacer(minLength: 0)
+
+                Button {
+                    store.submitCommand()
+                } label: {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(
+                            store.canSubmitCommand
+                                ? Color.white
+                                : WorkspaceVisualStyle.color(.textTertiary)
+                        )
+                        .frame(width: 32, height: 32)
+                        .background(sendButtonFill, in: Circle())
+                        .overlay {
+                            if !store.canSubmitCommand {
+                                Circle()
+                                    .stroke(WorkspaceVisualStyle.color(.borderSubtle), lineWidth: 0.7)
+                            }
+                        }
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!store.canSubmitCommand)
+                .help(store.isRunning ? "Send message" : "Ask FDE Agent")
+                .accessibilityLabel("Send message")
+                .accessibilityIdentifier("workspace.composer.send")
+                .onHover { isSendHovering = $0 }
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!store.canSubmitCommand)
-            .help(store.isRunning ? "Send message" : "Ask FDE Agent")
-            .accessibilityLabel("Send message")
-            .accessibilityIdentifier("workspace.composer.send")
+            .frame(minHeight: 32)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(nsColor: .controlBackgroundColor))
+        .padding(.horizontal, WorkspaceVisualStyle.Spacing.x16)
+        .padding(.top, WorkspaceVisualStyle.Spacing.x12)
+        .padding(.bottom, WorkspaceVisualStyle.Spacing.x12)
+        .background {
+            RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.composer, style: .continuous)
+                .fill(WorkspaceVisualStyle.color(.elevatedSurface))
+                .overlay {
+                    if isHovering && store.selectedWorkspaceHasProjectScope && !isEditorFocused {
+                        RoundedRectangle(cornerRadius: WorkspaceVisualStyle.Radius.composer, style: .continuous)
+                            .fill(WorkspaceVisualStyle.color(.controlSurfaceHover))
+                    }
+                }
+        }
+        // The composer is a floating surface, not a bordered text field. A small
+        // neutral elevation change gives focus feedback without competing with the text.
+        .shadow(
+            color: .black.opacity(isEditorFocused ? 0.085 : 0.055),
+            radius: isEditorFocused ? 8 : 5,
+            y: isEditorFocused ? 2 : 1
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
-        )
-        .animation(.easeOut(duration: 0.12), value: editorHeight)
+        .opacity(store.selectedWorkspaceHasProjectScope ? 1 : 0.76)
+        .onHover { isHovering = $0 }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: editorHeight)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.10), value: isEditorFocused)
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 store.requestComposerFocus()
@@ -68,6 +105,13 @@ struct CommandBarView: View {
         }
         return store.isRunning ? "Reply or change direction…" : "Ask FDE to inspect, modify, or run code…"
     }
+
+    private var sendButtonFill: Color {
+        guard store.canSubmitCommand else {
+            return WorkspaceVisualStyle.color(.controlSurface)
+        }
+        return WorkspaceVisualStyle.color(.accent).opacity(isSendHovering ? 0.86 : 1)
+    }
 }
 
 private struct AutoGrowingComposer: NSViewRepresentable {
@@ -76,6 +120,7 @@ private struct AutoGrowingComposer: NSViewRepresentable {
     let focusRequestID: UUID
     let isEnabled: Bool
     let onSubmit: () -> Void
+    let onFocusChanged: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -88,6 +133,7 @@ private struct AutoGrowingComposer: NSViewRepresentable {
         scrollView.hasHorizontalScroller = false
         scrollView.hasVerticalScroller = false
         scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
 
         let textView = NSTextView()
         textView.delegate = context.coordinator
@@ -161,6 +207,14 @@ private struct AutoGrowingComposer: NSViewRepresentable {
             guard let textView else { return }
             parent.text = textView.string
             recalculateHeight()
+        }
+
+        func textDidBeginEditing(_ notification: Notification) {
+            parent.onFocusChanged(true)
+        }
+
+        func textDidEndEditing(_ notification: Notification) {
+            parent.onFocusChanged(false)
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {

@@ -119,4 +119,27 @@ final class AgentConversationViewTests: XCTestCase {
         XCTAssertFalse(actionSource.lowercased().contains("latest"))
         XCTAssertFalse(actionSource.contains("prefix("))
     }
+
+    func testUserMessagesUseAStructuredCodexStyleSurface() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let conversationSource = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/FDECloudOS/UI/Components/AgentConversationView.swift"
+            ),
+            encoding: .utf8
+        )
+        let messageRow = try XCTUnwrap(
+            conversationSource.components(separatedBy: "private struct AgentConversationMessageRow").last?
+                .components(separatedBy: "private struct AgentStreamingMarkdownResponseRow").first
+        )
+
+        XCTAssertTrue(messageRow.contains("Text(message.sender == .user ? \"You\" : \"Agent\")"))
+        XCTAssertTrue(messageRow.contains("WorkspaceVisualStyle.Typography.body"))
+        XCTAssertTrue(messageRow.contains("WorkspaceVisualStyle.Radius.artifactCard"))
+        XCTAssertTrue(messageRow.contains("message.sender == .user ? 0 : 0.7"))
+        XCTAssertTrue(messageRow.contains("Text(message.content)"))
+    }
 }

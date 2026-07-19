@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 @testable import FDECloudOS
@@ -228,6 +229,73 @@ final class AgentWorkspaceConsolidationTests: XCTestCase {
         XCTAssertTrue(AutoGrowingComposerMetrics.shouldScrollInternally(for: 9))
     }
 
+    func testSemanticVisualTokensCoverRequiredLightAndDarkRoles() throws {
+        XCTAssertEqual(
+            Set(WorkspaceSemanticColorRole.allCases.map(\.rawValue)),
+            Set([
+                "canvas", "sidebarSurface", "primarySurface", "elevatedSurface",
+                "controlSurface", "controlSurfaceHover", "borderSubtle", "borderFocused",
+                "textPrimary", "textSecondary", "textTertiary", "accent", "success",
+                "warning", "danger", "diffAddedBackground", "diffRemovedBackground",
+                "diffAddedText", "diffRemovedText"
+            ])
+        )
+
+        for appearanceName in [NSAppearance.Name.aqua, .darkAqua] {
+            let appearance = try XCTUnwrap(NSAppearance(named: appearanceName))
+            appearance.performAsCurrentDrawingAppearance {
+                for role in WorkspaceSemanticColorRole.allCases {
+                    _ = WorkspaceVisualStyle.color(role)
+                    XCTAssertNotNil(
+                        WorkspaceVisualStyle.nsColor(role).usingColorSpace(.deviceRGB),
+                        "\(role.rawValue) should resolve in \(appearanceName.rawValue)"
+                    )
+                }
+            }
+        }
+
+        XCTAssertEqual(WorkspaceVisualStyle.Radius.control, 8)
+        XCTAssertEqual(WorkspaceVisualStyle.Radius.artifactCard, 12)
+        XCTAssertEqual(WorkspaceVisualStyle.Radius.humanReview, 14)
+        XCTAssertEqual(WorkspaceVisualStyle.Radius.composer, 18)
+    }
+
+    func testUnifiedDiffPresentationPreservesChangesLineNumbersAndCollapsedContext() throws {
+        let context = (1...10).map { " context \($0)" }.joined(separator: "\n")
+        let diff = """
+        diff --git a/Sources/App.swift b/Sources/App.swift
+        index 1111111..2222222 100644
+        --- a/Sources/App.swift
+        +++ b/Sources/App.swift
+        @@ -1,11 +1,12 @@
+        \(context)
+        -let oldValue = true
+        +let newValue = true
+        +let anotherValue = false
+        """
+
+        let presentation = UnifiedDiffPresentation(diff)
+
+        XCTAssertEqual(presentation.additionCount, 2)
+        XCTAssertEqual(presentation.deletionCount, 1)
+        XCTAssertEqual(presentation.lines.filter { $0.kind == .header }.count, 4)
+        let removed = try XCTUnwrap(presentation.lines.first { $0.kind == .removed })
+        XCTAssertEqual(removed.oldLineNumber, 11)
+        XCTAssertNil(removed.newLineNumber)
+        let added = presentation.lines.filter { $0.kind == .added }
+        XCTAssertEqual(added.map(\.newLineNumber), [11, 12])
+        XCTAssertEqual(added.map(\.content), ["+let newValue = true", "+let anotherValue = false"])
+
+        let collapsed = presentation.displayRows().compactMap { row -> UnifiedDiffCollapsedSection? in
+            if case let .collapsed(section) = row { return section }
+            return nil
+        }
+        XCTAssertEqual(collapsed.count, 1)
+        XCTAssertEqual(collapsed[0].hiddenLineCount, 4)
+        XCTAssertEqual(collapsed[0].lines.first?.content, " context 4")
+        XCTAssertEqual(collapsed[0].lines.last?.content, " context 7")
+    }
+
     func testShiftEnterInsertsNewlineAndIMECompositionNeverSubmits() {
         XCTAssertEqual(
             ComposerSubmissionPolicy.action(text: "long request", shiftPressed: true, hasMarkedText: false),
@@ -285,6 +353,74 @@ final class AgentWorkspaceConsolidationTests: XCTestCase {
         XCTAssertFalse(source.contains(".keyboardShortcut(.defaultAction)"))
     }
 
+    func testHumanReviewUsesDirectApproveAndKeepsSecondaryReviewExplicit() throws {
+        let source = try workspaceConsolidationSource()
+        let actionBar = try XCTUnwrap(
+            source.components(separatedBy: "private func actionBar").last?
+                .components(separatedBy: "private var currentAction").first
+        )
+
+        XCTAssertTrue(actionBar.contains("Text(\"Human review\")"))
+        XCTAssertTrue(actionBar.contains("Text(action.descriptor.title)"))
+        XCTAssertTrue(actionBar.contains("Text(action.descriptor.scope)"))
+        XCTAssertTrue(actionBar.contains("Text(\"Revision \\(revision)\")"))
+        XCTAssertTrue(actionBar.contains("Text(action.descriptor.status)"))
+        XCTAssertTrue(actionBar.contains("Optional review note"))
+        XCTAssertTrue(actionBar.contains("submit(action, decision: .approve)"))
+        XCTAssertTrue(actionBar.contains("decisionButtonLabel(\"Approve\""))
+        XCTAssertTrue(actionBar.contains("Label(\"More options\""))
+        XCTAssertTrue(actionBar.contains("selectedDecisionAction(action, decision: selectedDecision)"))
+        XCTAssertTrue(actionBar.contains("humanAction.approve"))
+        XCTAssertTrue(actionBar.contains("humanAction.secondaryDecisionMenu"))
+        XCTAssertTrue(actionBar.contains("humanAction.submitDecision"))
+        XCTAssertFalse(actionBar.contains("Picker(\"Decision\""))
+        XCTAssertFalse(actionBar.contains("Choose a decision"))
+        XCTAssertFalse(actionBar.contains(".pickerStyle(.segmented)"))
+        XCTAssertFalse(actionBar.contains("Color.purple"))
+        XCTAssertTrue(source.contains("@State private var selectedDecision: HumanReviewDecision?"))
+        XCTAssertTrue(source.contains("private func submit(_ action: WorkspaceHumanAction, decision: HumanReviewDecision)"))
+        XCTAssertTrue(source.contains("title: \"Undo this run\""))
+        XCTAssertTrue(source.contains("Exact revert and cleanup workflow; audit history is preserved"))
+    }
+
+    func testDiffViewerUsesLazyRowsCollapsedContextAndValidatedArtifactAuthority() throws {
+        let source = try workspaceConsolidationSource()
+
+        XCTAssertTrue(source.contains("UnifiedDiffPane"))
+        XCTAssertTrue(source.contains("LazyVStack"))
+        XCTAssertTrue(source.contains("artifact.diff.collapsedContext"))
+        XCTAssertTrue(source.contains("ArtifactPathAuthority.isValidatedRelativePath(card.relativePath)"))
+        XCTAssertTrue(source.contains("card.relativePath"))
+        XCTAssertFalse(source.contains("card.absolutePath"))
+        XCTAssertFalse(source.contains("NSWorkspace.shared.open"))
+    }
+
+    func testRedesignedSurfacesRespectReduceMotionAndShareAlignedInsets() throws {
+        let repositoryRoot = try repositoryRoot()
+        let commandBar = try source(
+            at: "Sources/FDECloudOS/UI/Components/CommandBarView.swift",
+            repositoryRoot: repositoryRoot
+        )
+        let workspace = try source(
+            at: "Sources/FDECloudOS/UI/Components/AgentWorkspaceView.swift",
+            repositoryRoot: repositoryRoot
+        )
+        let consolidation = try workspaceConsolidationSource()
+
+        XCTAssertTrue(commandBar.contains("@Environment(\\.accessibilityReduceMotion)"))
+        XCTAssertTrue(commandBar.contains("reduceMotion ? nil"))
+        XCTAssertTrue(workspace.contains("@Environment(\\.accessibilityReduceMotion)"))
+        XCTAssertTrue(workspace.contains("VStack(spacing: WorkspaceVisualStyle.Spacing.x8)"))
+        XCTAssertTrue(workspace.contains(".padding(.horizontal, WorkspaceVisualStyle.Spacing.x20)"))
+        XCTAssertTrue(consolidation.contains("@Environment(\\.accessibilityReduceMotion)"))
+        XCTAssertTrue(consolidation.contains("WorkspaceVisualStyle.Radius.humanReview"))
+        XCTAssertTrue(commandBar.contains("WorkspaceVisualStyle.Radius.composer"))
+        XCTAssertTrue(commandBar.contains("color: .black.opacity(isEditorFocused ? 0.085 : 0.055)"))
+        XCTAssertTrue(commandBar.contains("radius: isEditorFocused ? 8 : 5"))
+        let composerSurface = try XCTUnwrap(commandBar.components(separatedBy: "private var prompt").first)
+        XCTAssertFalse(composerSurface.contains("WorkspaceVisualStyle.color(.borderFocused)"))
+    }
+
     func testUIUsesAppOwnedViewerAndDoesNotOpenArbitraryPath() throws {
         let source = try workspaceConsolidationSource()
 
@@ -298,6 +434,9 @@ final class AgentWorkspaceConsolidationTests: XCTestCase {
 
         XCTAssertTrue(source.contains("store.selectedMissionPresentation?.previousRuns"))
         XCTAssertTrue(source.contains("Read-only Mission history"))
+        XCTAssertTrue(source.contains("inspectorCardSurface"))
+        XCTAssertTrue(source.contains("WorkspaceVisualStyle.Radius.artifactCard"))
+        XCTAssertTrue(source.contains("inspectorIcon(\"waveform.path.ecg\")"))
         XCTAssertFalse(source.contains("duplicateMission"))
     }
 
@@ -377,6 +516,13 @@ final class AgentWorkspaceConsolidationTests: XCTestCase {
             contentsOf: try repositoryRoot().appendingPathComponent(
                 "Sources/FDECloudOS/UI/Components/AgentWorkspaceConsolidationViews.swift"
             ),
+            encoding: .utf8
+        )
+    }
+
+    private func source(at path: String, repositoryRoot: URL) throws -> String {
+        try String(
+            contentsOf: repositoryRoot.appendingPathComponent(path),
             encoding: .utf8
         )
     }

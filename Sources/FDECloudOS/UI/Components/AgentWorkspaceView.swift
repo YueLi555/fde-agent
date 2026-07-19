@@ -2,6 +2,7 @@ import SwiftUI
 
 struct AgentWorkspaceView: View {
     @EnvironmentObject private var store: AppStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 0) {
@@ -15,8 +16,8 @@ struct AgentWorkspaceView: View {
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .animation(.easeInOut(duration: 0.18), value: store.isInspectorPresented)
+        .background(WorkspaceVisualStyle.color(.canvas))
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: store.isInspectorPresented)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -90,13 +91,14 @@ struct AgentWorkspaceView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            HumanActionBar()
-
-            Divider()
-
-            CommandBarView()
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
+            VStack(spacing: WorkspaceVisualStyle.Spacing.x8) {
+                HumanActionBar()
+                CommandBarView()
+            }
+            .padding(.horizontal, WorkspaceVisualStyle.Spacing.x20)
+            .padding(.top, WorkspaceVisualStyle.Spacing.x8)
+            .padding(.bottom, WorkspaceVisualStyle.Spacing.x12)
+            .background(WorkspaceVisualStyle.color(.canvas))
         }
     }
 

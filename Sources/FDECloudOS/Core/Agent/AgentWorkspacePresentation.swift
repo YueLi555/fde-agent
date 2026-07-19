@@ -431,6 +431,180 @@ struct ArtifactFileCardModel: Identifiable, Codable, Hashable, Sendable {
     var expandsLargeDiffInlineByDefault: Bool { false }
 }
 
+enum UnifiedDiffLineKind: String, Codable, Hashable, Sendable {
+    case header
+    case hunk
+    case context
+    case added
+    case removed
+    case metadata
+}
+
+struct UnifiedDiffLine: Identifiable, Codable, Hashable, Sendable {
+    var id: Int
+    var kind: UnifiedDiffLineKind
+    var oldLineNumber: Int?
+    var newLineNumber: Int?
+    var content: String
+}
+
+struct UnifiedDiffCollapsedSection: Identifiable, Codable, Hashable, Sendable {
+    var id: Int
+    var lines: [UnifiedDiffLine]
+
+    var hiddenLineCount: Int { lines.count }
+}
+
+enum UnifiedDiffDisplayRow: Identifiable, Hashable, Sendable {
+    case line(UnifiedDiffLine)
+    case collapsed(UnifiedDiffCollapsedSection)
+
+    var id: String {
+        switch self {
+        case let .line(line): return "line:\(line.id)"
+        case let .collapsed(section): return "collapsed:\(section.id)"
+        }
+    }
+}
+
+struct UnifiedDiffPresentation: Hashable, Sendable {
+    var lines: [UnifiedDiffLine]
+
+    init(_ unifiedDiff: String) {
+        var sourceLines = unifiedDiff
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: "\n")
+        if unifiedDiff.hasSuffix("\n") {
+            sourceLines.removeLast()
+        }
+
+        var oldLineNumber: Int?
+        var newLineNumber: Int?
+        var isInsideHunk = false
+        var parsed: [UnifiedDiffLine] = []
+        parsed.reserveCapacity(sourceLines.count)
+
+        for (index, content) in sourceLines.enumerated() {
+            if let start = Self.hunkStart(in: content) {
+                oldLineNumber = start.old
+                newLineNumber = start.new
+                isInsideHunk = true
+                parsed.append(.init(
+                    id: index,
+                    kind: .hunk,
+                    oldLineNumber: nil,
+                    newLineNumber: nil,
+                    content: content
+                ))
+                continue
+            }
+
+            let line: UnifiedDiffLine
+            if isInsideHunk, content.hasPrefix("+"), !content.hasPrefix("+++") {
+                line = .init(
+                    id: index,
+                    kind: .added,
+                    oldLineNumber: nil,
+                    newLineNumber: newLineNumber,
+                    content: content
+                )
+                newLineNumber = newLineNumber.map { $0 + 1 }
+            } else if isInsideHunk, content.hasPrefix("-"), !content.hasPrefix("---") {
+                line = .init(
+                    id: index,
+                    kind: .removed,
+                    oldLineNumber: oldLineNumber,
+                    newLineNumber: nil,
+                    content: content
+                )
+                oldLineNumber = oldLineNumber.map { $0 + 1 }
+            } else if isInsideHunk, content.hasPrefix(" ") {
+                line = .init(
+                    id: index,
+                    kind: .context,
+                    oldLineNumber: oldLineNumber,
+                    newLineNumber: newLineNumber,
+                    content: content
+                )
+                oldLineNumber = oldLineNumber.map { $0 + 1 }
+                newLineNumber = newLineNumber.map { $0 + 1 }
+            } else {
+                let kind: UnifiedDiffLineKind = content.hasPrefix("diff ")
+                    || content.hasPrefix("index ")
+                    || content.hasPrefix("--- ")
+                    || content.hasPrefix("+++ ")
+                    || content.hasPrefix("new file ")
+                    || content.hasPrefix("deleted file ")
+                    ? .header
+                    : .metadata
+                line = .init(
+                    id: index,
+                    kind: kind,
+                    oldLineNumber: nil,
+                    newLineNumber: nil,
+                    content: content
+                )
+            }
+            parsed.append(line)
+        }
+        lines = parsed
+    }
+
+    var additionCount: Int { lines.lazy.filter { $0.kind == .added }.count }
+    var deletionCount: Int { lines.lazy.filter { $0.kind == .removed }.count }
+
+    func displayRows(
+        minimumContextRun: Int = 9,
+        visibleContextAtEachEdge: Int = 3
+    ) -> [UnifiedDiffDisplayRow] {
+        guard minimumContextRun > visibleContextAtEachEdge * 2 else {
+            return lines.map(UnifiedDiffDisplayRow.line)
+        }
+
+        var rows: [UnifiedDiffDisplayRow] = []
+        var index = 0
+        while index < lines.count {
+            guard lines[index].kind == .context else {
+                rows.append(.line(lines[index]))
+                index += 1
+                continue
+            }
+
+            var end = index
+            while end < lines.count, lines[end].kind == .context {
+                end += 1
+            }
+            let run = Array(lines[index..<end])
+            if run.count >= minimumContextRun {
+                rows.append(contentsOf: run.prefix(visibleContextAtEachEdge).map(UnifiedDiffDisplayRow.line))
+                let hidden = Array(run.dropFirst(visibleContextAtEachEdge).dropLast(visibleContextAtEachEdge))
+                rows.append(.collapsed(.init(id: hidden[0].id, lines: hidden)))
+                rows.append(contentsOf: run.suffix(visibleContextAtEachEdge).map(UnifiedDiffDisplayRow.line))
+            } else {
+                rows.append(contentsOf: run.map(UnifiedDiffDisplayRow.line))
+            }
+            index = end
+        }
+        return rows
+    }
+
+    private static func hunkStart(in content: String) -> (old: Int, new: Int)? {
+        guard content.hasPrefix("@@ ") else { return nil }
+        let fields = content.split(separator: " ")
+        guard fields.count >= 3,
+              fields[1].hasPrefix("-"), fields[2].hasPrefix("+") else {
+            return nil
+        }
+        let oldValue = fields[1].dropFirst().split(separator: ",", maxSplits: 1).first
+        let newValue = fields[2].dropFirst().split(separator: ",", maxSplits: 1).first
+        guard let oldValue, let newValue,
+              let old = Int(oldValue), let new = Int(newValue) else {
+            return nil
+        }
+        return (old, new)
+    }
+}
+
 enum ArtifactPathAuthority {
     static func isValidatedRelativePath(_ path: String) -> Bool {
         guard !path.isEmpty,
