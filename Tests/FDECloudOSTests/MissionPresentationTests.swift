@@ -291,6 +291,236 @@ final class MissionPresentationTests: XCTestCase {
         XCTAssertEqual(state.previousRuns.count, 0)
     }
 
+    func testApprovedPhase3PairAndEvalRunExposeExactlyOneControlledCTAWithoutHistoryRow() throws {
+        let fixture = Fixture()
+        let patch = fixture.patch(revision: 1, state: .patchReady)
+        let plan = fixture.plan(status: .testPlanReviewReady)
+        let artifact = fixture.artifact(review: .approved)
+        var phase3 = try fixture.phase3Artifacts(for: artifact)
+        let reportRevision = try XCTUnwrap(phase3.report.currentRevision)
+        let evalRevision = try XCTUnwrap(phase3.evalPlan.currentRevision)
+        let workspaceSessionID = UUID(uuidString: "00000000-0000-0000-0000-000000000070")!
+        phase3.report = try ProductionReadinessPlanningService().reviewReport(
+            phase3.report,
+            decision: .approvePlan,
+            context: ProductionReadinessReviewContext(
+                missionRunID: fixture.missionID,
+                workspaceID: fixture.workspaceID,
+                artifactID: phase3.report.reportID,
+                revision: reportRevision.revision,
+                artifactSHA256: reportRevision.digest.sha256,
+                authenticatedLocalSessionID: fixture.localSessionID,
+                appSessionID: fixture.appSessionID
+            )
+        )
+        phase3.evalPlan = try ProductionReadinessPlanningService().reviewEvalPlan(
+            phase3.evalPlan,
+            decision: .approvePlan,
+            context: ProductionReadinessReviewContext(
+                missionRunID: fixture.missionID,
+                workspaceID: fixture.workspaceID,
+                artifactID: phase3.evalPlan.planID,
+                revision: evalRevision.revision,
+                artifactSHA256: evalRevision.digest.sha256,
+                authenticatedLocalSessionID: fixture.localSessionID,
+                appSessionID: fixture.appSessionID
+            )
+        )
+        let approvedPlans = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [patch],
+            plans: [plan],
+            artifacts: [artifact],
+            readinessReports: [phase3.report],
+            evalPlans: [phase3.evalPlan]
+        )
+        XCTAssertNil(approvedPlans.current.postReadyAction)
+        XCTAssertEqual(approvedPlans.current.controlledEvalAction, .reviewControlledEvalExecution)
+
+        let service = ControlledEvalExecutionService()
+        let restartedAppSessionID = UUID(uuidString: "00000000-0000-0000-0000-000000000071")!
+        let priorSession = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [patch],
+            plans: [plan],
+            artifacts: [artifact],
+            readinessReports: [phase3.report],
+            evalPlans: [phase3.evalPlan],
+            controlledEvalAppSessionID: restartedAppSessionID
+        )
+        XCTAssertEqual(priorSession.current.controlledEvalAction, .reauthorizeControlledEvalExecution)
+        XCTAssertEqual(priorSession.current.controlledEvalEligibility?.state, .reauthorizationReview)
+        XCTAssertEqual(
+            [
+                priorSession.current.primaryAction?.label,
+                priorSession.current.postReadyAction?.label,
+                priorSession.current.controlledEvalAction?.label
+            ].compactMap { $0 },
+            ["Reauthorize controlled eval execution"]
+        )
+        let priorProposal = try XCTUnwrap(priorSession.current.controlledEvalEligibility?.proposal)
+        let restartedContext = ControlledEvalExecutionContext(
+            missionRunID: fixture.missionID,
+            workspaceID: fixture.workspaceID,
+            authenticatedLocalSessionID: fixture.localSessionID,
+            workspaceSessionID: workspaceSessionID,
+            appSessionID: restartedAppSessionID
+        )
+        let sharedEligibility = ControlledEvalExecutionEligibilityEvaluator.evaluate(
+            report: phase3.report,
+            evalPlan: phase3.evalPlan,
+            context: restartedContext,
+            authorizations: []
+        )
+        XCTAssertEqual(priorSession.current.controlledEvalEligibility, sharedEligibility)
+        let authorization = try service.authorizeExecution(
+            proposal: priorProposal,
+            context: restartedContext
+        )
+        let authorized = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [patch],
+            plans: [plan],
+            artifacts: [artifact],
+            readinessReports: [phase3.report],
+            evalPlans: [phase3.evalPlan],
+            controlledEvalAppSessionID: restartedAppSessionID,
+            controlledEvalAuthorizations: [authorization]
+        )
+        XCTAssertEqual(authorized.current.controlledEvalAction, .reviewControlledEvalExecution)
+        XCTAssertEqual(authorized.current.controlledEvalEligibility?.state, .finalExecutionReview)
+
+        var tamperedPlan = phase3.evalPlan
+        tamperedPlan.revisions[0].digest.sha256 = "tampered"
+        let tampered = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [patch],
+            plans: [plan],
+            artifacts: [artifact],
+            readinessReports: [phase3.report],
+            evalPlans: [tamperedPlan],
+            controlledEvalAppSessionID: restartedAppSessionID
+        )
+        XCTAssertEqual(tampered.current.controlledEvalAction, .viewControlledEvalBlocker)
+        XCTAssertEqual(tampered.current.controlledEvalEligibility?.state, .blocker)
+
+        let dataset = try service.makeFixtureDataset(for: phase3.evalPlan)
+        let policy = try service.makeDefaultPolicy(for: phase3.evalPlan, datasetID: dataset.datasetID)
+        let context = ControlledEvalExecutionContext(
+            missionRunID: fixture.missionID,
+            workspaceID: fixture.workspaceID,
+            authenticatedLocalSessionID: fixture.localSessionID,
+            workspaceSessionID: workspaceSessionID,
+            appSessionID: fixture.appSessionID
+        )
+        let executionProposal = try service.makeExecutionProposal(
+            report: phase3.report,
+            evalPlan: phase3.evalPlan,
+            dataset: dataset,
+            policy: policy,
+            context: context
+        )
+        let executionAuthorization = try service.authorizeExecution(
+            proposal: executionProposal,
+            context: context
+        )
+        let run = try service.prepareAuthorized(
+            report: phase3.report,
+            evalPlan: phase3.evalPlan,
+            proposal: executionProposal,
+            authorization: executionAuthorization,
+            context: context
+        ).run
+        let awaiting = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [patch],
+            plans: [plan],
+            artifacts: [artifact],
+            readinessReports: [phase3.report],
+            evalPlans: [phase3.evalPlan],
+            evalRuns: [run]
+        )
+        XCTAssertEqual(awaiting.current.evalRun?.runID, run.runID)
+        XCTAssertEqual(awaiting.current.controlledEvalAction, .reviewControlledEvalExecution)
+        XCTAssertEqual(awaiting.previousRuns.count, 0)
+
+        let approved = try service.approveExecution(run, context: context)
+        let completed = try service.execute(
+            approved,
+            report: phase3.report,
+            evalPlan: phase3.evalPlan,
+            context: context
+        ).run
+        let results = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [patch],
+            plans: [plan],
+            artifacts: [artifact],
+            readinessReports: [phase3.report],
+            evalPlans: [phase3.evalPlan],
+            evalRuns: [completed]
+        )
+        XCTAssertEqual(results.current.controlledEvalAction, .authorizeEvalResultReview)
+        XCTAssertEqual(results.current.controlledEvalResultReviewEligibility?.state, .currentAuthorizationReview)
+        XCTAssertNil(results.current.postReadyAction)
+        XCTAssertEqual(results.previousRuns.count, 0)
+
+        let restartedResults = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [patch],
+            plans: [plan],
+            artifacts: [artifact],
+            readinessReports: [phase3.report],
+            evalPlans: [phase3.evalPlan],
+            evalRuns: [completed],
+            controlledEvalAppSessionID: restartedAppSessionID
+        )
+        XCTAssertEqual(restartedResults.current.controlledEvalAction, .reauthorizeEvalResultReview)
+        XCTAssertEqual(restartedResults.current.controlledEvalResultReviewEligibility?.state, .reauthorizationReview)
+        let resultProposal = try XCTUnwrap(restartedResults.current.controlledEvalResultReviewEligibility?.proposal)
+        let resultAuthorization = try service.authorizeResultReview(
+            proposal: resultProposal,
+            context: restartedContext
+        )
+        let authorizedResults = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [patch],
+            plans: [plan],
+            artifacts: [artifact],
+            readinessReports: [phase3.report],
+            evalPlans: [phase3.evalPlan],
+            evalRuns: [completed],
+            controlledEvalAppSessionID: restartedAppSessionID,
+            controlledEvalResultReviewAuthorizations: [resultAuthorization]
+        )
+        XCTAssertEqual(authorizedResults.current.controlledEvalAction, .reviewEvalResults)
+        XCTAssertEqual(authorizedResults.current.controlledEvalResultReviewEligibility?.state, .finalDecisionReview)
+
+        let finalizedRun = try service.reviewResultsAuthorized(
+            completed,
+            report: phase3.report,
+            evalPlan: phase3.evalPlan,
+            proposal: resultProposal,
+            authorization: resultAuthorization,
+            decision: .approveResults,
+            context: restartedContext
+        ).run
+        let finalizedResults = fixture.project(
+            session: fixture.session(interaction: .completed),
+            candidates: [patch],
+            plans: [plan],
+            artifacts: [artifact],
+            readinessReports: [phase3.report],
+            evalPlans: [phase3.evalPlan],
+            evalRuns: [finalizedRun],
+            controlledEvalAppSessionID: UUID()
+        )
+        XCTAssertEqual(finalizedResults.current.controlledEvalAction, .viewEvalResults)
+        XCTAssertEqual(finalizedResults.current.controlledEvalResultReviewEligibility?.state, .finalizedReadOnly)
+        XCTAssertEqual(finalizedResults.current.evalRun?.currentRevision?.digest, completed.currentRevision?.digest)
+        XCTAssertEqual(finalizedResults.previousRuns.count, 0)
+    }
+
     func testPhase3ARestorationFailureSuppressesReviewWithoutChangingExactUndoAuthority() {
         let fixture = Fixture()
         let state = fixture.project(
@@ -1079,7 +1309,11 @@ private struct Fixture {
         cleanup: [MissionCleanupState] = [],
         readinessReports: [ProductionReadinessReport] = [],
         evalPlans: [AIEvalPlan] = [],
-        phase3ARestorationFailure: String? = nil
+        phase3ARestorationFailure: String? = nil,
+        evalRuns: [EvalRun] = [],
+        controlledEvalAppSessionID: UUID? = nil,
+        controlledEvalAuthorizations: [ControlledEvalExecutionAuthorization] = [],
+        controlledEvalResultReviewAuthorizations: [ControlledEvalResultReviewAuthorization] = []
     ) -> MissionPresentationState {
         MissionPresentationProjector.project(
             session: session,
@@ -1091,7 +1325,16 @@ private struct Fixture {
             cleanupStates: cleanup,
             productionReadinessReports: readinessReports,
             aiEvalPlans: evalPlans,
-            phase3ARestorationFailure: phase3ARestorationFailure
+            phase3ARestorationFailure: phase3ARestorationFailure,
+            evalRuns: evalRuns,
+            controlledEvalSessionAuthority: ControlledEvalSessionAuthority(
+                workspaceID: workspaceID,
+                authenticatedLocalSessionID: localSessionID,
+                workspaceSessionID: UUID(uuidString: "00000000-0000-0000-0000-000000000070")!,
+                appSessionID: controlledEvalAppSessionID ?? appSessionID
+            ),
+            controlledEvalExecutionAuthorizations: controlledEvalAuthorizations,
+            controlledEvalResultReviewAuthorizations: controlledEvalResultReviewAuthorizations
         )
     }
 }

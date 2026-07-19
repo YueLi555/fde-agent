@@ -12,6 +12,11 @@ struct AgentConversationView: View {
     var productionReadinessReports: [ProductionReadinessReport] = []
     var aiEvalPlans: [AIEvalPlan] = []
     var productionReadinessRestoreFailure: String? = nil
+    var controlledEvalRuns: [EvalRun] = []
+    var controlledEvalRestoreFailure: String? = nil
+    var controlledEvalSessionAuthority: ControlledEvalSessionAuthority? = nil
+    var controlledEvalExecutionAuthorizations: [ControlledEvalExecutionAuthorization] = []
+    var controlledEvalResultReviewAuthorizations: [ControlledEvalResultReviewAuthorization] = []
     let approvals: [ApprovalRequest]
     var showsHeader = true
     let onApprove: (ApprovalRequest) -> Void
@@ -34,6 +39,13 @@ struct AgentConversationView: View {
     var aiEvalPlanReviewEligibility: ((AIEvalPlan) -> ProductionReadinessReviewEligibility)? = nil
     var onReviewReadinessReport: ((ProductionReadinessReport, ProductionReadinessReviewDecisionKind, String?) -> Void)? = nil
     var onReviewAIEvalPlan: ((AIEvalPlan, ProductionReadinessReviewDecisionKind, String?) -> Void)? = nil
+    var onPrepareControlledEvalExecution: ((MissionSummary) -> Void)? = nil
+    var controlledEvalExecutionReviewEligibility: ((EvalRun) -> ProductionReadinessReviewEligibility)? = nil
+    var onConfirmControlledEvalExecution: ((EvalRun) -> Void)? = nil
+    var onConfirmAuthorizedControlledEvalExecution: ((MissionSummary) -> Void)? = nil
+    var onPrepareControlledEvalResultReview: ((MissionSummary) -> Void)? = nil
+    var evalResultsReviewEligibility: ((EvalRun) -> ProductionReadinessReviewEligibility)? = nil
+    var onReviewEvalResults: ((EvalRun, EvalRunReviewDecisionKind, String?) -> Void)? = nil
     var missionCleanupStates: [MissionCleanupState] = []
     var onUndoMission: ((MissionSummary) -> Void)? = nil
     var onRetryMissionCleanup: ((MissionSummary) -> Void)? = nil
@@ -64,7 +76,12 @@ struct AgentConversationView: View {
             cleanupStates: missionCleanupStates,
             productionReadinessReports: productionReadinessReports,
             aiEvalPlans: aiEvalPlans,
-            phase3ARestorationFailure: productionReadinessRestoreFailure
+            phase3ARestorationFailure: productionReadinessRestoreFailure,
+            evalRuns: controlledEvalRuns,
+            controlledEvalRestorationFailure: controlledEvalRestoreFailure,
+            controlledEvalSessionAuthority: controlledEvalSessionAuthority,
+            controlledEvalExecutionAuthorizations: controlledEvalExecutionAuthorizations,
+            controlledEvalResultReviewAuthorizations: controlledEvalResultReviewAuthorizations
         )
     }
 
@@ -142,6 +159,13 @@ struct AgentConversationView: View {
                     aiEvalPlanReviewEligibility: aiEvalPlanReviewEligibility,
                     onReviewReadinessReport: onReviewReadinessReport,
                     onReviewAIEvalPlan: onReviewAIEvalPlan,
+                    onPrepareControlledEvalExecution: onPrepareControlledEvalExecution,
+                    controlledEvalExecutionReviewEligibility: controlledEvalExecutionReviewEligibility,
+                    onConfirmControlledEvalExecution: onConfirmControlledEvalExecution,
+                    onConfirmAuthorizedControlledEvalExecution: onConfirmAuthorizedControlledEvalExecution,
+                    onPrepareControlledEvalResultReview: onPrepareControlledEvalResultReview,
+                    evalResultsReviewEligibility: evalResultsReviewEligibility,
+                    onReviewEvalResults: onReviewEvalResults,
                     onUndoRun: onUndoMission,
                     onRetryCleanup: onRetryMissionCleanup,
                     onShowWorkDetails: { showsWorkDetails = true }

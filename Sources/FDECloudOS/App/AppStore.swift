@@ -79,6 +79,14 @@ final class AppStore: ObservableObject {
     @Published private(set) var productionReadinessReports: [ProductionReadinessReport] = []
     @Published private(set) var aiEvalPlans: [AIEvalPlan] = []
     @Published private(set) var productionReadinessRestoreFailure: String?
+    @Published private(set) var controlledEvalRuns: [EvalRun] = []
+    @Published private(set) var controlledEvalRestoreFailure: String?
+    @Published private(set) var controlledEvalExecutionAuthorizations: [ControlledEvalExecutionAuthorization] = []
+    @Published private(set) var controlledEvalResultReviewAuthorizations: [ControlledEvalResultReviewAuthorization] = []
+    @Published private(set) var activeWorkspaceSessionID: UUID?
+    @Published private var controlledEvalRunsInFlight: Set<UUID> = []
+    @Published private var controlledEvalAuthorizationsInFlight: Set<UUID> = []
+    @Published private var controlledEvalResultReviewAuthorizationsInFlight: Set<UUID> = []
 
     private let environment: AppEnvironment
     private let startupIssue: String?
@@ -110,6 +118,21 @@ final class AppStore: ObservableObject {
         }
         guard let selectedTaskID else { return tasks.first }
         return tasks.first { $0.id == selectedTaskID }
+    }
+
+    var controlledEvalSessionAuthority: ControlledEvalSessionAuthority? {
+        guard let workspace = selectedWorkspace,
+              let authenticatedLocalSessionID = session?.id,
+              session?.workspaceID == workspace.id,
+              let workspaceSessionID = activeWorkspaceSessionID else {
+            return nil
+        }
+        return ControlledEvalSessionAuthority(
+            workspaceID: workspace.id,
+            authenticatedLocalSessionID: authenticatedLocalSessionID,
+            workspaceSessionID: workspaceSessionID,
+            appSessionID: appSessionID
+        )
     }
 
     var selectedTaskPendingApprovals: [ApprovalRequest] {
@@ -272,7 +295,11 @@ final class AppStore: ObservableObject {
             }
 
             workspaces = storedWorkspaces
-            if let storedSession = try await environment.persistence.loadSessionMetadata(),
+            let storedSession = try await environment.persistence.loadSessionMetadata()
+            activeWorkspaceSessionID = storedSession?.workspaceSession?.state == .signedIn
+                ? storedSession?.workspaceSession?.id
+                : nil
+            if let storedSession,
                let workspaceID = storedSession.workspaceSession?.workspaceID,
                storedWorkspaces.contains(where: { $0.id == workspaceID }) {
                 selectedWorkspaceID = selectedWorkspaceID ?? workspaceID
@@ -332,6 +359,26 @@ final class AppStore: ObservableObject {
                 productionReadinessRestoreFailure = "Phase 3A persistence validation failed: \(error.localizedDescription)"
                 lastError = productionReadinessRestoreFailure
             }
+            let evalStore = ControlledEvalRunStore(
+                storageRoot: environment.sandboxLifecycle.storageRoot
+            )
+            do {
+                let restored = try evalStore.restoreAll(workspaceID: workspace.id)
+                controlledEvalRuns = restored.runs
+                controlledEvalRestoreFailure = nil
+                if !restored.restorationFailures.isEmpty {
+                    lastError = "An interrupted controlled Eval Run was restored and stopped fail-closed."
+                }
+            } catch {
+                controlledEvalRuns = []
+                controlledEvalRestoreFailure = "Phase 3A.1 persistence validation failed: \(error.localizedDescription)"
+                lastError = controlledEvalRestoreFailure
+            }
+            let metadata = try await environment.persistence.loadSessionMetadata()
+            activeWorkspaceSessionID = metadata?.workspaceSession?.state == .signedIn
+                && metadata?.workspaceSession?.workspaceID == workspace.id
+                ? metadata?.workspaceSession?.id
+                : nil
             conversationAssetProjection = AgentConversationAssetProjector.project(
                 workspaceID: workspace.id,
                 events: workspaceEvents,
@@ -1009,7 +1056,12 @@ final class AppStore: ObservableObject {
             cleanupStates: missionCleanupStates,
             productionReadinessReports: productionReadinessReports,
             aiEvalPlans: aiEvalPlans,
-            phase3ARestorationFailure: productionReadinessRestoreFailure
+            phase3ARestorationFailure: productionReadinessRestoreFailure,
+            evalRuns: controlledEvalRuns,
+            controlledEvalRestorationFailure: controlledEvalRestoreFailure,
+            controlledEvalSessionAuthority: controlledEvalSessionAuthority,
+            controlledEvalExecutionAuthorizations: controlledEvalExecutionAuthorizations,
+            controlledEvalResultReviewAuthorizations: controlledEvalResultReviewAuthorizations
         )
         .current
         guard summary.undoEligible,
@@ -1064,6 +1116,7 @@ final class AppStore: ObservableObject {
             )
         )
         do {
+            try cancelControlledEvalRunsForUndo(request)
             try MissionCleanupStore(storageRoot: environment.sandboxLifecycle.storageRoot).save(starting)
             replaceMissionCleanupState(starting)
         } catch {
@@ -1137,7 +1190,12 @@ final class AppStore: ObservableObject {
             cleanupStates: missionCleanupStates,
             productionReadinessReports: productionReadinessReports,
             aiEvalPlans: aiEvalPlans,
-            phase3ARestorationFailure: productionReadinessRestoreFailure
+            phase3ARestorationFailure: productionReadinessRestoreFailure,
+            evalRuns: controlledEvalRuns,
+            controlledEvalRestorationFailure: controlledEvalRestoreFailure,
+            controlledEvalSessionAuthority: controlledEvalSessionAuthority,
+            controlledEvalExecutionAuthorizations: controlledEvalExecutionAuthorizations,
+            controlledEvalResultReviewAuthorizations: controlledEvalResultReviewAuthorizations
         )
         .current
     }
@@ -1301,6 +1359,338 @@ final class AppStore: ObservableObject {
             Task { await refresh() }
         } catch {
             lastError = error.localizedDescription
+        }
+    }
+
+    func prepareControlledEvalExecution(_ summary: MissionSummary) {
+        guard summary.controlledEvalAction == .reviewControlledEvalExecution
+                || summary.controlledEvalAction == .reauthorizeControlledEvalExecution,
+              summary.evalRun == nil,
+              controlledEvalRestoreFailure == nil,
+              summary.lineageState == .exact,
+              summary.cleanup?.freezesMissionActions != true,
+              let eligibility = summary.controlledEvalEligibility,
+              eligibility.state == .currentAuthorizationReview
+                || eligibility.state == .reauthorizationReview,
+              let proposal = eligibility.proposal,
+              let current = exactCurrentMissionSummary(),
+              current.missionID == summary.missionID,
+              current.controlledEvalEligibility == eligibility,
+              let context = controlledEvalContext(missionRunID: summary.missionID) else {
+            lastError = "The exact controlled Eval authorization review is no longer current."
+            return
+        }
+        do {
+            let authorization = try ControlledEvalExecutionService().authorizeExecution(
+                proposal: proposal,
+                context: context
+            )
+            replaceControlledEvalExecutionAuthorization(authorization)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func confirmAuthorizedControlledEvalExecution(_ summary: MissionSummary) {
+        guard summary.controlledEvalAction == .reviewControlledEvalExecution,
+              summary.evalRun == nil,
+              controlledEvalRestoreFailure == nil,
+              summary.lineageState == .exact,
+              summary.cleanup?.freezesMissionActions != true,
+              let eligibility = summary.controlledEvalEligibility,
+              eligibility.state == .finalExecutionReview,
+              let proposal = eligibility.proposal,
+              let authorization = eligibility.authorization,
+              !controlledEvalAuthorizationsInFlight.contains(authorization.authorizationID),
+              let current = exactCurrentMissionSummary(),
+              current.missionID == summary.missionID,
+              current.controlledEvalEligibility == eligibility,
+              let report = current.productionReadinessReport,
+              let plan = current.aiEvalPlan,
+              let context = controlledEvalContext(missionRunID: summary.missionID) else {
+            lastError = "The exact single-use execution authorization is stale, consumed, or unavailable."
+            return
+        }
+        controlledEvalAuthorizationsInFlight.insert(authorization.authorizationID)
+        defer { controlledEvalAuthorizationsInFlight.remove(authorization.authorizationID) }
+        let store = ControlledEvalRunStore(storageRoot: environment.sandboxLifecycle.storageRoot)
+        do {
+            let service = ControlledEvalExecutionService()
+            let prepared = try service.prepareAuthorized(
+                report: report,
+                evalPlan: plan,
+                proposal: proposal,
+                authorization: authorization,
+                context: context
+            )
+            // Consume before persistence or execution. Any subsequent activation
+            // fails closed even if persistence cannot complete.
+            replaceControlledEvalExecutionAuthorization(prepared.consumedAuthorization)
+            try store.save(prepared.run)
+            replaceControlledEvalRun(prepared.run)
+
+            let approved = try service.approveExecution(prepared.run, context: context)
+            try store.save(approved)
+            replaceControlledEvalRun(approved)
+
+            let begun = try service.beginExecution(
+                approved,
+                report: report,
+                evalPlan: plan,
+                context: context
+            )
+            try store.save(begun)
+            replaceControlledEvalRun(begun)
+
+            let result = try service.completeExecution(
+                begun,
+                report: report,
+                evalPlan: plan,
+                context: context
+            )
+            guard result.safetyCounters.hasZeroExternalAuthority else {
+                throw ControlledEvalFailure.policyViolation
+            }
+            try store.save(result.run)
+            replaceControlledEvalRun(result.run)
+        } catch {
+            lastError = error.localizedDescription
+            Task { await refresh() }
+        }
+    }
+
+    func controlledEvalExecutionReviewEligibility(
+        _ run: EvalRun
+    ) -> ProductionReadinessReviewEligibility {
+        guard let current = exactCurrentMissionSummary(),
+              controlledEvalRestoreFailure == nil,
+              current.lineageState == .exact,
+              current.evalRun?.runID == run.runID,
+              current.cleanup?.freezesMissionActions != true,
+              run.currentState == .awaitingExecutionApproval,
+              !controlledEvalRunsInFlight.contains(run.runID),
+              let context = controlledEvalContext(missionRunID: current.missionID),
+              context.workspaceID == run.request.authority.workspaceID,
+              context.authenticatedLocalSessionID == run.request.authority.authenticatedLocalSessionID,
+              context.workspaceSessionID == run.request.authority.workspaceSessionID,
+              context.appSessionID == run.request.authority.appSessionID else {
+            return .unavailable("This Eval Run is historical, in flight, already decided, or lacks exact current-session execution authority.")
+        }
+        return .available
+    }
+
+    func confirmControlledEvalExecution(_ run: EvalRun) {
+        let eligibility = controlledEvalExecutionReviewEligibility(run)
+        guard eligibility.isAvailable,
+              let context = controlledEvalContext(missionRunID: run.request.authority.missionRunID),
+              let report = productionReadinessReports.first(where: {
+                  $0.reportID == run.request.authority.productionReadinessReportID
+              }),
+              let plan = aiEvalPlans.first(where: {
+                  $0.planID == run.request.authority.aiEvalPlanID
+              }) else {
+            lastError = eligibility.unavailableReason
+            return
+        }
+        controlledEvalRunsInFlight.insert(run.runID)
+        defer { controlledEvalRunsInFlight.remove(run.runID) }
+        let store = ControlledEvalRunStore(storageRoot: environment.sandboxLifecycle.storageRoot)
+        do {
+            let service = ControlledEvalExecutionService()
+            let approved = try service.approveExecution(run, context: context)
+            try store.save(approved)
+            replaceControlledEvalRun(approved)
+
+            // Persist EXECUTING before evaluating. A process interruption can
+            // therefore only restore as STOPPED_FAIL_CLOSED, never completed.
+            let begun = try service.beginExecution(
+                approved,
+                report: report,
+                evalPlan: plan,
+                context: context
+            )
+            try store.save(begun)
+            replaceControlledEvalRun(begun)
+
+            let result = try service.completeExecution(
+                begun,
+                report: report,
+                evalPlan: plan,
+                context: context
+            )
+            guard result.safetyCounters.hasZeroExternalAuthority else {
+                throw ControlledEvalFailure.policyViolation
+            }
+            try store.save(result.run)
+            replaceControlledEvalRun(result.run)
+        } catch {
+            lastError = error.localizedDescription
+            Task { await refresh() }
+        }
+    }
+
+    func evalResultsReviewEligibility(
+        _ run: EvalRun
+    ) -> ProductionReadinessReviewEligibility {
+        guard let current = exactCurrentMissionSummary(),
+              controlledEvalRestoreFailure == nil,
+              current.lineageState == .exact,
+              current.evalRun?.runID == run.runID,
+              current.cleanup?.freezesMissionActions != true,
+              current.controlledEvalResultReviewEligibility?.state == .finalDecisionReview,
+              let authorization = current.controlledEvalResultReviewEligibility?.authorization,
+              !controlledEvalResultReviewAuthorizationsInFlight.contains(authorization.authorizationID) else {
+            return .unavailable("These results are finalized, blocked, or lack exact current-session result-review authority.")
+        }
+        return .available
+    }
+
+    func prepareControlledEvalResultReview(_ summary: MissionSummary) {
+        guard summary.controlledEvalAction == .authorizeEvalResultReview
+                || summary.controlledEvalAction == .reauthorizeEvalResultReview,
+              controlledEvalRestoreFailure == nil,
+              summary.lineageState == .exact,
+              summary.cleanup?.freezesMissionActions != true,
+              let eligibility = summary.controlledEvalResultReviewEligibility,
+              eligibility.state == .currentAuthorizationReview
+                || eligibility.state == .reauthorizationReview,
+              let proposal = eligibility.proposal,
+              let current = exactCurrentMissionSummary(),
+              current.missionID == summary.missionID,
+              current.controlledEvalResultReviewEligibility == eligibility,
+              let context = controlledEvalContext(missionRunID: summary.missionID) else {
+            lastError = "The exact Eval Result authorization review is no longer current."
+            return
+        }
+        do {
+            let authorization = try ControlledEvalExecutionService().authorizeResultReview(
+                proposal: proposal,
+                context: context
+            )
+            replaceControlledEvalResultReviewAuthorization(authorization)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func reviewEvalResults(
+        _ run: EvalRun,
+        decision: EvalRunReviewDecisionKind,
+        instructions: String?
+    ) {
+        guard let current = exactCurrentMissionSummary(),
+              current.evalRun?.runID == run.runID,
+              let eligibility = current.controlledEvalResultReviewEligibility,
+              eligibility.state == .finalDecisionReview,
+              let proposal = eligibility.proposal,
+              let authorization = eligibility.authorization,
+              !controlledEvalResultReviewAuthorizationsInFlight.contains(authorization.authorizationID),
+              let exactRun = current.evalRun,
+              let report = current.productionReadinessReport,
+              let plan = current.aiEvalPlan,
+              let context = controlledEvalContext(missionRunID: current.missionID) else {
+            lastError = "The exact single-use Eval Result review authorization is stale, consumed, or unavailable."
+            return
+        }
+        controlledEvalResultReviewAuthorizationsInFlight.insert(authorization.authorizationID)
+        defer { controlledEvalResultReviewAuthorizationsInFlight.remove(authorization.authorizationID) }
+        do {
+            let reviewed = try ControlledEvalExecutionService().reviewResultsAuthorized(
+                exactRun,
+                report: report,
+                evalPlan: plan,
+                proposal: proposal,
+                authorization: authorization,
+                decision: decision,
+                instructions: instructions,
+                context: context
+            )
+            // Consume before persistence so a failed save cannot make the same
+            // current-session authorization reusable.
+            replaceControlledEvalResultReviewAuthorization(reviewed.consumedAuthorization)
+            guard reviewed.safetyCounters.hasZeroExternalAuthority else {
+                throw ControlledEvalFailure.policyViolation
+            }
+            try ControlledEvalRunStore(
+                storageRoot: environment.sandboxLifecycle.storageRoot
+            ).save(reviewed.run)
+            replaceControlledEvalRun(reviewed.run)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func controlledEvalContext(missionRunID: UUID) -> ControlledEvalExecutionContext? {
+        guard let workspace = selectedWorkspace,
+              let authenticatedLocalSessionID = session?.id,
+              session?.workspaceID == workspace.id,
+              let workspaceSessionID = activeWorkspaceSessionID else {
+            return nil
+        }
+        return ControlledEvalExecutionContext(
+            missionRunID: missionRunID,
+            workspaceID: workspace.id,
+            authenticatedLocalSessionID: authenticatedLocalSessionID,
+            workspaceSessionID: workspaceSessionID,
+            appSessionID: appSessionID
+        )
+    }
+
+    private func replaceControlledEvalRun(_ run: EvalRun) {
+        controlledEvalRuns.removeAll { $0.runID == run.runID }
+        controlledEvalRuns.append(run)
+        controlledEvalRuns.sort {
+            if $0.updatedAt == $1.updatedAt { return $0.runID.uuidString < $1.runID.uuidString }
+            return $0.updatedAt < $1.updatedAt
+        }
+    }
+
+    private func replaceControlledEvalExecutionAuthorization(
+        _ authorization: ControlledEvalExecutionAuthorization
+    ) {
+        controlledEvalExecutionAuthorizations.removeAll {
+            $0.authorizationID == authorization.authorizationID
+                || ($0.authority.missionRunID == authorization.authority.missionRunID
+                    && $0.authority.workspaceID == authorization.authority.workspaceID)
+        }
+        controlledEvalExecutionAuthorizations.append(authorization)
+    }
+
+    private func replaceControlledEvalResultReviewAuthorization(
+        _ authorization: ControlledEvalResultReviewAuthorization
+    ) {
+        controlledEvalResultReviewAuthorizations.removeAll {
+            $0.authorizationID == authorization.authorizationID
+                || ($0.workspaceID == authorization.workspaceID
+                    && $0.missionRunID == authorization.missionRunID
+                    && $0.runID == authorization.runID)
+        }
+        controlledEvalResultReviewAuthorizations.append(authorization)
+    }
+
+    private func cancelControlledEvalRunsForUndo(_ request: MissionUndoRequest) throws {
+        let eligible = controlledEvalRuns.filter {
+            $0.request.authority.missionRunID == request.missionID
+                && ($0.currentState == .awaitingExecutionApproval || $0.currentState?.isExecutionActive == true)
+        }
+        guard !eligible.isEmpty else { return }
+        guard let context = controlledEvalContext(missionRunID: request.missionID) else {
+            throw ControlledEvalFailure.sessionMismatch
+        }
+        let service = ControlledEvalExecutionService()
+        let store = ControlledEvalRunStore(storageRoot: environment.sandboxLifecycle.storageRoot)
+        for run in eligible {
+            let authority = run.request.authority
+            guard authority.workspaceID == request.workspaceID,
+                  authority.canonicalLegacyRoot == request.canonicalLegacyRoot,
+                  authority.sourceSnapshotID == request.sourceSnapshotID,
+                  authority.readinessSourceBinding.candidatePatchManifestID == request.candidatePatchManifestID,
+                  authority.readinessSourceBinding.candidatePatchArtifactSHA256 == request.candidatePatchArtifactSHA256 else {
+                throw ControlledEvalFailure.authorityMismatch
+            }
+            let cancelled = try service.cancel(run, context: context)
+            try store.save(cancelled)
+            replaceControlledEvalRun(cancelled)
         }
     }
 
