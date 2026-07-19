@@ -186,7 +186,8 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
 
         XCTAssertNil(result.task)
         XCTAssertEqual(result.normalChatLifecycle, .failed)
-        XCTAssertFalse(session.conversation.messages.contains { $0.sender == .agent })
+        XCTAssertEqual(session.conversation.messages.filter { $0.sender == .agent }.count, 1)
+        XCTAssertEqual(session.conversation.messages.last?.content, "Unable to reach the configured AI provider.")
         let submittedInputs = await runtime.submittedInputs()
         XCTAssertTrue(submittedInputs.isEmpty)
     }
@@ -267,7 +268,8 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
         XCTAssertFalse(result.waitingForUser)
         XCTAssertNil(result.task)
         XCTAssertEqual(result.normalChatLifecycle, .failed)
-        XCTAssertFalse(session.conversation.messages.contains { $0.sender == .agent })
+        XCTAssertEqual(session.conversation.messages.filter { $0.sender == .agent }.count, 1)
+        XCTAssertEqual(session.conversation.messages.last?.content, "Unable to reach the configured AI provider.")
         let recordedEvents = await runtime.recordedEvents()
         XCTAssertEqual(recordedEvents.last?.payload["runtime_mode"], AgentRuntimeMode.fallback.rawValue)
         XCTAssertEqual(recordedEvents.last?.payload["used_fallback"], "true")
@@ -292,7 +294,8 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
         XCTAssertFalse(result.waitingForUser)
         XCTAssertNil(result.task)
         XCTAssertEqual(result.normalChatLifecycle, .failed)
-        XCTAssertFalse(session.conversation.messages.contains { $0.sender == .agent })
+        XCTAssertEqual(session.conversation.messages.filter { $0.sender == .agent }.count, 1)
+        XCTAssertEqual(session.conversation.messages.last?.content, "Unable to reach the configured AI provider.")
         let recordedEvents = await runtime.recordedEvents()
         XCTAssertEqual(recordedEvents.last?.payload["runtime_mode"], AgentRuntimeMode.fallback.rawValue)
         XCTAssertEqual(recordedEvents.last?.payload["model_provider"], "")
@@ -550,8 +553,10 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
         XCTAssertEqual(session.interactionState, .working)
         XCTAssertEqual(session.conversation.messages.prefix(previousMessages.count), previousMessages[...])
         XCTAssertEqual(result.normalChatLifecycle, .failed)
-        XCTAssertEqual(session.conversation.messages.last?.sender, .user)
-        XCTAssertEqual(session.conversation.messages.last?.content, "你能做什么？")
+        XCTAssertEqual(session.conversation.messages.suffix(2).first?.sender, .user)
+        XCTAssertEqual(session.conversation.messages.suffix(2).first?.content, "你能做什么？")
+        XCTAssertEqual(session.conversation.messages.last?.sender, .agent)
+        XCTAssertEqual(session.conversation.messages.last?.content, "Unable to reach the configured AI provider.")
         let submittedInputs = await runtime.submittedInputs()
         let controlActions = await runtime.recordedControlActions()
         XCTAssertTrue(submittedInputs.isEmpty)
@@ -1355,6 +1360,56 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
             XCTAssertEqual(result.task?.id, taskID, phrase)
             XCTAssertEqual(recoveries, [phrase], phrase)
             XCTAssertTrue(submissions.isEmpty, phrase)
+        }
+    }
+
+    func testCasualIdentityAndCapabilityQuestionsRemainSingleReplyChatOnly() async throws {
+        let messages = [
+            "Hello",
+            "Who are you?",
+            "What can you do?",
+            "Hello, who are you? What can you do?",
+            "你好",
+            "你是谁？",
+            "你可以做什么？"
+        ]
+
+        for message in messages {
+            let workspace = Workspace.default()
+            var session = AgentSession(workspace: workspace, userGoal: message)
+            let runtime = FakeAgentRuntime()
+            let response = message.unicodeScalars.contains(where: { $0.value > 127 })
+                ? "我是 FDE。我可以回答问题，也可以在你明确要求时处理所选代码库中的工程任务。"
+                : "I am FDE. I can answer questions and, when explicitly asked, work on the selected codebase."
+            let coordinator = AgentRuntimeCoordinator(
+                chatProvider: FakeAgentChatProvider(content: response)
+            )
+
+            let result = try await coordinator.startMission(
+                input: message,
+                workspace: workspace,
+                session: &session,
+                runtime: runtime
+            )
+
+            XCTAssertNil(result.task, message)
+            XCTAssertFalse(result.waitingForUser, message)
+            XCTAssertEqual(session.currentState, .idle, message)
+            XCTAssertEqual(session.interactionState, .idle, message)
+            XCTAssertTrue(session.artifacts.isEmpty, message)
+            XCTAssertNil(session.runtimeTaskID, message)
+            XCTAssertEqual(session.conversation.messages.filter { $0.sender == .user }.count, 1, message)
+            XCTAssertEqual(session.conversation.messages.filter { $0.sender == .agent }.count, 1, message)
+            let submittedInputs = await runtime.submittedInputs()
+            XCTAssertTrue(submittedInputs.isEmpty, message)
+            let events = await runtime.recordedEvents()
+            XCTAssertEqual(
+                events.first?.payload["selected_route"],
+                AgentRequestRoute.conversationalChat.rawValue,
+                message
+            )
+            XCTAssertTrue(events.allSatisfy { $0.taskID == nil }, message)
+            XCTAssertTrue(events.allSatisfy { $0.payload["chat_only"] == "true" }, message)
         }
     }
 

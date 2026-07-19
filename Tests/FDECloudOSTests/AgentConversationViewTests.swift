@@ -142,4 +142,42 @@ final class AgentConversationViewTests: XCTestCase {
         XCTAssertTrue(messageRow.contains("message.sender == .user ? 0 : 0.7"))
         XCTAssertTrue(messageRow.contains("Text(message.content)"))
     }
+
+    func testOrdinaryAgentChatReplyRemainsVisibleWithoutMissionOrArtifact() throws {
+        let workspace = Workspace.default()
+        var session = AgentSession.newConversation(in: workspace)
+        session.beginConversation(with: "Hello", timestamp: Date(timeIntervalSince1970: 1))
+        let agentReply = AgentMessage(
+            timestamp: Date(timeIntervalSince1970: 2),
+            sender: .agent,
+            type: .text,
+            content: "Hello — I am FDE."
+        )
+        session.appendInteractionMessage(agentReply)
+
+        let items = AgentConversationWorkUnitAdapter.displayItems(
+            conversation: session.conversation,
+            events: []
+        )
+        let visible = AgentConversationWorkUnitAdapter.conciseDisplayItems(
+            from: items,
+            hasMissionAssets: false
+        )
+        let agentReplies = visible.compactMap { item -> String? in
+            switch item.content {
+            case let .message(message):
+                return message.sender == .agent ? message.content : nil
+            case let .streamingResponse(response):
+                return response.markdown
+            }
+        }
+
+        XCTAssertNil(session.runtimeTaskID)
+        XCTAssertTrue(session.artifacts.isEmpty)
+        XCTAssertEqual(agentReplies, ["Hello — I am FDE."])
+        XCTAssertEqual(
+            StructuredAgentResponseProjector.response(for: agentReply).summary,
+            "Hello — I am FDE."
+        )
+    }
 }

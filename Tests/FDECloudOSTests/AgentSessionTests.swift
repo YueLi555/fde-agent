@@ -108,6 +108,7 @@ final class AgentSessionTests: XCTestCase {
     func testBlockedStateUpdateDoesNotLeaveSidebarExecuting() {
         var session = AgentSession(workspace: Workspace.default(), userGoal: "Inspect project")
         let taskID = UUID()
+        session.workspaceContext.runtimeTaskID = taskID
         session.apply(event: makeEvent(.toolCalled, sequence: 1, workspaceID: session.workspaceID, taskID: taskID))
         XCTAssertEqual(session.currentState, .executing)
 
@@ -198,6 +199,7 @@ final class AgentSessionTests: XCTestCase {
     func testPostCompletionPolicyEventsKeepInteractionCompleted() {
         var session = AgentSession(workspace: Workspace.default(), userGoal: "Investigate API")
         let taskID = UUID()
+        session.workspaceContext.runtimeTaskID = taskID
 
         session.apply(
             event: makeEvent(
@@ -221,6 +223,7 @@ final class AgentSessionTests: XCTestCase {
     func testFeedbackEventCreatesActionableArtifactFromPayloadDetail() {
         var session = AgentSession(workspace: Workspace.default(), userGoal: "Assess AI agent integration")
         let taskID = UUID()
+        session.workspaceContext.runtimeTaskID = taskID
         let detail = "Verdict: Assessment-only complete.\nProblems to resolve:\n- Identify the legacy extension point."
 
         session.apply(
@@ -245,6 +248,7 @@ final class AgentSessionTests: XCTestCase {
     func testImplementationFeedbackEventsCreatePatchAndVerificationArtifacts() {
         var session = AgentSession(workspace: Workspace.default(), userGoal: "Approved AI agent implementation")
         let taskID = UUID()
+        session.workspaceContext.runtimeTaskID = taskID
 
         session.apply(
             event: makeEvent(

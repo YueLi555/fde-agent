@@ -119,9 +119,10 @@ struct AgentWorkspaceView: View {
 
                     Spacer(minLength: 16)
 
-                    Text(store.selectedConversationActivity?.conversationTitle ?? session.interactionState.conversationTitle)
+                    let status = store.selectedConversationStatus ?? .idle
+                    Text(status.conversationTitle)
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(store.selectedConversationActivity?.conversationColor ?? session.interactionState.conversationColor)
+                        .foregroundStyle(status.conversationColor)
                 }
 
                 if let activity = store.selectedConversationActivity,
@@ -148,9 +149,9 @@ struct AgentWorkspaceView: View {
                     session: session,
                     events: store.selectedAgentSessionEvents,
                     activity: store.selectedConversationActivity,
-                    candidatePatchAssets: store.conversationAssetProjection.candidatePatches,
-                    generatedTestAssets: store.conversationAssetProjection.generatedTestPlans,
-                    generatedTestArtifactAssets: store.conversationAssetProjection.generatedTestArtifacts,
+                    candidatePatchAssets: store.selectedConversationAssetProjection.candidatePatches,
+                    generatedTestAssets: store.selectedConversationAssetProjection.generatedTestPlans,
+                    generatedTestArtifactAssets: store.selectedConversationAssetProjection.generatedTestArtifacts,
                     productionReadinessReports: store.productionReadinessReports,
                     aiEvalPlans: store.aiEvalPlans,
                     productionReadinessRestoreFailure: store.productionReadinessRestoreFailure,

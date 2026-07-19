@@ -136,6 +136,44 @@ struct AgentConversationWorkUnitAdapter: Sendable {
         }
     }
 
+    /// Conversation-first visibility keeps the latest ordinary Agent reply
+    /// visible even when it is represented as a streaming response. Mission
+    /// assets may replace only their own duplicated terminal result card.
+    static func conciseDisplayItems(
+        from displayItems: [AgentConversationDisplayItem],
+        hasMissionAssets: Bool
+    ) -> [AgentConversationDisplayItem] {
+        let lastAgentID = displayItems.reversed().first(where: { item in
+            switch item.content {
+            case let .message(message): return message.sender == .agent
+            case .streamingResponse: return true
+            }
+        })?.id
+
+        return displayItems.filter { item in
+            switch item.content {
+            case let .message(message):
+                if item.id == lastAgentID,
+                   !(hasMissionAssets && message.type == .result) {
+                    return true
+                }
+                return message.sender == .user
+                    || !message.options.isEmpty
+                    || message.type == .question
+                    || message.type == .decisionRequest
+                    || message.type == .warning
+                    || (!hasMissionAssets && message.type == .result)
+            case let .streamingResponse(response):
+                if item.id == lastAgentID,
+                   !(hasMissionAssets && response.messageType == .result) {
+                    return true
+                }
+                return response.messageType == .warning
+                    || (!hasMissionAssets && response.messageType == .result)
+            }
+        }
+    }
+
     static func workStatusCards(
         conversation: AgentConversation,
         events: [ExecutionEvent]

@@ -100,22 +100,26 @@ final class MissionPresentationTests: XCTestCase {
 
     func testCurrentRunIsDeterministicAndOneMissionProducesOneHistoryRow() {
         let fixture = Fixture()
+        let historicalMissionID = UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!
         let currentRevision = fixture.patch(revision: 3, state: .patchReady)
         let olderCurrentRevision = fixture.patch(revision: 2, state: .patchReady)
         let historicalA = fixture.patch(
-            missionID: UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!,
+            missionID: historicalMissionID,
             planID: UUID(uuidString: "00000000-0000-0000-0000-0000000000B1")!,
             revision: 1,
             state: .reverted
         )
         let historicalB = fixture.patch(
-            missionID: UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!,
+            missionID: historicalMissionID,
             planID: UUID(uuidString: "00000000-0000-0000-0000-0000000000B2")!,
             revision: 2,
             state: .sandboxDestroyed
         )
         let state = fixture.project(
-            session: fixture.session(interaction: .completed),
+            session: fixture.session(
+                interaction: .completed,
+                missionTaskIDs: [fixture.missionID, fixture.planningTaskID, historicalMissionID]
+            ),
             candidates: [historicalA, currentRevision, historicalB, olderCurrentRevision, historicalA]
         )
         XCTAssertEqual(state.current.candidatePatch?.planRevision, 3)
@@ -672,7 +676,7 @@ final class MissionPresentationTests: XCTestCase {
         XCTAssertFalse(state.current.undoEligible)
     }
 
-    func testLatestExactCompletedMissionWinsOverIncompleteFallback() {
+    func testSelectedIncompleteMissionDoesNotFallBackToLatestExactCompletedMission() {
         let fixture = Fixture()
         let exactMissionID = UUID(uuidString: "00000000-0000-0000-0000-00000000010A")!
         let exactCandidatePlanID = UUID(uuidString: "00000000-0000-0000-0000-00000000010B")!
@@ -704,10 +708,14 @@ final class MissionPresentationTests: XCTestCase {
             plans: [fixture.plan(status: .testPlanReviewReady), exactPlan],
             artifacts: [exactArtifact]
         )
-        XCTAssertEqual(state.current.missionID, exactMissionID)
-        XCTAssertEqual(state.current.lineageState, .exact)
-        XCTAssertEqual(state.current.generatedTestArtifact?.artifactID, exactArtifact.artifactID)
+        XCTAssertEqual(state.current.missionID, fixture.missionID)
+        XCTAssertEqual(state.current.lineageState, .incomplete)
+        XCTAssertNil(state.current.generatedTestArtifact)
+        XCTAssertFalse(state.current.undoEligible)
         XCTAssertTrue(state.current.isTerminal)
+        let historical = state.previousRuns.first { $0.missionID == exactMissionID }
+        XCTAssertNotNil(historical)
+        XCTAssertFalse(historical?.exposesMutationActions ?? true)
     }
 
     func testExactPlanAndArtifactParentChainRemainsActionable() {

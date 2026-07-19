@@ -170,7 +170,15 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
     }
 
     mutating func apply(event: ExecutionEvent) {
-        guard event.workspaceID == workspaceID else { return }
+        let isExactSessionEvent = AgentSessionEventScope.belongsToSession(event, session: self)
+        // Reducer callers may explicitly seed a session with its first task.
+        // AppStore never chooses that session by selection/recency: its event
+        // index requires a session ID or an already-linked exact task.
+        let isInitialTaskLink = runtimeTaskID == nil
+            && event.workspaceID == workspaceID
+            && event.type == .taskCreated
+            && event.taskID != nil
+        guard isExactSessionEvent || isInitialTaskLink else { return }
         if let runtimeTaskID, let eventTaskID = event.taskID, runtimeTaskID != eventTaskID {
             let isKnownMissionChild = workspaceContext.missionTaskIDs?.contains(eventTaskID) == true
             guard event.exactParentMissionRunID == runtimeTaskID

@@ -91,29 +91,10 @@ struct AgentConversationView: View {
         let hasMissionAssets = !candidatePatchAssets.isEmpty
             || !generatedTestAssets.isEmpty
             || !generatedTestArtifactAssets.isEmpty
-        let lastAgentID = displayItems.reversed().first(where: { item in
-            switch item.content {
-            case let .message(message): return message.sender == .agent
-            case .streamingResponse: return true
-            }
-        })?.id
-        return displayItems.filter { item in
-            switch item.content {
-            case let .message(message):
-                if item.id == lastAgentID,
-                   !(hasMissionAssets && message.type == .result) {
-                    return true
-                }
-                return message.sender == .user
-                    || !message.options.isEmpty
-                    || message.type == .question
-                    || message.type == .decisionRequest
-                    || message.type == .warning
-                    || (!hasMissionAssets && message.type == .result)
-            case let .streamingResponse(response):
-                return response.messageType == .warning || response.messageType == .result
-            }
-        }
+        return AgentConversationWorkUnitAdapter.conciseDisplayItems(
+            from: displayItems,
+            hasMissionAssets: hasMissionAssets
+        )
     }
 
     private var workDetailDisplayItems: [AgentConversationDisplayItem] {
@@ -1675,6 +1656,21 @@ extension AgentInteractionState {
         case .blocked: return .orange
         case .completed: return .green
         case .failed: return .red
+        }
+    }
+
+    var conversationSymbol: String {
+        switch self {
+        case .idle: return "circle"
+        case .understanding: return "brain.head.profile"
+        case .planning: return "list.bullet.clipboard"
+        case .working: return "terminal"
+        case .waitingForUser: return "person.crop.circle.badge.questionmark"
+        case .waitingForApproval: return "checkmark.shield"
+        case .verifying: return "checkmark.magnifyingglass"
+        case .blocked: return "exclamationmark.octagon"
+        case .completed: return "checkmark.seal"
+        case .failed: return "xmark.octagon"
         }
     }
 }

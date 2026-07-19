@@ -869,7 +869,9 @@ struct AgentRuntimeCoordinator: Sendable {
         if missionClassifier.isPriorWorkQuestion(input) {
             return .conversationalChat
         }
-        if isCapabilityQuestion || missionClassifier.isAgentAbilityQuestion(input) {
+        if missionClassifier.isIdentityQuestion(input)
+            || isCapabilityQuestion
+            || missionClassifier.isAgentAbilityQuestion(input) {
             return .conversationalChat
         }
         if missionClassifier.isCasualChat(input) || missionClassifier.isFeedbackOrComplaint(input) {
@@ -913,6 +915,9 @@ struct AgentRuntimeCoordinator: Sendable {
         includeActiveTaskContext: Bool = false
     ) async throws -> [ExecutionEvent] {
         session.setInteractionState(restoreInteractionState ?? .idle)
+        if session.runtimeTaskID == nil {
+            session.currentState = .idle
+        }
         let auditTaskID = includeActiveTaskContext ? session.runtimeTaskID : nil
         let answer = await workspaceQuestionAnswerer.answer(input: input, intent: intent, workspace: workspace)
         session.appendInteractionMessage(
@@ -996,16 +1001,21 @@ struct AgentRuntimeCoordinator: Sendable {
                 includeActiveTaskContext: includeActiveTaskContext
             )
         }
-        if chatLifecycle(for: response) != .failed {
-            session.appendInteractionMessage(
-                AgentMessage(
-                    sender: .agent,
-                    type: .text,
-                    content: response.content
-                )
+        // Provider failure is still a completed conversational turn from the
+        // user's perspective. Persist the honest fallback as the single Agent
+        // reply; the separate failed lifecycle remains transient status and
+        // diagnostic metadata, not a substitute for conversation content.
+        session.appendInteractionMessage(
+            AgentMessage(
+                sender: .agent,
+                type: .text,
+                content: response.content
             )
-        }
+        )
         session.setInteractionState(restoreInteractionState ?? .idle)
+        if session.runtimeTaskID == nil {
+            session.currentState = .idle
+        }
         return response
     }
 
@@ -1649,7 +1659,7 @@ struct AgentMissionClassifier: Sendable {
         )
     }
 
-    private func isIdentityQuestion(_ input: String) -> Bool {
+    func isIdentityQuestion(_ input: String) -> Bool {
         let text = normalized(input)
         return containsAny(
             text,

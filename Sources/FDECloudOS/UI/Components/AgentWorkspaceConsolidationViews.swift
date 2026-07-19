@@ -718,37 +718,41 @@ struct WorkspaceInspectorView: View {
         }
     }
 
+    @ViewBuilder
     private var evidence: some View {
-        let summary = store.selectedMissionPresentation?.current
-        let revision = summary?.evalRun?.currentRevision
-        return VStack(alignment: .leading, spacing: 12) {
-            inspectorMetric("Summarized evidence", value: store.selectedAgentSession?.evidence.count ?? 0)
-            inspectorMetric("Candidate Patch evidence", value: summary?.candidatePatch?.evidenceCount ?? 0)
-            inspectorMetric("Fixture result count", value: revision?.scenarioExecutions.flatMap(\.results).count ?? 0)
-            inspectorMetric("Metric result count", value: revision?.metricResults.count ?? 0)
+        if let summary = store.selectedMissionPresentation?.current {
+            let revision = summary.evalRun?.currentRevision
+            VStack(alignment: .leading, spacing: 12) {
+                inspectorMetric("Summarized evidence", value: store.selectedAgentSession?.evidence.count ?? 0)
+                inspectorMetric("Candidate Patch evidence", value: summary.candidatePatch?.evidenceCount ?? 0)
+                inspectorMetric("Fixture result count", value: revision?.scenarioExecutions.flatMap(\.results).count ?? 0)
+                inspectorMetric("Metric result count", value: revision?.metricResults.count ?? 0)
 
-            if let blocker = summary?.lineageFailureReason
-                ?? summary?.controlledEvalRestorationFailureReason
-                ?? store.selectedConversationActivity?.metadata.blockerReason {
-                inspectorCard("Blocker", value: blocker, symbol: "exclamationmark.triangle")
-            }
-            if let unknowns = summary?.generatedTestPlan?.remainingUnknowns, !unknowns.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Unknowns")
-                        .font(.caption.weight(.semibold))
-                    ForEach(unknowns, id: \.self) { unknown in
-                        Text("• \(unknown)")
-                            .font(.caption)
+                if let blocker = summary.lineageFailureReason
+                    ?? summary.controlledEvalRestorationFailureReason
+                    ?? store.selectedConversationActivity?.metadata.blockerReason {
+                    inspectorCard("Blocker", value: blocker, symbol: "exclamationmark.triangle")
+                }
+                if let unknowns = summary.generatedTestPlan?.remainingUnknowns, !unknowns.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Unknowns")
+                            .font(.caption.weight(.semibold))
+                        ForEach(unknowns, id: \.self) { unknown in
+                            Text("• \(unknown)")
+                                .font(.caption)
+                        }
                     }
                 }
             }
+        } else {
+            ContentUnavailableView("No evidence yet", systemImage: "tray")
         }
     }
 
     @ViewBuilder
     private var activity: some View {
         let events = Array(store.selectedAgentSessionEvents.suffix(40).reversed())
-        if events.isEmpty {
+        if store.selectedConversationScope?.hasLinkedMission != true || events.isEmpty {
             ContentUnavailableView("No activity yet", systemImage: "waveform.path.ecg")
         } else {
             VStack(alignment: .leading, spacing: 10) {
@@ -1063,7 +1067,10 @@ struct HumanActionBar: View {
     }
 
     private var currentAction: WorkspaceHumanAction? {
-        guard let summary = store.selectedMissionPresentation?.current else { return nil }
+        guard let summary = store.selectedMissionPresentation?.current,
+              store.isMissionSummaryBoundToSelectedConversation(summary) else {
+            return nil
+        }
         var actions: [WorkspaceHumanAction] = []
         let decisions = HumanReviewDecision.allCases
 
@@ -1267,7 +1274,8 @@ struct HumanActionBar: View {
 
     private func submit(_ action: WorkspaceHumanAction, decision: HumanReviewDecision) {
         guard action.descriptor.canSubmit(decision: decision, note: reviewNote),
-              !isSubmitting else { return }
+              !isSubmitting,
+              actionIsStillBoundToSelectedConversation(action) else { return }
         isSubmitting = true
         let note = reviewNote.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -1302,6 +1310,28 @@ struct HumanActionBar: View {
             decision == .approve ? store.approve(approval) : store.reject(approval)
         case let .undo(summary):
             store.openMissionUndoConfirmation(summary)
+        }
+    }
+
+    private func actionIsStillBoundToSelectedConversation(_ action: WorkspaceHumanAction) -> Bool {
+        switch action.target {
+        case let .candidate(approval), let .generic(approval):
+            return store.isApprovalBoundToSelectedConversation(approval)
+        case let .undo(summary),
+             let .authorizedEvalExecution(summary),
+             let .evalAuthorization(summary),
+             let .evalResultAuthorization(summary):
+            return store.isMissionSummaryBoundToSelectedConversation(summary)
+        case let .generatedTest(artifact):
+            return store.isGeneratedTestArtifactBoundToSelectedConversation(artifact)
+        case let .readiness(report):
+            return store.selectedConversationScope?.containsMissionTask(report.sourceBinding.missionRunID) == true
+        case let .evalPlan(plan):
+            return store.selectedConversationScope?.containsMissionTask(
+                plan.sourceBinding.readinessSourceBinding.missionRunID
+            ) == true
+        case let .evalExecution(run), let .evalResults(run):
+            return store.selectedConversationScope?.containsMissionTask(run.request.authority.missionRunID) == true
         }
     }
 

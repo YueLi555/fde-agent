@@ -134,12 +134,18 @@ final class AppStore: ObservableObject {
     }
 
     var selectedAgentSession: AgentSession? {
-        if let selectedAgentSessionID,
-           let selectedSession = agentSessions.first(where: { $0.sessionID == selectedAgentSessionID }) {
-            return selectedSession
+        guard let selectedAgentSessionID else { return nil }
+        return agentSessions.first { session in
+            session.sessionID == selectedAgentSessionID
+                && session.workspaceID == selectedWorkspace?.id
         }
-        guard let workspaceID = selectedWorkspace?.id else { return agentSessions.first }
-        return agentSessions.first { $0.workspaceID == workspaceID }
+    }
+
+    /// Center-workspace authority starts with the selected conversation. A
+    /// chat-only session has no Mission scope and therefore cannot project a
+    /// task, approval, artifact, or mutation from another conversation.
+    var selectedConversationScope: AgentSessionMissionScope? {
+        selectedAgentSession.map(AgentSessionMissionScope.init)
     }
 
     var selectedWorkspaceAgentSessions: [AgentSession] {
@@ -147,12 +153,21 @@ final class AppStore: ObservableObject {
         return agentSessions.filter { $0.workspaceID == workspaceID }
     }
 
+    var selectedConversationStatus: AgentInteractionState? {
+        guard let selectedAgentSessionID else { return nil }
+        return conversationStatus(for: selectedAgentSessionID)
+    }
+
+    func conversationStatus(for sessionID: UUID) -> AgentInteractionState? {
+        agentSessions.first { session in
+            session.sessionID == sessionID
+                && session.workspaceID == selectedWorkspace?.id
+        }?.interactionState
+    }
+
     var selectedTask: FDETask? {
-        if selectedAgentSession?.runtimeTaskID == nil, selectedAgentSessionID != nil {
-            return nil
-        }
-        guard let selectedTaskID else { return tasks.first }
-        return tasks.first { $0.id == selectedTaskID }
+        guard let runtimeTaskID = selectedAgentSession?.runtimeTaskID else { return nil }
+        return tasks.first { $0.id == runtimeTaskID }
     }
 
     var controlledEvalSessionAuthority: ControlledEvalSessionAuthority? {
@@ -171,8 +186,58 @@ final class AppStore: ObservableObject {
     }
 
     var selectedTaskPendingApprovals: [ApprovalRequest] {
-        guard let selectedTaskID else { return [] }
-        return pendingApprovals.filter { $0.taskID == selectedTaskID }
+        guard let scope = selectedConversationScope, scope.hasLinkedMission else { return [] }
+        return pendingApprovals.filter { scope.containsMissionTask($0.taskID) }
+    }
+
+    func isApprovalBoundToSelectedConversation(_ approval: ApprovalRequest) -> Bool {
+        AgentSessionAuthorityEvaluator.approvalIsBound(
+            approval,
+            scope: selectedConversationScope,
+            visiblePendingApprovalIDs: Set(selectedTaskPendingApprovals.map(\.id))
+        )
+    }
+
+    func isMissionSummaryBoundToSelectedConversation(_ summary: MissionSummary) -> Bool {
+        AgentSessionAuthorityEvaluator.missionIsBound(
+            summary,
+            current: selectedMissionPresentation?.current,
+            scope: selectedConversationScope
+        )
+    }
+
+    func isCandidatePatchBoundToSelectedConversation(
+        _ snapshot: CandidatePatchActivitySnapshot
+    ) -> Bool {
+        guard let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
+              selectedConversationScope?.containsMissionTask(missionID) == true else {
+            return false
+        }
+        return selectedConversationAssetProjection.candidatePatches.contains {
+            $0.assetID == snapshot.assetID
+        }
+    }
+
+    func isGeneratedTestPlanBoundToSelectedConversation(
+        _ snapshot: GeneratedTestActivitySnapshot
+    ) -> Bool {
+        guard let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
+              selectedConversationScope?.containsMissionTask(missionID) == true else {
+            return false
+        }
+        return selectedConversationAssetProjection.generatedTestPlans.contains {
+            $0.assetID == snapshot.assetID
+        }
+    }
+
+    func isGeneratedTestArtifactBoundToSelectedConversation(
+        _ artifact: GeneratedTestArtifact
+    ) -> Bool {
+        let missionID = artifact.sourceBinding.generatedTestSourceBinding.sourceCandidatePatchTaskID
+        guard selectedConversationScope?.containsMissionTask(missionID) == true else { return false }
+        return selectedConversationAssetProjection.generatedTestArtifacts.contains {
+            $0.artifactID == artifact.artifactID
+        }
     }
 
     var selectedAgentSessionEvents: [ExecutionEvent] {
@@ -189,13 +254,17 @@ final class AppStore: ObservableObject {
     }
 
     var selectedMissionPresentation: MissionPresentationState? {
-        guard let session = selectedAgentSession, !session.isEmptyConversation else { return nil }
+        guard let session = selectedAgentSession,
+              !session.isEmptyConversation,
+              selectedConversationScope?.hasLinkedMission == true else {
+            return nil
+        }
         return MissionPresentationProjector.project(
             session: session,
             activity: selectedConversationActivity,
-            candidatePatches: conversationAssetProjection.candidatePatches,
-            generatedTestPlans: conversationAssetProjection.generatedTestPlans,
-            generatedTestArtifacts: conversationAssetProjection.generatedTestArtifacts,
+            candidatePatches: selectedConversationAssetProjection.candidatePatches,
+            generatedTestPlans: selectedConversationAssetProjection.generatedTestPlans,
+            generatedTestArtifacts: selectedConversationAssetProjection.generatedTestArtifacts,
             approvals: selectedTaskPendingApprovals,
             cleanupStates: missionCleanupStates,
             productionReadinessReports: productionReadinessReports,
@@ -206,6 +275,34 @@ final class AppStore: ObservableObject {
             controlledEvalSessionAuthority: controlledEvalSessionAuthority,
             controlledEvalExecutionAuthorizations: controlledEvalExecutionAuthorizations,
             controlledEvalResultReviewAuthorizations: controlledEvalResultReviewAuthorizations
+        )
+    }
+
+    var selectedConversationAssetProjection: AgentConversationAssetProjection {
+        guard let scope = selectedConversationScope,
+              scope.hasLinkedMission,
+              let session = selectedAgentSession,
+              let missionRunID = MissionPresentationProjector.selectedMissionRunID(
+                  for: session,
+                  candidatePatches: conversationAssetProjection.candidatePatches,
+                  generatedTestPlans: conversationAssetProjection.generatedTestPlans,
+                  generatedTestArtifacts: conversationAssetProjection.generatedTestArtifacts
+              ) else {
+            return .empty
+        }
+        return AgentConversationAssetProjection(
+            candidatePatches: conversationAssetProjection.candidatePatches.filter {
+                $0.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)) == missionRunID
+            },
+            generatedTestPlans: conversationAssetProjection.generatedTestPlans.filter { plan in
+                plan.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)) == missionRunID
+                    && scope.containsMissionTask(plan.planningTaskID.flatMap(UUID.init(uuidString:)))
+            },
+            generatedTestArtifacts: conversationAssetProjection.generatedTestArtifacts.filter { artifact in
+                let binding = artifact.sourceBinding.generatedTestSourceBinding
+                return binding.sourceCandidatePatchTaskID == missionRunID
+                    && scope.containsMissionTask(binding.generatedTestPlanningTaskID)
+            }
         )
     }
 
@@ -292,19 +389,13 @@ final class AppStore: ObservableObject {
     }
 
     var latestGovernorDecision: GlobalGovernorDecision? {
-        if let selectedTaskID,
-           let selectedDecision = governorDecisions.first(where: { $0.taskID == selectedTaskID }) {
-            return selectedDecision
-        }
-        return governorDecisions.first
+        guard let taskID = selectedAgentSession?.runtimeTaskID else { return nil }
+        return governorDecisions.first { $0.taskID == taskID }
     }
 
     var latestPolicyDelta: ExecutionPolicyDelta? {
-        if let selectedTaskID,
-           let selectedDelta = policyDeltas.first(where: { $0.sourceTaskID == selectedTaskID }) {
-            return selectedDelta
-        }
-        return policyDeltas.first
+        guard let taskID = selectedAgentSession?.runtimeTaskID else { return nil }
+        return policyDeltas.first { $0.sourceTaskID == taskID }
     }
 
     var canViewDiagnostics: Bool {
@@ -396,13 +487,7 @@ final class AppStore: ObservableObject {
 
         do {
             tasks = try await environment.persistence.loadTasks(workspaceID: workspace.id)
-            if let runtimeTaskID = selectedAgentSession?.runtimeTaskID {
-                selectedTaskID = runtimeTaskID
-            } else if selectedAgentSessionID != nil {
-                selectedTaskID = nil
-            } else if selectedTaskID == nil {
-                selectedTaskID = tasks.first?.id
-            }
+            selectedTaskID = selectedAgentSession?.runtimeTaskID
             await refreshSelectedTaskDetails()
             let graph = try await environment.persistence.loadGraph(workspaceID: workspace.id)
             graphNodes = graph.0
@@ -555,11 +640,16 @@ final class AppStore: ObservableObject {
         cancelCandidatePatchApprovalConfirmation()
         cancelCandidatePatchRevertConfirmation()
         cancelCandidatePatchDestructionConfirmation()
-        selectedTaskID = taskID
-        if let taskID,
-           let session = agentSessions.first(where: { $0.runtimeTaskID == taskID }) {
-            selectedAgentSessionID = session.sessionID
+        guard let taskID,
+              let session = agentSessions.first(where: {
+                  $0.runtimeTaskID == taskID && $0.workspaceID == selectedWorkspace?.id
+              }) else {
+            selectedTaskID = nil
+            Task { await refreshSelectedTaskDetails() }
+            return
         }
+        selectedAgentSessionID = session.sessionID
+        selectedTaskID = taskID
         Task { await refreshSelectedTaskDetails() }
     }
 
@@ -628,12 +718,14 @@ final class AppStore: ObservableObject {
                     reactivatesCurrentTask: false
                 )
                 composerFocusRequestID = UUID()
+                let originatingSession = agentSessions[index]
                 Task {
+                    defer {
+                        endSubmission(fingerprint, sessionID: selectedAgentSessionID)
+                        composerFocusRequestID = UUID()
+                    }
                     do {
-                        guard let currentIndex = agentSessions.firstIndex(where: {
-                            $0.sessionID == selectedAgentSessionID
-                        }) else { return }
-                        var session = agentSessions[currentIndex]
+                        var session = originatingSession
                         let result = try await runtimeCoordinator.startMission(
                             input: input,
                             workspace: workspace,
@@ -641,10 +733,16 @@ final class AppStore: ObservableObject {
                             runtime: environment.runtime,
                             userMessageID: requestID
                         )
-                        agentSessions[currentIndex] = session
+                        guard AgentSessionAsyncBinding.commit(
+                            originatingSession: originatingSession,
+                            updatedSession: session,
+                            into: &agentSessions
+                        ) else { return }
                         if let task = result.task {
-                            selectedTaskID = task.id
                             linkRuntimeTask(task, to: selectedAgentSessionID)
+                            if self.selectedAgentSessionID == selectedAgentSessionID {
+                                self.selectedTaskID = task.id
+                            }
                         }
                         finishActivity(for: selectedAgentSessionID, requestID: requestID, result: result)
                         await refresh()
@@ -658,8 +756,6 @@ final class AppStore: ObservableObject {
                         )
                         lastError = error.localizedDescription
                     }
-                    endSubmission(fingerprint, sessionID: selectedAgentSessionID)
-                    composerFocusRequestID = UUID()
                 }
                 return
             }
@@ -706,11 +802,14 @@ final class AppStore: ObservableObject {
             )
         }
         composerFocusRequestID = UUID()
+        guard let originatingSession = agentSessions.first(where: {
+            $0.sessionID == agentSessionID
+        }) else { return }
 
         Task {
+            defer { endSubmission(fingerprint, sessionID: agentSessionID) }
             do {
-                guard let index = agentSessions.firstIndex(where: { $0.sessionID == agentSessionID }) else { return }
-                var session = agentSessions[index]
+                var session = originatingSession
                 let result = try await runtimeCoordinator.startMission(
                     input: input,
                     workspace: workspace,
@@ -718,10 +817,16 @@ final class AppStore: ObservableObject {
                     runtime: environment.runtime,
                     userMessageID: requestID
                 )
-                agentSessions[index] = session
+                guard AgentSessionAsyncBinding.commit(
+                    originatingSession: originatingSession,
+                    updatedSession: session,
+                    into: &agentSessions
+                ) else { return }
                 if let task = result.task {
-                    selectedTaskID = task.id
                     linkRuntimeTask(task, to: agentSessionID)
+                    if self.selectedAgentSessionID == agentSessionID {
+                        self.selectedTaskID = task.id
+                    }
                 }
                 finishActivity(for: agentSessionID, requestID: requestID, result: result)
                 await refresh()
@@ -730,7 +835,6 @@ final class AppStore: ObservableObject {
                 failActivity(for: agentSessionID, requestID: requestID, scope: scope, error: error)
                 lastError = error.localizedDescription
             }
-            endSubmission(fingerprint, sessionID: agentSessionID)
         }
     }
 
@@ -774,6 +878,11 @@ final class AppStore: ObservableObject {
     }
 
     func approve(_ approval: ApprovalRequest) {
+        guard isApprovalBoundToSelectedConversation(approval),
+              let originatingSessionID = selectedAgentSessionID else {
+            lastError = "This approval is not bound to the selected conversation and Mission."
+            return
+        }
         if let missionID = approval.taskID,
            missionCleanupState(for: missionID)?.freezesMissionActions == true {
             lastError = "This exact mission is locked while Undo this run is being completed."
@@ -798,7 +907,7 @@ final class AppStore: ObservableObject {
                     workspace: workspace,
                     reason: "Approved from Agent Workspace"
                 )
-                if let event = applyApprovalGranted(approval.id) {
+                if let event = applyApprovalGranted(approval.id, to: originatingSessionID) {
                     try await recordInteractionEvent(event, workspace: workspace, taskID: approval.taskID)
                 }
                 await refresh()
@@ -811,6 +920,7 @@ final class AppStore: ObservableObject {
     func candidatePatchReviewEligibility(_ approval: ApprovalRequest) -> Bool {
         guard approval.targetKind == .candidatePatchPlan,
               approval.state == .pending,
+              isApprovalBoundToSelectedConversation(approval),
               selectedTaskPendingApprovals.contains(where: { $0.id == approval.id }),
               !candidatePatchReviewActionsInFlight.contains(approval.id),
               candidatePatchApprovalConfirmation == nil,
@@ -824,6 +934,7 @@ final class AppStore: ObservableObject {
     func confirmCandidatePatchApproval(_ confirmation: CandidatePatchApprovalConfirmation) {
         guard confirmation == candidatePatchApprovalConfirmation,
               let workspace = selectedWorkspace,
+              let originatingSessionID = selectedAgentSessionID,
               let context = candidatePatchApprovalUIContext(for: confirmation.approvalRequestID) else {
             lastError = "The Candidate Patch approval is no longer the visible pending request."
             cancelCandidatePatchApprovalConfirmation()
@@ -846,7 +957,10 @@ final class AppStore: ObservableObject {
                     reason: "Confirmed from Candidate Patch approval sheet"
                 )
                 candidatePatchApprovalConfirmation = nil
-                if let event = applyApprovalGranted(confirmation.approvalRequestID) {
+                if let event = applyApprovalGranted(
+                    confirmation.approvalRequestID,
+                    to: originatingSessionID
+                ) {
                     try await recordInteractionEvent(event, workspace: workspace, taskID: confirmation.taskID)
                 }
                 await refresh()
@@ -870,8 +984,13 @@ final class AppStore: ObservableObject {
     }
 
     func openCandidatePatchRevertConfirmation(_ snapshot: CandidatePatchActivitySnapshot) {
-        if let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
-           missionCleanupState(for: missionID)?.freezesMissionActions == true {
+        guard isCandidatePatchBoundToSelectedConversation(snapshot),
+              let originatingSessionID = selectedAgentSessionID,
+              let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)) else {
+            lastError = "The Candidate Patch Revert target is not bound to the selected conversation and Mission."
+            return
+        }
+        if missionCleanupState(for: missionID)?.freezesMissionActions == true {
             lastError = "This exact mission is locked while Undo this run is being completed."
             return
         }
@@ -898,6 +1017,12 @@ final class AppStore: ObservableObject {
                         workspace: workspace
                     )
                 }
+                if let index = agentSessions.firstIndex(where: { $0.sessionID == originatingSessionID }) {
+                    agentSessions[index].linkMissionChildTask(
+                        requestingTask,
+                        missionRunID: missionID
+                    )
+                }
                 let context = CandidatePatchRevertUIContext(
                     currentWorkspaceID: workspace.id,
                     currentTaskID: requestingTask.id,
@@ -906,7 +1031,7 @@ final class AppStore: ObservableObject {
                     authenticatedLocalSessionID: authenticatedLocalSessionID,
                     appSessionID: appSessionID
                 )
-                candidatePatchRevertConfirmation = try await environment.runtime
+                let confirmation = try await environment.runtime
                     .beginCandidatePatchRevertConfirmation(
                         patchID: patchID,
                         sandboxID: sandboxID,
@@ -914,6 +1039,14 @@ final class AppStore: ObservableObject {
                         context: context,
                         source: source
                     )
+                guard selectedAgentSessionID == originatingSessionID,
+                      isCandidatePatchBoundToSelectedConversation(snapshot) else {
+                    await environment.runtime.cancelCandidatePatchRevertConfirmation(
+                        confirmation.confirmationStepID
+                    )
+                    return
+                }
+                candidatePatchRevertConfirmation = confirmation
                 await refresh()
             } catch {
                 candidatePatchRevertConfirmation = nil
@@ -924,8 +1057,13 @@ final class AppStore: ObservableObject {
     }
 
     func prepareGeneratedTestPlan(_ snapshot: CandidatePatchActivitySnapshot) {
-        if let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
-           missionCleanupState(for: missionID)?.freezesMissionActions == true {
+        guard isCandidatePatchBoundToSelectedConversation(snapshot),
+              let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
+              let originatingSessionID = selectedAgentSessionID else {
+            lastError = "The Candidate Patch is not bound to the selected conversation and Mission."
+            return
+        }
+        if missionCleanupState(for: missionID)?.freezesMissionActions == true {
             lastError = "This exact mission is locked while Undo this run is being completed."
             return
         }
@@ -950,14 +1088,15 @@ final class AppStore: ObservableObject {
                     workspace: workspace,
                     context: context
                 )
-                if let selectedAgentSessionID,
-                   let index = agentSessions.firstIndex(where: { $0.sessionID == selectedAgentSessionID }) {
+                if let index = agentSessions.firstIndex(where: { $0.sessionID == originatingSessionID }) {
                     agentSessions[index].linkMissionChildTask(
                         task,
                         missionRunID: sourceBinding.sourceCandidatePatchTaskID
                     )
                 }
-                selectedTaskID = sourceBinding.sourceCandidatePatchTaskID
+                if selectedAgentSessionID == originatingSessionID {
+                    selectedTaskID = sourceBinding.sourceCandidatePatchTaskID
+                }
                 await refresh()
             } catch {
                 lastError = error.localizedDescription
@@ -969,6 +1108,9 @@ final class AppStore: ObservableObject {
     func generatedTestPlanGenerationEligibility(
         _ snapshot: GeneratedTestActivitySnapshot
     ) -> GeneratedTestPlanGenerationEligibility {
+        guard isGeneratedTestPlanBoundToSelectedConversation(snapshot) else {
+            return .unavailable("This Generated Test Plan is not bound to the selected conversation and Mission.")
+        }
         if let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
            missionCleanupState(for: missionID)?.freezesMissionActions == true {
             return .unavailable("This exact mission is locked while Undo this run is being completed.")
@@ -1163,6 +1305,9 @@ final class AppStore: ObservableObject {
     func generatedTestArtifactReviewEligibility(
         _ artifact: GeneratedTestArtifact
     ) -> GeneratedTestArtifactReviewEligibility {
+        guard isGeneratedTestArtifactBoundToSelectedConversation(artifact) else {
+            return .unavailable("This Generated Test Artifact is not bound to the selected conversation and Mission.")
+        }
         let missionID = artifact.sourceBinding.generatedTestSourceBinding.sourceCandidatePatchTaskID
         if missionCleanupState(for: missionID)?.freezesMissionActions == true {
             return .unavailable("This exact mission is locked while Undo this run is being completed.")
@@ -1190,30 +1335,17 @@ final class AppStore: ObservableObject {
     func openMissionUndoConfirmation(_ summary: MissionSummary) {
         guard missionUndoConfirmation == nil,
               let workspace = selectedWorkspace,
-              let session = selectedAgentSession,
+              let scope = selectedConversationScope,
+              scope.containsMissionTask(summary.missionID),
               summary.cleanup?.phase != .cleanedUp,
               summary.cleanup?.freezesMissionActions != true else {
             lastError = "Undo this run is unavailable because this exact mission is already being cleaned up."
             return
         }
-        let exactCurrent = MissionPresentationProjector.project(
-            session: session,
-            activity: selectedConversationActivity,
-            candidatePatches: conversationAssetProjection.candidatePatches,
-            generatedTestPlans: conversationAssetProjection.generatedTestPlans,
-            generatedTestArtifacts: conversationAssetProjection.generatedTestArtifacts,
-            approvals: selectedTaskPendingApprovals,
-            cleanupStates: missionCleanupStates,
-            productionReadinessReports: productionReadinessReports,
-            aiEvalPlans: aiEvalPlans,
-            phase3ARestorationFailure: productionReadinessRestoreFailure,
-            evalRuns: controlledEvalRuns,
-            controlledEvalRestorationFailure: controlledEvalRestoreFailure,
-            controlledEvalSessionAuthority: controlledEvalSessionAuthority,
-            controlledEvalExecutionAuthorizations: controlledEvalExecutionAuthorizations,
-            controlledEvalResultReviewAuthorizations: controlledEvalResultReviewAuthorizations
-        )
-        .current
+        guard let exactCurrent = selectedMissionPresentation?.current else {
+            lastError = "Undo this run could not bind to the selected conversation."
+            return
+        }
         guard summary.undoEligible,
               summary.lineageState == .exact,
               summary.missionID == exactCurrent.missionID,
@@ -1234,6 +1366,9 @@ final class AppStore: ObservableObject {
         guard confirmation == missionUndoConfirmation,
               let workspace = selectedWorkspace,
               confirmation.request.workspaceID == workspace.id,
+              let current = exactCurrentMissionSummary(),
+              current.missionID == confirmation.request.missionID,
+              current.lineage?.lineageKey == confirmation.request.lineageKey,
               !isConfirmingMissionUndo else {
             lastError = "The Undo this run confirmation is no longer current."
             cancelMissionUndoConfirmation()
@@ -1294,7 +1429,8 @@ final class AppStore: ObservableObject {
     }
 
     func retryMissionCleanup(_ summary: MissionSummary) {
-        guard let workspace = selectedWorkspace,
+        guard isMissionSummaryBoundToSelectedConversation(summary),
+              let workspace = selectedWorkspace,
               let cleanup = missionCleanupState(for: summary.missionID),
               cleanup.phase == .partialFailure,
               !isConfirmingMissionUndo else {
@@ -1329,29 +1465,12 @@ final class AppStore: ObservableObject {
     }
 
     private func exactCurrentMissionSummary() -> MissionSummary? {
-        guard let session = selectedAgentSession else { return nil }
-        return MissionPresentationProjector.project(
-            session: session,
-            activity: selectedConversationActivity,
-            candidatePatches: conversationAssetProjection.candidatePatches,
-            generatedTestPlans: conversationAssetProjection.generatedTestPlans,
-            generatedTestArtifacts: conversationAssetProjection.generatedTestArtifacts,
-            approvals: selectedTaskPendingApprovals,
-            cleanupStates: missionCleanupStates,
-            productionReadinessReports: productionReadinessReports,
-            aiEvalPlans: aiEvalPlans,
-            phase3ARestorationFailure: productionReadinessRestoreFailure,
-            evalRuns: controlledEvalRuns,
-            controlledEvalRestorationFailure: controlledEvalRestoreFailure,
-            controlledEvalSessionAuthority: controlledEvalSessionAuthority,
-            controlledEvalExecutionAuthorizations: controlledEvalExecutionAuthorizations,
-            controlledEvalResultReviewAuthorizations: controlledEvalResultReviewAuthorizations
-        )
-        .current
+        selectedMissionPresentation?.current
     }
 
     func reviewProductionReadiness(_ summary: MissionSummary) {
-        guard summary.postReadyAction == .reviewProductionReadiness,
+        guard isMissionSummaryBoundToSelectedConversation(summary),
+              summary.postReadyAction == .reviewProductionReadiness,
               productionReadinessRestoreFailure == nil,
               summary.phase == .ready,
               summary.lineageState == .exact,
@@ -1960,7 +2079,11 @@ final class AppStore: ObservableObject {
     func confirmCandidatePatchRevert(_ confirmation: CandidatePatchRevertConfirmation) {
         guard confirmation == candidatePatchRevertConfirmation,
               let workspace = selectedWorkspace,
-              let authenticatedLocalSessionID = session?.id else {
+              let authenticatedLocalSessionID = session?.id,
+              candidatePatchBindingIsCurrent(
+                  patchID: confirmation.binding.patchID,
+                  sandboxID: confirmation.binding.sandboxID
+              ) else {
             lastError = "The Candidate Patch Revert confirmation is no longer current."
             cancelCandidatePatchRevertConfirmation()
             return
@@ -2007,14 +2130,19 @@ final class AppStore: ObservableObject {
     }
 
     func openCandidatePatchDestructionConfirmation(_ snapshot: CandidatePatchActivitySnapshot) {
-        if let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
-           missionCleanupState(for: missionID)?.freezesMissionActions == true {
+        guard isCandidatePatchBoundToSelectedConversation(snapshot),
+              let missionID = snapshot.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)),
+              let originatingSessionID = selectedAgentSessionID else {
+            lastError = "The Candidate Patch Sandbox is not bound to the selected conversation and Mission."
+            return
+        }
+        if missionCleanupState(for: missionID)?.freezesMissionActions == true {
             lastError = "This exact mission is locked while Undo this run is being completed."
             return
         }
         guard candidatePatchDestructionConfirmation == nil,
               let workspace = selectedWorkspace,
-              let taskID = selectedTaskID,
+              let taskID = selectedAgentSession?.runtimeTaskID,
               let patchID = snapshot.patchID.flatMap(CandidatePatchID.init(rawValue:)),
               let sandboxID = snapshot.sandboxID.flatMap(SandboxID.init(rawValue:)),
               let authenticatedLocalSessionID = session?.id,
@@ -2033,7 +2161,7 @@ final class AppStore: ObservableObject {
         let source = candidatePatchApprovalInvocationSource()
         Task {
             do {
-                candidatePatchDestructionConfirmation = try await environment.runtime
+                let confirmation = try await environment.runtime
                     .beginCandidatePatchSandboxDestructionConfirmation(
                         patchID: patchID,
                         sandboxID: sandboxID,
@@ -2041,6 +2169,14 @@ final class AppStore: ObservableObject {
                         context: context,
                         source: source
                     )
+                guard selectedAgentSessionID == originatingSessionID,
+                      isCandidatePatchBoundToSelectedConversation(snapshot) else {
+                    await environment.runtime.cancelCandidatePatchSandboxDestructionConfirmation(
+                        confirmation.confirmationStepID
+                    )
+                    return
+                }
+                candidatePatchDestructionConfirmation = confirmation
                 await refresh()
             } catch {
                 candidatePatchDestructionConfirmation = nil
@@ -2055,7 +2191,11 @@ final class AppStore: ObservableObject {
     ) {
         guard confirmation == candidatePatchDestructionConfirmation,
               let workspace = selectedWorkspace,
-              let authenticatedLocalSessionID = session?.id else {
+              let authenticatedLocalSessionID = session?.id,
+              candidatePatchBindingIsCurrent(
+                  patchID: confirmation.binding.patchID,
+                  sandboxID: confirmation.binding.sandboxID
+              ) else {
             lastError = "The Sandbox destruction confirmation is no longer current."
             cancelCandidatePatchDestructionConfirmation()
             return
@@ -2107,19 +2247,28 @@ final class AppStore: ObservableObject {
     ) {
         guard candidatePatchApprovalConfirmation == nil,
               let workspace = selectedWorkspace,
+              let originatingSessionID = selectedAgentSessionID,
               let context = candidatePatchApprovalUIContext(for: approval.id) else {
             lastError = "The Candidate Patch approval is not the current visible pending request."
             return
         }
         Task {
             do {
-                candidatePatchApprovalConfirmation = try await environment.runtime
+                let confirmation = try await environment.runtime
                     .beginCandidatePatchApprovalConfirmation(
                         approval.id,
                         workspace: workspace,
                         context: context,
                         source: source
                     )
+                guard selectedAgentSessionID == originatingSessionID,
+                      isApprovalBoundToSelectedConversation(approval) else {
+                    await environment.runtime.cancelCandidatePatchApprovalConfirmation(
+                        confirmation.confirmationStepID
+                    )
+                    return
+                }
+                candidatePatchApprovalConfirmation = confirmation
             } catch {
                 candidatePatchApprovalConfirmation = nil
                 lastError = error.localizedDescription
@@ -2132,7 +2281,9 @@ final class AppStore: ObservableObject {
         for approvalRequestID: UUID
     ) -> CandidatePatchApprovalUIContext? {
         guard let workspaceID = selectedWorkspace?.id,
-              let taskID = selectedTaskID,
+              let taskID = selectedAgentSession?.runtimeTaskID,
+              let scope = selectedConversationScope,
+              scope.containsMissionTask(taskID),
               let authenticatedUserSessionID = session?.id,
               session?.workspaceID == workspaceID,
               selectedTaskPendingApprovals.contains(where: {
@@ -2160,7 +2311,25 @@ final class AppStore: ObservableObject {
         }
     }
 
+    private func candidatePatchBindingIsCurrent(
+        patchID: CandidatePatchID,
+        sandboxID: SandboxID
+    ) -> Bool {
+        guard let current = exactCurrentMissionSummary(),
+              isMissionSummaryBoundToSelectedConversation(current),
+              current.candidatePatch?.patchID == patchID.rawValue,
+              current.candidatePatch?.sandboxID == sandboxID.rawValue else {
+            return false
+        }
+        return true
+    }
+
     func reject(_ approval: ApprovalRequest) {
+        guard isApprovalBoundToSelectedConversation(approval),
+              let originatingSessionID = selectedAgentSessionID else {
+            lastError = "This approval is not bound to the selected conversation and Mission."
+            return
+        }
         if let missionID = approval.taskID,
            missionCleanupState(for: missionID)?.freezesMissionActions == true {
             lastError = "This exact mission is locked while Undo this run is being completed."
@@ -2182,7 +2351,7 @@ final class AppStore: ObservableObject {
                     workspace: workspace,
                     reason: "Rejected from Agent Workspace"
                 )
-                if let event = applyApprovalRejected(approval.id) {
+                if let event = applyApprovalRejected(approval.id, to: originatingSessionID) {
                     try await recordInteractionEvent(event, workspace: workspace, taskID: approval.taskID)
                 }
                 await refresh()
@@ -2199,6 +2368,10 @@ final class AppStore: ObservableObject {
     }
 
     func requestCandidatePatchChanges(_ approval: ApprovalRequest, revisionInstructions: String) {
+        guard isApprovalBoundToSelectedConversation(approval) else {
+            lastError = "This approval is not bound to the selected conversation and Mission."
+            return
+        }
         if let missionID = approval.taskID,
            missionCleanupState(for: missionID)?.freezesMissionActions == true {
             lastError = "This exact mission is locked while Undo this run is being completed."
@@ -2345,12 +2518,6 @@ final class AppStore: ObservableObject {
         guard event.workspaceID == selectedWorkspaceID else { return }
         applyAgentEvent(event)
         scheduleAgentNarrationEnrichment(for: event)
-        if event.type == .taskCreated, let taskID = event.taskID, isRunning || selectedTaskID == nil {
-            selectedTaskID = taskID
-            events = []
-            replayFrames = []
-            missionReplay = nil
-        }
         if shouldAppendLiveEvent(event) {
             appendLiveEvent(event)
         }
@@ -2358,15 +2525,7 @@ final class AppStore: ObservableObject {
     }
 
     private func shouldAppendLiveEvent(_ event: ExecutionEvent) -> Bool {
-        if let selectedTaskID {
-            return event.taskID == selectedTaskID
-                || event.payload["session_id"] == selectedAgentSessionID?.uuidString
-        }
-
-        guard let selectedAgentSession else {
-            return event.taskID == nil
-        }
-
+        guard let selectedAgentSession else { return false }
         return AgentSessionEventScope.belongsToSession(event, session: selectedAgentSession)
     }
 
@@ -2386,7 +2545,11 @@ final class AppStore: ObservableObject {
         guard let workspace = selectedWorkspace else { return }
 
         do {
-            events = try await environment.persistence.loadEvents(workspaceID: workspace.id, taskID: selectedTaskID)
+            // Conversation projection filters this workspace event ledger by
+            // exact Agent Session and Mission lineage. Loading the ledger here
+            // also preserves session-tagged chat events and exact child-task
+            // events that an exact root-task query would omit.
+            events = try await environment.persistence.loadEvents(workspaceID: workspace.id, taskID: nil)
             if let selectedTaskID {
                 do {
                     replayFrames = try await environment.runtime.replay(taskID: selectedTaskID, workspaceID: workspace.id)
@@ -2479,8 +2642,9 @@ final class AppStore: ObservableObject {
         isRestoringWorkspaceUIState = true
         agentSessions = validSessions
         composerDrafts = state.drafts.filter { validSessionIDs.contains($0.key) }
-        selectedAgentSessionID = state.selectedSessionID.flatMap { activeSessionIDs.contains($0) ? $0 : nil }
-            ?? validSessions.first(where: { activeWorkspaceID == nil || $0.workspaceID == activeWorkspaceID })?.sessionID
+        selectedAgentSessionID = state.selectedSessionID.flatMap {
+            activeSessionIDs.contains($0) ? $0 : nil
+        }
         isInspectorPresented = state.isInspectorPresented
         commandText = selectedAgentSessionID.flatMap { composerDrafts[$0] } ?? ""
         isRestoringWorkspaceUIState = false
@@ -2507,61 +2671,76 @@ final class AppStore: ObservableObject {
         workspaceEvents: [ExecutionEvent]
     ) {
         guard !conversationAssetProjection.candidatePatches.isEmpty,
-              !agentSessions.contains(where: { $0.workspaceID == workspace.id }),
-              let sourceTaskID = conversationAssetProjection.candidatePatches
-                .compactMap(\.sourceCandidatePatchTaskID)
-                .compactMap(UUID.init(uuidString:))
-                .last,
-              let task = tasks.first(where: { $0.id == sourceTaskID }) else {
+              !agentSessions.contains(where: { $0.workspaceID == workspace.id }) else {
             return
         }
-        let taskEvents = workspaceEvents.filter { $0.taskID == task.id }
-        let conversation = AgentResponseComposer.replayConversation(
-            sessionID: task.id,
-            workspaceID: workspace.id,
-            userRequest: task.rawInput,
-            events: taskEvents,
-            createdAt: task.createdAt
+
+        let sourceTaskIDs = Set(
+            conversationAssetProjection.candidatePatches
+                .compactMap(\.sourceCandidatePatchTaskID)
+                .compactMap(UUID.init(uuidString:))
         )
-        var workspaceContext = AgentWorkspaceContext(workspace: workspace)
-        var missionTaskIDs = [sourceTaskID]
-        for plan in conversationAssetProjection.generatedTestPlans
-        where plan.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)) == sourceTaskID {
-            if let planningTaskID = plan.planningTaskID.flatMap(UUID.init(uuidString:)),
-               !missionTaskIDs.contains(planningTaskID) {
-                missionTaskIDs.append(planningTaskID)
+        let restorableTasks = tasks
+            .filter { sourceTaskIDs.contains($0.id) }
+            .sorted { lhs, rhs in
+                if lhs.createdAt == rhs.createdAt { return lhs.id.uuidString < rhs.id.uuidString }
+                return lhs.createdAt > rhs.createdAt
             }
+
+        for task in restorableTasks {
+            var workspaceContext = AgentWorkspaceContext(workspace: workspace)
+            var missionTaskIDs = [task.id]
+            for plan in conversationAssetProjection.generatedTestPlans
+            where plan.sourceCandidatePatchTaskID.flatMap(UUID.init(uuidString:)) == task.id {
+                if let planningTaskID = plan.planningTaskID.flatMap(UUID.init(uuidString:)),
+                   !missionTaskIDs.contains(planningTaskID) {
+                    missionTaskIDs.append(planningTaskID)
+                }
+            }
+            for artifact in conversationAssetProjection.generatedTestArtifacts
+            where artifact.sourceBinding.generatedTestSourceBinding.sourceCandidatePatchTaskID == task.id {
+                let planningTaskID = artifact.sourceBinding.generatedTestSourceBinding.generatedTestPlanningTaskID
+                if !missionTaskIDs.contains(planningTaskID) { missionTaskIDs.append(planningTaskID) }
+            }
+            workspaceContext.missionTaskIDs = missionTaskIDs
+            workspaceContext.linkRuntimeTask(task)
+            let taskEvents = workspaceEvents.filter { event in
+                event.payload["session_id"] == task.id.uuidString
+                    || event.taskID.map(missionTaskIDs.contains) == true
+                    || event.exactParentMissionRunID.map(missionTaskIDs.contains) == true
+            }
+            let conversation = AgentResponseComposer.replayConversation(
+                sessionID: task.id,
+                workspaceID: workspace.id,
+                userRequest: task.rawInput,
+                events: taskEvents,
+                createdAt: task.createdAt
+            )
+            agentSessions.append(AgentSession(
+                sessionID: task.id,
+                workspaceID: workspace.id,
+                userGoal: task.rawInput,
+                createdAt: task.createdAt,
+                currentState: .completed,
+                interactionState: .completed,
+                currentPlan: task.plan,
+                conversation: conversation,
+                workspaceContext: workspaceContext
+            ))
         }
-        for artifact in conversationAssetProjection.generatedTestArtifacts
-        where artifact.sourceBinding.generatedTestSourceBinding.sourceCandidatePatchTaskID == sourceTaskID {
-            let planningTaskID = artifact.sourceBinding.generatedTestSourceBinding.generatedTestPlanningTaskID
-            if !missionTaskIDs.contains(planningTaskID) { missionTaskIDs.append(planningTaskID) }
-        }
-        workspaceContext.missionTaskIDs = missionTaskIDs
-        workspaceContext.linkRuntimeTask(task)
-        let restored = AgentSession(
-            sessionID: task.id,
-            workspaceID: workspace.id,
-            userGoal: task.rawInput,
-            createdAt: task.createdAt,
-            currentState: .completed,
-            interactionState: .completed,
-            currentPlan: task.plan,
-            conversation: conversation,
-            workspaceContext: workspaceContext
-        )
-        agentSessions.insert(restored, at: 0)
-        selectedAgentSessionID = restored.sessionID
-        selectedTaskID = task.id
+        // Restored workspace history is not current-conversation authority.
+        // The user must select an exact restored conversation before its
+        // Mission, artifacts, or Human Action can project.
+        selectedAgentSessionID = nil
+        selectedTaskID = nil
     }
 
     private func linkRuntimeTask(_ task: FDETask, to sessionID: UUID) {
         guard let index = agentSessions.firstIndex(where: { session in
-            session.sessionID == sessionID || session.runtimeTaskID == task.id
+            session.sessionID == sessionID && session.workspaceID == task.workspaceID
         }) else { return }
 
         agentSessions[index].syncRuntimeTask(task)
-        selectedAgentSessionID = agentSessions[index].sessionID
     }
 
     private func failAgentSession(_ sessionID: UUID, with error: Error) {
@@ -2572,26 +2751,33 @@ final class AppStore: ObservableObject {
     func selectDecision(messageID: UUID, optionID: String) {
         guard let workspace = selectedWorkspace,
               let sessionID = selectedAgentSessionID,
-              let event = applyDecisionSelection(messageID: messageID, optionID: optionID, to: sessionID) else {
+              let event = applyDecisionSelection(messageID: messageID, optionID: optionID, to: sessionID),
+              let originatingSession = agentSessions.first(where: { $0.sessionID == sessionID }) else {
             return
         }
         let decision = event.payload["decision"] ?? optionID
+        let taskID = originatingSession.runtimeTaskID
         Task {
             do {
-                try await recordInteractionEvent(event, workspace: workspace, taskID: selectedTaskID)
-                if let index = agentSessions.firstIndex(where: { $0.sessionID == sessionID }),
-                   agentSessions[index].runtimeTaskID == nil {
-                    var session = agentSessions[index]
+                try await recordInteractionEvent(event, workspace: workspace, taskID: taskID)
+                if originatingSession.runtimeTaskID == nil {
+                    var session = originatingSession
                     let result = try await runtimeCoordinator.resumeMissionFromSelectedDecision(
                         decision: decision,
                         workspace: workspace,
                         session: &session,
                         runtime: environment.runtime
                     )
-                    agentSessions[index] = session
+                    guard AgentSessionAsyncBinding.commit(
+                        originatingSession: originatingSession,
+                        updatedSession: session,
+                        into: &agentSessions
+                    ) else { return }
                     if let task = result.task {
-                        selectedTaskID = task.id
                         linkRuntimeTask(task, to: sessionID)
+                        if selectedAgentSessionID == sessionID {
+                            selectedTaskID = task.id
+                        }
                     }
                 }
                 await refresh()
@@ -2604,24 +2790,31 @@ final class AppStore: ObservableObject {
     func approveCurrentPlan() {
         guard let workspace = selectedWorkspace,
               let sessionID = selectedAgentSessionID,
-              let event = applyPlanApproval(to: sessionID) else {
+              let event = applyPlanApproval(to: sessionID),
+              let originatingSession = agentSessions.first(where: { $0.sessionID == sessionID }) else {
             return
         }
+        let taskID = originatingSession.runtimeTaskID
         Task {
             do {
-                try await recordInteractionEvent(event, workspace: workspace, taskID: selectedTaskID)
-                if let index = agentSessions.firstIndex(where: { $0.sessionID == sessionID }),
-                   shouldStartApprovedImplementation(for: agentSessions[index]) {
-                    var session = agentSessions[index]
+                try await recordInteractionEvent(event, workspace: workspace, taskID: taskID)
+                if shouldStartApprovedImplementation(for: originatingSession) {
+                    var session = originatingSession
                     let result = try await runtimeCoordinator.startApprovedImplementation(
                         workspace: workspace,
                         session: &session,
                         runtime: environment.runtime
                     )
-                    agentSessions[index] = session
+                    guard AgentSessionAsyncBinding.commit(
+                        originatingSession: originatingSession,
+                        updatedSession: session,
+                        into: &agentSessions
+                    ) else { return }
                     if let task = result.task {
-                        selectedTaskID = task.id
                         linkRuntimeTask(task, to: sessionID)
+                        if selectedAgentSessionID == sessionID {
+                            selectedTaskID = task.id
+                        }
                     }
                 }
                 await refresh()
@@ -2634,12 +2827,13 @@ final class AppStore: ObservableObject {
     func modifyCurrentPlan() {
         guard let workspace = selectedWorkspace,
               let sessionID = selectedAgentSessionID,
-              let event = applyPlanModificationRequest(to: sessionID) else {
+              let event = applyPlanModificationRequest(to: sessionID),
+              let taskID = agentSessions.first(where: { $0.sessionID == sessionID })?.runtimeTaskID else {
             return
         }
         Task {
             do {
-                try await recordInteractionEvent(event, workspace: workspace, taskID: selectedTaskID)
+                try await recordInteractionEvent(event, workspace: workspace, taskID: taskID)
                 await refresh()
             } catch {
                 lastError = error.localizedDescription
@@ -2654,13 +2848,16 @@ final class AppStore: ObservableObject {
         requestID: UUID,
         inputFingerprint: UInt64
     ) {
-        guard let workspace = selectedWorkspace else {
+        guard let workspace = selectedWorkspace,
+              let originatingSession = agentSessions.first(where: {
+                  $0.sessionID == sessionID && $0.workspaceID == workspace.id
+              }) else {
             return
         }
         Task {
+            defer { endSubmission(inputFingerprint, sessionID: sessionID) }
             do {
-                guard let index = agentSessions.firstIndex(where: { $0.sessionID == sessionID }) else { return }
-                var session = agentSessions[index]
+                var session = originatingSession
                 let result = try await runtimeCoordinator.resumeMission(
                     reply: content,
                     workspace: workspace,
@@ -2670,10 +2867,16 @@ final class AppStore: ObservableObject {
                     userMessageAlreadyAppended: true,
                     userMessageID: requestID
                 )
-                agentSessions[index] = session
+                guard AgentSessionAsyncBinding.commit(
+                    originatingSession: originatingSession,
+                    updatedSession: session,
+                    into: &agentSessions
+                ) else { return }
                 if let task = result.task {
-                    selectedTaskID = task.id
                     linkRuntimeTask(task, to: sessionID)
+                    if self.selectedAgentSessionID == sessionID {
+                        self.selectedTaskID = task.id
+                    }
                 }
                 finishActivity(for: sessionID, requestID: requestID, result: result)
                 await refresh()
@@ -2682,7 +2885,6 @@ final class AppStore: ObservableObject {
                 failActivity(for: sessionID, requestID: requestID, scope: scope, error: error)
                 lastError = error.localizedDescription
             }
-            endSubmission(inputFingerprint, sessionID: sessionID)
         }
     }
 
@@ -2716,15 +2918,19 @@ final class AppStore: ObservableObject {
             && !artifactTitles.contains("Code patch")
     }
 
-    private func applyApprovalGranted(_ approvalID: UUID) -> AgentInteractionRuntimeEvent? {
-        guard let sessionID = selectedAgentSessionID,
-              let index = agentSessions.firstIndex(where: { $0.sessionID == sessionID }) else { return nil }
+    private func applyApprovalGranted(
+        _ approvalID: UUID,
+        to sessionID: UUID
+    ) -> AgentInteractionRuntimeEvent? {
+        guard let index = agentSessions.firstIndex(where: { $0.sessionID == sessionID }) else { return nil }
         return interactionController.approvalGranted(session: &agentSessions[index], approvalID: approvalID)
     }
 
-    private func applyApprovalRejected(_ approvalID: UUID) -> AgentInteractionRuntimeEvent? {
-        guard let sessionID = selectedAgentSessionID,
-              let index = agentSessions.firstIndex(where: { $0.sessionID == sessionID }) else { return nil }
+    private func applyApprovalRejected(
+        _ approvalID: UUID,
+        to sessionID: UUID
+    ) -> AgentInteractionRuntimeEvent? {
+        guard let index = agentSessions.firstIndex(where: { $0.sessionID == sessionID }) else { return nil }
         return interactionController.approvalRejected(session: &agentSessions[index], approvalID: approvalID)
     }
 
@@ -2992,13 +3198,6 @@ final class AppStore: ObservableObject {
         }
     }
 
-    private func isClosed(_ session: AgentSession) -> Bool {
-        session.currentState == .completed
-            || session.currentState == .failed
-            || session.interactionState == .completed
-            || session.interactionState == .failed
-    }
-
     private var selectedAgentSessionNeedsInput: Bool {
         selectedAgentSession?.interactionState == .waitingForUser
             || selectedAgentSession?.interactionState == .waitingForApproval
@@ -3016,7 +3215,6 @@ final class AppStore: ObservableObject {
         LLMNarrationDebugLog.write(
             "appstore_deterministic_event_applied event_id=\(event.id.uuidString) event_type=\(event.type.rawValue) message_delta=\(afterCount - beforeCount)"
         )
-        selectedAgentSessionID = agentSessions[index].sessionID
     }
 
     private func scheduleAgentNarrationEnrichment(for event: ExecutionEvent) {
@@ -3044,15 +3242,24 @@ final class AppStore: ObservableObject {
             LLMNarrationDebugLog.write("appstore_enrichment_failed event_id=\(event.id.uuidString) reason=no_agent_session")
             return
         }
+        let originatingSessionID = agentSessions[index].sessionID
+        let history = agentSessions[index].conversation.messages
         LLMNarrationDebugLog.write("appstore_enrichment_started event_id=\(event.id.uuidString) event_type=\(event.type.rawValue)")
         let message = await environment.agentResponseComposer.liveMessage(
             for: event,
-            history: agentSessions[index].conversation.messages
+            history: history
         )
-        var updatedSession = agentSessions[index]
+        guard let targetIndex = agentSessions.firstIndex(where: {
+            $0.sessionID == originatingSessionID
+                && AgentSessionEventScope.belongsToSession(event, session: $0)
+        }) else {
+            LLMNarrationDebugLog.write("appstore_enrichment_failed event_id=\(event.id.uuidString) reason=originating_agent_session_unavailable")
+            return
+        }
+        var updatedSession = agentSessions[targetIndex]
         let replaced = updatedSession.replaceMessage(relatedEventID: event.id, with: message)
         if replaced {
-            agentSessions[index] = updatedSession
+            agentSessions[targetIndex] = updatedSession
         }
         LLMNarrationDebugLog.write(
             "ui_message_replaced event_id=\(event.id.uuidString) replaced=\(replaced) message_type=\(message.type.rawValue)"
@@ -3060,54 +3267,56 @@ final class AppStore: ObservableObject {
     }
 
     private func agentSessionIndex(for event: ExecutionEvent) -> Int? {
+        if let sessionID = event.payload["session_id"].flatMap(UUID.init(uuidString:)),
+           let exactSessionIndex = agentSessions.firstIndex(where: {
+               $0.sessionID == sessionID && $0.workspaceID == event.workspaceID
+           }) {
+            return exactSessionIndex
+        }
+
         if let taskID = event.taskID,
-           let linkedIndex = agentSessions.firstIndex(where: { $0.runtimeTaskID == taskID }) {
+           let linkedIndex = agentSessions.firstIndex(where: {
+               $0.runtimeTaskID == taskID && $0.workspaceID == event.workspaceID
+           }) {
             return linkedIndex
         }
 
         if let parentMissionRunID = event.exactParentMissionRunID,
-           let parentIndex = agentSessions.firstIndex(where: { $0.runtimeTaskID == parentMissionRunID }) {
+           let parentIndex = agentSessions.firstIndex(where: {
+               $0.runtimeTaskID == parentMissionRunID && $0.workspaceID == event.workspaceID
+           }) {
             return parentIndex
         }
 
         if let taskID = event.taskID,
-           let selectedAgentSessionID,
            let childIndex = agentSessions.firstIndex(where: {
-               $0.sessionID == selectedAgentSessionID
-                   && $0.workspaceID == event.workspaceID
+               $0.workspaceID == event.workspaceID
                    && $0.workspaceContext.missionTaskIDs?.contains(taskID) == true
            }) {
             return childIndex
         }
 
-        guard event.type == .taskCreated,
-              let selectedAgentSessionID,
-              let pendingIndex = agentSessions.firstIndex(where: { session in
-                  session.sessionID == selectedAgentSessionID
-                      && session.workspaceID == event.workspaceID
-                      && (session.runtimeTaskID == nil || isClosed(session))
-              }) else {
-            return nil
-        }
-
-        return pendingIndex
+        // A task-created event contains no originating Agent Session ID. It
+        // cannot safely be attached by current selection, timestamp, or
+        // recency; start/resume completion links the exact returned task.
+        return nil
     }
 
     private func syncSelectedAgentSessionFromLoadedTaskAndEvents() {
         guard let selectedTaskID,
               let task = tasks.first(where: { $0.id == selectedTaskID }) else { return }
 
-        let targetIndex = agentSessions.firstIndex(where: { $0.runtimeTaskID == task.id })
-            ?? selectedAgentSessionID.flatMap { sessionID in
-                agentSessions.firstIndex { $0.sessionID == sessionID }
-            }
-        guard let targetIndex else { return }
+        guard let targetIndex = agentSessions.firstIndex(where: {
+            $0.runtimeTaskID == task.id && $0.workspaceID == task.workspaceID
+        }) else { return }
 
         agentSessions[targetIndex].syncRuntimeTask(task)
-        for event in events {
+        for event in AgentSessionEventScope.events(
+            from: events,
+            for: agentSessions[targetIndex]
+        ) {
             agentSessions[targetIndex].apply(event: event)
         }
-        selectedAgentSessionID = agentSessions[targetIndex].sessionID
     }
 
     nonisolated private static func loadEngineeringActivity(rootPath: String?) async -> EngineeringActivitySnapshot {

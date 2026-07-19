@@ -56,15 +56,17 @@ final class AgentInteractionControllerTests: XCTestCase {
     func testApprovalRequestFlowUpdatesInteractionState() {
         var session = AgentSession(workspace: Workspace.default(), userGoal: "Investigate API")
         let approvalID = UUID()
+        let taskID = UUID()
         let controller = AgentInteractionController()
         session.setInteractionState(.working)
+        session.workspaceContext.runtimeTaskID = taskID
 
         session.apply(
             event: makeEvent(
                 .humanApprovalRequested,
                 sequence: 1,
                 workspaceID: session.workspaceID,
-                taskID: UUID(),
+                taskID: taskID,
                 payload: ["approval_request_id": approvalID.uuidString]
             )
         )
@@ -124,6 +126,7 @@ final class AgentInteractionControllerTests: XCTestCase {
     func testArtifactGenerationFromRuntimeEvents() {
         var session = AgentSession(workspace: Workspace.default(), userGoal: "Investigate API")
         let taskID = UUID()
+        session.workspaceContext.runtimeTaskID = taskID
 
         session.apply(
             event: makeEvent(

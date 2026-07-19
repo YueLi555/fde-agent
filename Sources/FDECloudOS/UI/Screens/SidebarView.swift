@@ -117,7 +117,12 @@ private struct ProjectScopeRow: View {
 }
 
 private struct AgentSessionRow: View {
+    @EnvironmentObject private var store: AppStore
     let session: AgentSession
+
+    private var status: AgentInteractionState {
+        store.conversationStatus(for: session.sessionID) ?? .idle
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -126,56 +131,13 @@ private struct AgentSessionRow: View {
                     .font(.callout.weight(.semibold))
                     .lineLimit(1)
                 Spacer()
-                Image(systemName: session.currentState.sidebarSymbol)
-                    .foregroundStyle(session.currentState.sidebarColor)
+                Image(systemName: status.conversationSymbol)
+                    .foregroundStyle(status.conversationColor)
             }
-            Text(session.currentState.sidebarTitle)
+            Text(status.conversationTitle)
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
         .padding(.vertical, 4)
-    }
-}
-
-private extension AgentState {
-    var sidebarTitle: String {
-        switch self {
-        case .idle: return "Idle"
-        case .understanding: return "Understanding"
-        case .planning: return "Planning"
-        case .executing: return "Executing"
-        case .waitingApproval: return "Waiting approval"
-        case .recovering: return "Recovering"
-        case .blocked: return "Blocked"
-        case .completed: return "Completed"
-        case .failed: return "Failed"
-        }
-    }
-
-    var sidebarSymbol: String {
-        switch self {
-        case .idle: return "circle"
-        case .understanding: return "brain.head.profile"
-        case .planning: return "list.bullet.clipboard"
-        case .executing: return "terminal"
-        case .waitingApproval: return "checkmark.shield"
-        case .recovering: return "arrow.triangle.2.circlepath"
-        case .blocked: return "exclamationmark.octagon"
-        case .completed: return "checkmark.seal"
-        case .failed: return "xmark.octagon"
-        }
-    }
-
-    var sidebarColor: Color {
-        switch self {
-        case .idle: return .secondary
-        case .understanding, .planning: return .accentColor
-        case .executing: return .blue
-        case .waitingApproval: return .purple
-        case .recovering: return .orange
-        case .blocked: return .orange
-        case .completed: return .green
-        case .failed: return .red
-        }
     }
 }
