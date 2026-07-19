@@ -25,8 +25,22 @@ private enum ProjectScopeKind {
 final class AppStore: ObservableObject {
     @Published var workspaces: [Workspace] = []
     @Published var selectedWorkspaceID: UUID?
-    @Published var agentSessions: [AgentSession] = []
-    @Published var selectedAgentSessionID: UUID?
+    @Published var agentSessions: [AgentSession] = [] {
+        didSet { persistWorkspaceUIStateIfNeeded() }
+    }
+    @Published var selectedAgentSessionID: UUID? {
+        didSet {
+            guard !isRestoringWorkspaceUIState else { return }
+            if let oldValue {
+                composerDrafts[oldValue] = commandText
+            }
+            isSwitchingComposerDraft = true
+            commandText = selectedAgentSessionID.flatMap { composerDrafts[$0] } ?? ""
+            isSwitchingComposerDraft = false
+            composerFocusRequestID = UUID()
+            persistWorkspaceUIStateIfNeeded()
+        }
+    }
     @Published var tasks: [FDETask] = []
     @Published var selectedTaskID: UUID?
     @Published var events: [ExecutionEvent] = []
@@ -67,7 +81,19 @@ final class AppStore: ObservableObject {
     )
     @Published var connectorStatuses: [ConnectorStatus] = []
     @Published var session: SessionCredential?
-    @Published var commandText = ""
+    @Published var commandText = "" {
+        didSet {
+            guard !isRestoringWorkspaceUIState, !isSwitchingComposerDraft else { return }
+            if let selectedAgentSessionID {
+                composerDrafts[selectedAgentSessionID] = commandText
+            }
+            persistWorkspaceUIStateIfNeeded()
+        }
+    }
+    @Published var isInspectorPresented = false {
+        didSet { persistWorkspaceUIStateIfNeeded() }
+    }
+    @Published private(set) var composerFocusRequestID = UUID()
     @Published var isRunning = false
     @Published var lastError: String?
     @Published private var conversationActivities: [UUID: AgentConversationActivity] = [:]
@@ -97,6 +123,10 @@ final class AppStore: ObservableObject {
     private var hasLoaded = false
     private var pendingSubmissionFingerprints: [UUID: Set<UInt64>] = [:]
     private let appSessionID = UUID()
+    private let workspaceUIStateStore = AgentWorkspaceUIStateStore()
+    private var composerDrafts: [UUID: String] = [:]
+    private var isRestoringWorkspaceUIState = false
+    private var isSwitchingComposerDraft = false
 
     var selectedWorkspace: Workspace? {
         guard let selectedWorkspaceID else { return workspaces.first }
@@ -110,6 +140,11 @@ final class AppStore: ObservableObject {
         }
         guard let workspaceID = selectedWorkspace?.id else { return agentSessions.first }
         return agentSessions.first { $0.workspaceID == workspaceID }
+    }
+
+    var selectedWorkspaceAgentSessions: [AgentSession] {
+        guard let workspaceID = selectedWorkspace?.id else { return [] }
+        return agentSessions.filter { $0.workspaceID == workspaceID }
     }
 
     var selectedTask: FDETask? {
@@ -150,6 +185,44 @@ final class AppStore: ObservableObject {
             session: session,
             events: selectedAgentSessionEvents,
             localActivity: conversationActivities[session.sessionID]
+        )
+    }
+
+    var selectedMissionPresentation: MissionPresentationState? {
+        guard let session = selectedAgentSession, !session.isEmptyConversation else { return nil }
+        return MissionPresentationProjector.project(
+            session: session,
+            activity: selectedConversationActivity,
+            candidatePatches: conversationAssetProjection.candidatePatches,
+            generatedTestPlans: conversationAssetProjection.generatedTestPlans,
+            generatedTestArtifacts: conversationAssetProjection.generatedTestArtifacts,
+            approvals: selectedTaskPendingApprovals,
+            cleanupStates: missionCleanupStates,
+            productionReadinessReports: productionReadinessReports,
+            aiEvalPlans: aiEvalPlans,
+            phase3ARestorationFailure: productionReadinessRestoreFailure,
+            evalRuns: controlledEvalRuns,
+            controlledEvalRestorationFailure: controlledEvalRestoreFailure,
+            controlledEvalSessionAuthority: controlledEvalSessionAuthority,
+            controlledEvalExecutionAuthorizations: controlledEvalExecutionAuthorizations,
+            controlledEvalResultReviewAuthorizations: controlledEvalResultReviewAuthorizations
+        )
+    }
+
+    var selectedArtifactFileCards: [ArtifactFileCardModel] {
+        guard let summary = selectedMissionPresentation?.current else { return [] }
+        let manifest: CandidatePatchManifest?
+        if let patchID = summary.candidatePatch?.patchID.flatMap(CandidatePatchID.init(rawValue:)),
+           let sandboxID = summary.candidatePatch?.sandboxID.flatMap(SandboxID.init(rawValue:)) {
+            manifest = try? CandidatePatchManifestStore(
+                lifecycle: environment.sandboxLifecycle
+            ).load(sandboxID: sandboxID, patchID: patchID)
+        } else {
+            manifest = nil
+        }
+        return ArtifactFileCardProjector.cards(
+            candidateManifest: manifest,
+            generatedTestArtifact: summary.generatedTestArtifact
         )
     }
 
@@ -306,6 +379,10 @@ final class AppStore: ObservableObject {
             } else {
                 selectedWorkspaceID = selectedWorkspaceID ?? storedWorkspaces.first?.id
             }
+            restoreWorkspaceUIState(
+                validWorkspaceIDs: Set(storedWorkspaces.map(\.id)),
+                activeWorkspaceID: selectedWorkspaceID
+            )
             session = try await environment.sessionRepository.loadCredential()
             connectorStatuses = await environment.connectors.statuses()
             await refresh()
@@ -496,6 +573,27 @@ final class AppStore: ObservableObject {
         Task { await refreshSelectedTaskDetails() }
     }
 
+    func createNewChat() {
+        guard let workspace = selectedWorkspace else { return }
+        cancelMissionUndoConfirmation()
+        cancelCandidatePatchApprovalConfirmation()
+        cancelCandidatePatchRevertConfirmation()
+        cancelCandidatePatchDestructionConfirmation()
+
+        let newSession = AgentSession.newConversation(in: workspace)
+        agentSessions.insert(newSession, at: 0)
+        selectedAgentSessionID = newSession.sessionID
+        selectedTaskID = nil
+        lastError = nil
+        composerFocusRequestID = UUID()
+        persistWorkspaceUIStateIfNeeded()
+    }
+
+    func requestComposerFocus() {
+        guard selectedWorkspaceHasProjectScope else { return }
+        composerFocusRequestID = UUID()
+    }
+
     func submitCommand() {
         guard let workspace = selectedWorkspace else { return }
         let input = commandText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -513,6 +611,56 @@ final class AppStore: ObservableObject {
                 return
             }
             guard let index = agentSessions.firstIndex(where: { $0.sessionID == selectedAgentSessionID }) else {
+                return
+            }
+            if agentSessions[index].isEmptyConversation {
+                let requestID = UUID()
+                agentSessions[index].beginConversation(with: input)
+                let scope = activityScope(for: input, session: agentSessions[index])
+                commandText = ""
+                lastError = nil
+                beginSubmission(
+                    requestID: requestID,
+                    session: agentSessions[index],
+                    input: input,
+                    scope: scope,
+                    inputFingerprint: fingerprint,
+                    reactivatesCurrentTask: false
+                )
+                composerFocusRequestID = UUID()
+                Task {
+                    do {
+                        guard let currentIndex = agentSessions.firstIndex(where: {
+                            $0.sessionID == selectedAgentSessionID
+                        }) else { return }
+                        var session = agentSessions[currentIndex]
+                        let result = try await runtimeCoordinator.startMission(
+                            input: input,
+                            workspace: workspace,
+                            session: &session,
+                            runtime: environment.runtime,
+                            userMessageID: requestID
+                        )
+                        agentSessions[currentIndex] = session
+                        if let task = result.task {
+                            selectedTaskID = task.id
+                            linkRuntimeTask(task, to: selectedAgentSessionID)
+                        }
+                        finishActivity(for: selectedAgentSessionID, requestID: requestID, result: result)
+                        await refresh()
+                    } catch {
+                        failAgentSession(selectedAgentSessionID, with: error)
+                        failActivity(
+                            for: selectedAgentSessionID,
+                            requestID: requestID,
+                            scope: scope,
+                            error: error
+                        )
+                        lastError = error.localizedDescription
+                    }
+                    endSubmission(fingerprint, sessionID: selectedAgentSessionID)
+                    composerFocusRequestID = UUID()
+                }
                 return
             }
             let requestID = UUID()
@@ -535,6 +683,7 @@ final class AppStore: ObservableObject {
                 requestID: requestID,
                 inputFingerprint: fingerprint
             )
+            composerFocusRequestID = UUID()
             return
         }
 
@@ -556,6 +705,7 @@ final class AppStore: ObservableObject {
                 reactivatesCurrentTask: false
             )
         }
+        composerFocusRequestID = UUID()
 
         Task {
             do {
@@ -2309,6 +2459,41 @@ final class AppStore: ObservableObject {
         replayValidationStatus = "No runtime task linked"
         eventChainValidationStatus = "Agent session created"
         return session.sessionID
+    }
+
+    private func restoreWorkspaceUIState(
+        validWorkspaceIDs: Set<UUID>,
+        activeWorkspaceID: UUID?
+    ) {
+        let state = workspaceUIStateStore.load()
+        var restoredSessionIDs = Set<UUID>()
+        let validSessions = state.sessions.filter {
+            validWorkspaceIDs.contains($0.workspaceID)
+                && restoredSessionIDs.insert($0.sessionID).inserted
+        }
+        let validSessionIDs = Set(validSessions.map(\.sessionID))
+        let activeSessionIDs = Set(validSessions.filter {
+            activeWorkspaceID == nil || $0.workspaceID == activeWorkspaceID
+        }.map(\.sessionID))
+
+        isRestoringWorkspaceUIState = true
+        agentSessions = validSessions
+        composerDrafts = state.drafts.filter { validSessionIDs.contains($0.key) }
+        selectedAgentSessionID = state.selectedSessionID.flatMap { activeSessionIDs.contains($0) ? $0 : nil }
+            ?? validSessions.first(where: { activeWorkspaceID == nil || $0.workspaceID == activeWorkspaceID })?.sessionID
+        isInspectorPresented = state.isInspectorPresented
+        commandText = selectedAgentSessionID.flatMap { composerDrafts[$0] } ?? ""
+        isRestoringWorkspaceUIState = false
+    }
+
+    private func persistWorkspaceUIStateIfNeeded() {
+        guard !isRestoringWorkspaceUIState else { return }
+        workspaceUIStateStore.save(AgentWorkspacePersistedUIState(
+            sessions: agentSessions,
+            selectedSessionID: selectedAgentSessionID,
+            drafts: composerDrafts,
+            isInspectorPresented: isInspectorPresented
+        ))
     }
 
     private func refreshAgentSessionWorkspaceContexts(for workspace: Workspace) {

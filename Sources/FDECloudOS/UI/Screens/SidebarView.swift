@@ -11,6 +11,25 @@ struct SidebarView: View {
                     Label("FDE Agent", systemImage: "sparkles")
                         .font(.headline)
 
+                    Button {
+                        store.createNewChat()
+                    } label: {
+                        Label("New Chat", systemImage: "plus")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .accessibilityIdentifier("workspace.newChat")
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Workspace")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Text(store.selectedWorkspace?.displayName ?? "No workspace selected")
+                            .font(.callout.weight(.medium))
+                            .lineLimit(1)
+                    }
+
                     VStack(alignment: .leading, spacing: 8) {
                         ProjectScopeRow(
                             title: "Legacy",
@@ -32,16 +51,16 @@ struct SidebarView: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("Dialog")
+                        Text("Conversations")
                             .font(.subheadline.weight(.semibold))
                         Spacer()
-                        Text("\(store.agentSessions.count)")
+                        Text("\(store.selectedWorkspaceAgentSessions.count)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     .padding(.horizontal, 14)
 
-                    if store.agentSessions.isEmpty {
+                    if store.selectedWorkspaceAgentSessions.isEmpty {
                         Text("Start by sending a message.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -51,7 +70,7 @@ struct SidebarView: View {
                             get: { store.selectedAgentSessionID },
                             set: { store.selectAgentSession($0) }
                         )) {
-                            ForEach(store.agentSessions) { session in
+                            ForEach(store.selectedWorkspaceAgentSessions) { session in
                                 AgentSessionRow(session: session)
                                     .tag(Optional(session.sessionID))
                             }
@@ -103,7 +122,7 @@ private struct AgentSessionRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Text(session.userGoal)
+                Text(session.displayTitle)
                     .font(.callout.weight(.semibold))
                     .lineLimit(1)
                 Spacer()

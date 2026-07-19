@@ -4,36 +4,31 @@ struct AgentWorkspaceView: View {
     @EnvironmentObject private var store: AppStore
 
     var body: some View {
-        VStack(spacing: 0) {
-            Group {
-                if !store.selectedWorkspaceHasProjectScope {
-                    ScrollView {
-                        ProjectSelectionRequiredView(
-                            legacyProjectRoot: store.selectedWorkspaceProjectRoot,
-                            agentProjectRoot: store.selectedWorkspaceAgentProjectRoot,
-                            onChooseLegacyProject: store.chooseProjectDirectory,
-                            onChooseAgentProject: store.chooseAgentProjectDirectory
-                        )
-                        .frame(maxWidth: 700)
-                        .padding(24)
-                        .frame(maxWidth: .infinity, alignment: .top)
-                    }
-                } else if let session = store.selectedAgentSession {
-                    workspaceShell(session: session)
-                } else {
-                    AgentEmptyState()
-                        .padding(24)
-                }
+        HStack(spacing: 0) {
+            centerWorkspace
+                .frame(minWidth: 540, maxWidth: .infinity, maxHeight: .infinity)
+
+            if store.isInspectorPresented {
+                Divider()
+                WorkspaceInspectorView()
+                    .frame(minWidth: 280, idealWidth: 340, maxWidth: 440)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            Divider()
-
-            CommandBarView()
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .animation(.easeInOut(duration: 0.18), value: store.isInspectorPresented)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    store.isInspectorPresented.toggle()
+                } label: {
+                    Image(systemName: "sidebar.trailing")
+                }
+                .help(store.isInspectorPresented ? "Hide Inspector" : "Show Inspector")
+                .accessibilityLabel(store.isInspectorPresented ? "Hide Inspector" : "Show Inspector")
+                .accessibilityIdentifier("workspace.inspector.toggle")
+            }
+        }
         .sheet(item: $store.candidatePatchApprovalConfirmation) { confirmation in
             CandidatePatchApprovalConfirmationView(
                 confirmation: confirmation,
@@ -72,15 +67,48 @@ struct AgentWorkspaceView: View {
         }
     }
 
+    private var centerWorkspace: some View {
+        VStack(spacing: 0) {
+            Group {
+                if !store.selectedWorkspaceHasProjectScope {
+                    ScrollView {
+                        ProjectSelectionRequiredView(
+                            legacyProjectRoot: store.selectedWorkspaceProjectRoot,
+                            agentProjectRoot: store.selectedWorkspaceAgentProjectRoot,
+                            onChooseLegacyProject: store.chooseProjectDirectory,
+                            onChooseAgentProject: store.chooseAgentProjectDirectory
+                        )
+                        .frame(maxWidth: 700)
+                        .padding(24)
+                        .frame(maxWidth: .infinity, alignment: .top)
+                    }
+                } else if let session = store.selectedAgentSession, !session.isEmptyConversation {
+                    workspaceShell(session: session)
+                } else {
+                    AgentWorkspaceEmptyConversationView()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            HumanActionBar()
+
+            Divider()
+
+            CommandBarView()
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+        }
+    }
+
     @ViewBuilder
     private func workspaceShell(session: AgentSession) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("FDE Agent")
+                        Text(session.displayTitle)
                             .font(.title2.weight(.semibold))
-                        Text(session.userGoal)
+                        Text(store.selectedWorkspace?.displayName ?? session.workspaceContext.workspaceName)
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
@@ -92,6 +120,26 @@ struct AgentWorkspaceView: View {
                     Text(store.selectedConversationActivity?.conversationTitle ?? session.interactionState.conversationTitle)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(store.selectedConversationActivity?.conversationColor ?? session.interactionState.conversationColor)
+                }
+
+                if let activity = store.selectedConversationActivity,
+                   activity.kind.isVisible {
+                    HStack(spacing: 9) {
+                        ProgressView()
+                            .controlSize(.small)
+                            .opacity(activity.kind.isAnimated ? 1 : 0)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Work Status")
+                                .font(.caption.weight(.semibold))
+                            Text(activity.label)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                    .padding(11)
+                    .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 9))
+                    .accessibilityIdentifier("workspace.workStatus")
                 }
 
                 AgentConversationView(
@@ -111,6 +159,8 @@ struct AgentWorkspaceView: View {
                     controlledEvalResultReviewAuthorizations: store.controlledEvalResultReviewAuthorizations,
                     approvals: store.selectedTaskPendingApprovals,
                     showsHeader: false,
+                    showsMissionPresentation: false,
+                    fileArtifacts: store.selectedArtifactFileCards,
                     onApprove: store.approve,
                     onReject: store.reject,
                     onRequestChanges: store.requestCandidatePatchChanges,
@@ -143,7 +193,7 @@ struct AgentWorkspaceView: View {
                     onRetryMissionCleanup: store.retryMissionCleanup
                 )
             }
-            .frame(maxWidth: 780, alignment: .topLeading)
+            .frame(maxWidth: 820, alignment: .topLeading)
             .padding(.horizontal, 24)
             .padding(.vertical, 22)
             .frame(maxWidth: .infinity, alignment: .top)
