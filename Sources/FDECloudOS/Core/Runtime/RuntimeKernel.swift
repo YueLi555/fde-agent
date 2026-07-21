@@ -47,6 +47,12 @@ enum ExecutionPlanApprovalError: LocalizedError, Equatable {
     }
 }
 
+private struct ValidatedExecutionPlanRecord {
+    var binding: ExecutionPlanApprovalBinding
+    var plan: ExecutionPlan
+    var task: FDETask
+}
+
 private enum RuntimeStepHandlingResult {
     case runStep
     case skipStep
@@ -3371,6 +3377,20 @@ actor RuntimeKernel {
             _ = try await approvalQueue.expirePending(now: now)
             throw ExecutionPlanApprovalError.approvalExpired
         }
+        let validated = try await validateBoundExecutionPlanRecord(
+            request,
+            workspace: workspace
+        )
+        if let approvalOrigin, validated.binding.origin != approvalOrigin {
+            throw ExecutionPlanApprovalError.originMismatch
+        }
+        return validated.binding
+    }
+
+    private func validateBoundExecutionPlanRecord(
+        _ request: ApprovalRequest,
+        workspace: Workspace
+    ) async throws -> ValidatedExecutionPlanRecord {
         guard let binding = ExecutionPlanApprovalBinding(metadata: request.metadata),
               binding.digest.isWellFormed else {
             throw ExecutionPlanApprovalError.invalidBinding
@@ -3403,11 +3423,13 @@ actor RuntimeKernel {
                 actual: binding.revision
             )
         }
-        let task = try await persistence.loadTasks(workspaceID: binding.workspaceID).first {
+        guard let task = try await persistence.loadTasks(workspaceID: binding.workspaceID).first(where: {
             $0.id == binding.taskID
+        }) else {
+            throw ExecutionPlanApprovalError.bindingMismatch
         }
         try plan.validate()
-        guard task?.state == .planned,
+        guard task.state == .planned,
               plan.taskID == binding.taskID,
               plan.workspaceID == binding.workspaceID,
               plan.digest == binding.digest,
@@ -3417,10 +3439,286 @@ actor RuntimeKernel {
         if let origin = binding.origin, origin != plan.origin {
             throw ExecutionPlanApprovalError.originMismatch
         }
-        if let approvalOrigin, binding.origin != approvalOrigin {
-            throw ExecutionPlanApprovalError.originMismatch
+        return ValidatedExecutionPlanRecord(binding: binding, plan: plan, task: task)
+    }
+
+    @discardableResult
+    func executeApprovedExecutionPlanReadOnlyStep(
+        approvalRequestID: UUID,
+        workspace: Workspace,
+        now: Date = Date()
+    ) async throws -> Phase3B2AReadOnlyAdmissionResult {
+        guard let approval = try await approvalQueue.load(requestID: approvalRequestID) else {
+            throw Phase3B2AReadOnlyAdmissionError.approvalNotFound(approvalRequestID)
         }
-        return binding
+        guard approval.state == .approved else {
+            throw Phase3B2AReadOnlyAdmissionError.approvalNotApproved(approval.state)
+        }
+        if approval.expiresAt.map({ $0 <= now }) == true {
+            throw Phase3B2AReadOnlyAdmissionError.approvalExpired
+        }
+
+        if approval.workspaceID == workspace.id,
+           let preliminaryBinding = ExecutionPlanApprovalBinding(metadata: approval.metadata),
+           approval.taskID == preliminaryBinding.taskID,
+           preliminaryBinding.workspaceID == workspace.id {
+            let priorEvents = try await persistence.loadEvents(
+                workspaceID: workspace.id,
+                taskID: preliminaryBinding.taskID
+            )
+            if priorEvents.contains(where: {
+                $0.payload["lifecycle_event"] == ExecutionPlanLifecycleEvent.executionStarted.rawValue
+                    && $0.payload["approval_request_id"] == approvalRequestID.uuidString
+            }) {
+                throw Phase3B2AReadOnlyAdmissionError.alreadyAdmitted
+            }
+        }
+
+        var validated = try await validateBoundExecutionPlanRecord(
+            approval,
+            workspace: workspace
+        )
+        let plan = validated.plan
+        guard let requirements = ReadOnlyEvidenceRequirements(
+            planRequirementIDs: plan.evidenceRequirementIDs
+        ) else {
+            throw Phase3B2AReadOnlyAdmissionError.invalidEvidenceRequirements
+        }
+        guard plan.missionSemantic == .readOnlyWorkspaceInspection,
+              plan.constraints.readOnlyRequired,
+              !plan.constraints.executionEnabled,
+              !plan.constraints.mutationAllowed,
+              !plan.constraints.networkAllowed,
+              !plan.constraints.credentialAccessAllowed,
+              !plan.constraints.productionAccessAllowed,
+              !plan.constraints.deploymentAllowed,
+              Set(plan.constraints.allowedToolTypes) == [.api],
+              Set(plan.constraints.allowedTools) == ReadOnlyInspectionPolicy.allowedTools else {
+            throw Phase3B2AReadOnlyAdmissionError.capabilityCeilingViolation(
+                "The persisted plan constraints are not the established read-only inspection policy."
+            )
+        }
+
+        let output = StructuredAgentOutput(
+            plan: plan.steps,
+            actions: [],
+            toolCalls: plan.toolCalls,
+            risks: plan.risks,
+            confidence: 1
+        )
+        let readiness = readOnlyReadinessValidator.validate(
+            output,
+            workspace: workspace,
+            missionTarget: plan.workspaceScope.readOnlyMissionTarget
+        )
+        guard readiness.isReady else {
+            let reason = readiness.rejectedToolCalls.first?.detail
+                ?? readiness.blockerReason?.rawValue
+                ?? "The read-only plan failed runtime admission."
+            throw Phase3B2AReadOnlyAdmissionError.capabilityCeilingViolation(reason)
+        }
+        guard let executable = readiness.executableSteps.first else {
+            throw Phase3B2AReadOnlyAdmissionError.noExecutableInspectionStep
+        }
+        guard executable.toolCall.type == .api,
+              ReadOnlyInspectionPolicy.allowedTools.contains(executable.toolCall.command) else {
+            throw Phase3B2AReadOnlyAdmissionError.capabilityCeilingViolation(
+                executable.toolCall.command
+            )
+        }
+
+        let authorization = authorizationService.authorize(
+            .executeTool,
+            workspace: workspace,
+            action: "execute approved Phase 3B.2A read-only inspection step",
+            resource: executable.toolCall.command
+        )
+        guard authorization.allowed else {
+            try await recordAuthorizationDenied(
+                authorization,
+                workspaceID: workspace.id,
+                taskID: validated.task.id,
+                extraPayload: readOnlyToolMetadata(executable, iteration: 1)
+                    .merging(validated.binding.metadata) { current, _ in current }
+            )
+            throw AuthorizationError.denied(authorization)
+        }
+
+        try stateMachine.transition(&validated.task, to: .running)
+        try await persistence.saveTask(validated.task)
+        let admissionPayload = validated.binding.metadata.merging([
+            "approval_request_id": approval.id.uuidString,
+            "approval_state": approval.state.rawValue,
+            "phase": "3B.2A",
+            "bounded_tool_limit": "1",
+            "read_only": "true",
+            "mutation_allowed": "false",
+            "assessment_generated": "false"
+        ]) { current, _ in current }
+
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: validated.task.id,
+            summary: "Approved ExecutionPlan admitted for one read-only inspection step",
+            payload: admissionPayload.merging([
+                "lifecycle_event": ExecutionPlanLifecycleEvent.executionStarted.rawValue,
+                "state": validated.task.state.rawValue,
+                "execution_started": "true",
+                "evidence_created": "false"
+            ]) { current, _ in current }
+                .merging(runtimeStatePayload(mission: .execute, task: validated.task.state, tool: .idle)) { current, _ in current }
+        )
+
+        let toolMetadata = readOnlyToolMetadata(executable, iteration: 1)
+            .merging(admissionPayload) { current, _ in current }
+        let toolCalledEvent = try await record(
+            type: .toolCalled,
+            workspaceID: workspace.id,
+            taskID: validated.task.id,
+            summary: "Phase 3B.2A read-only tool: \(executable.toolCall.command)",
+            payload: toolMetadata.merging([
+                "lifecycle_event": ExecutionPlanLifecycleEvent.toolCalled.rawValue,
+                "state": validated.task.state.rawValue,
+                "attempt": "1",
+                "max_attempts": "1",
+                "evidence_created": "false"
+            ]) { current, _ in current }
+                .merging(runtimeStatePayload(mission: .execute, task: validated.task.state, tool: .running)) { current, _ in current }
+        )
+
+        let toolResult: ToolExecutionResult
+        do {
+            toolResult = try await toolExecutor.execute(executable.toolCall)
+        } catch {
+            toolResult = ToolExecutionResult(
+                callID: executable.toolCall.id,
+                exitCode: 1,
+                standardOutput: "",
+                standardError: AgentPresentationSanitizer.safeContent(
+                    error.localizedDescription,
+                    fallback: "Read-only inspection failed."
+                ),
+                duration: 0
+            )
+        }
+        let succeeded = toolResult.exitCode == 0 && toolResult.callID == executable.toolCall.id
+        let boundedOutput = String(
+            toolResult.standardOutput.prefix(readOnlyInspectionLimits.maximumObservationCharacters)
+        )
+        let boundedError = String(toolResult.standardError.prefix(1_000))
+        let extractedFacts = succeeded
+            ? ReadOnlySafeFactExtractor.extract(
+                toolName: executable.toolCall.command,
+                targetPath: executable.relativeTargetPath,
+                output: toolResult.standardOutput
+            )
+            : nil
+        var toolResultPayload = toolMetadata.merging([
+            "lifecycle_event": ExecutionPlanLifecycleEvent.toolResult.rawValue,
+            "state": validated.task.state.rawValue,
+            "success": succeeded ? "true" : "false",
+            "exit_code": String(toolResult.exitCode),
+            "stdout": String(boundedOutput.prefix(4_000)),
+            "stderr": boundedError,
+            "evidence_eligible": succeeded ? "true" : "false",
+            "evidence_created": "false",
+            "executor_emitted_events_ignored": String(toolResult.emittedEvents.count)
+        ]) { current, _ in current }
+        if let extractedFacts {
+            toolResultPayload.merge(extractedFacts.eventPayload) { current, _ in current }
+        }
+        toolResultPayload.merge(
+            runtimeStatePayload(
+                mission: .observe,
+                task: validated.task.state,
+                tool: succeeded ? .succeeded : .failed
+            )
+        ) { current, _ in current }
+        let toolResultEvent = try await record(
+            type: .stepExecuted,
+            workspaceID: workspace.id,
+            taskID: validated.task.id,
+            summary: succeeded
+                ? "Phase 3B.2A read-only result recorded"
+                : "Phase 3B.2A read-only result failed",
+            payload: toolResultPayload
+        )
+
+        let evidence: [ReadOnlyInspectionEvidence]
+        if succeeded {
+            evidence = [
+                ReadOnlyInspectionEvidence(
+                    toolCallID: executable.toolCall.id,
+                    toolName: executable.toolCall.command,
+                    workspaceID: workspace.id,
+                    workspaceIdentity: executable.workspaceIdentity,
+                    targetPath: executable.relativeTargetPath,
+                    output: boundedOutput,
+                    toolCalledEventID: toolCalledEvent.id,
+                    toolResultEventID: toolResultEvent.id,
+                    extractedFacts: extractedFacts,
+                    query: readOnlyArgumentValue("query", in: executable.toolCall.arguments)
+                )
+            ]
+        } else {
+            evidence = []
+        }
+        let evidenceLedger = ReadOnlyFinalizationEvidenceLedger(
+            requirements: requirements,
+            evidence: evidence
+        )
+        let observationResult = succeeded
+            ? toolResult
+            : ToolExecutionResult(
+                callID: executable.toolCall.id,
+                exitCode: toolResult.exitCode == 0 ? 1 : toolResult.exitCode,
+                standardOutput: toolResult.standardOutput,
+                standardError: toolResult.standardError,
+                duration: toolResult.duration
+            )
+        let observation = observationLoop.observeResult(
+            step: executable.step,
+            toolCall: executable.toolCall,
+            result: observationResult,
+            attempt: 1,
+            maxAttempts: 1
+        )
+
+        try stateMachine.transition(&validated.task, to: .waiting)
+        try await persistence.saveTask(validated.task)
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: validated.task.id,
+            summary: "Phase 3B.2A bounded read-only observation created",
+            payload: toolMetadata.merging([
+                "lifecycle_event": ExecutionPlanLifecycleEvent.observationCreated.rawValue,
+                "state": validated.task.state.rawValue,
+                "success": succeeded ? "true" : "false",
+                "evidence_created": succeeded ? "true" : "false",
+                "evidence_count": String(evidence.count),
+                "bounded_inspection_complete": "true",
+                "assessment_generated": "false",
+                "additional_execution_authorized": "false",
+                "tool_called_event_id": toolCalledEvent.id.uuidString,
+                "tool_result_event_id": toolResultEvent.id.uuidString
+            ]) { current, _ in current }
+                .merging(observation.auditPayload) { current, _ in current }
+                .merging(evidenceLedger.auditPayload) { current, _ in current }
+                .merging(runtimeStatePayload(mission: .observe, task: validated.task.state, tool: succeeded ? .succeeded : .failed)) { current, _ in current }
+        )
+
+        return Phase3B2AReadOnlyAdmissionResult(
+            task: validated.task,
+            plan: plan,
+            approval: approval,
+            executedStep: executable.step,
+            executedToolCall: executable.toolCall,
+            toolResult: toolResult,
+            evidence: evidence,
+            evidenceLedger: evidenceLedger
+        )
     }
 
     func beginCandidatePatchApprovalConfirmation(

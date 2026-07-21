@@ -1375,6 +1375,16 @@ enum ReadOnlyEvidenceRequirementKind: String, Codable, Hashable, Sendable {
 struct ReadOnlyEvidenceRequirements: Hashable, Sendable {
     var required: [ReadOnlyEvidenceRequirementKind]
 
+    init?(planRequirementIDs: [String]) {
+        let requirements = planRequirementIDs.compactMap(ReadOnlyEvidenceRequirementKind.init(rawValue:))
+        guard !requirements.isEmpty,
+              requirements.count == planRequirementIDs.count,
+              Set(requirements).count == requirements.count else {
+            return nil
+        }
+        required = requirements
+    }
+
     init(request: String) {
         // Recovery prompts append an internal evidence ledger after this marker.
         // Requirement extraction must inspect the user's request and clarification,
@@ -1535,6 +1545,46 @@ struct ReadOnlyInspectionEvidence: Hashable, Sendable {
     var evidenceLabel: String {
         targetPath == "." ? "\(workspaceIdentity) workspace" : targetPath
     }
+}
+
+enum Phase3B2AReadOnlyAdmissionError: LocalizedError, Equatable {
+    case approvalNotFound(UUID)
+    case approvalNotApproved(ApprovalState)
+    case approvalExpired
+    case alreadyAdmitted
+    case invalidEvidenceRequirements
+    case capabilityCeilingViolation(String)
+    case noExecutableInspectionStep
+
+    var errorDescription: String? {
+        switch self {
+        case .approvalNotFound(let id):
+            return "ExecutionPlan approval request was not found: \(id.uuidString)."
+        case .approvalNotApproved(let state):
+            return "ExecutionPlan approval is \(state.rawValue), not approved."
+        case .approvalExpired:
+            return "ExecutionPlan approval has expired and cannot admit execution."
+        case .alreadyAdmitted:
+            return "ExecutionPlan approval has already admitted its bounded Phase 3B.2A inspection."
+        case .invalidEvidenceRequirements:
+            return "ExecutionPlan evidence requirements are not recognized by the read-only evidence ledger."
+        case .capabilityCeilingViolation(let reason):
+            return "ExecutionPlan exceeds the read-only capability ceiling: \(reason)."
+        case .noExecutableInspectionStep:
+            return "ExecutionPlan has no validated read-only inspection step to admit."
+        }
+    }
+}
+
+struct Phase3B2AReadOnlyAdmissionResult: Sendable {
+    var task: FDETask
+    var plan: ExecutionPlan
+    var approval: ApprovalRequest
+    var executedStep: PlanStep
+    var executedToolCall: ToolCall
+    var toolResult: ToolExecutionResult
+    var evidence: [ReadOnlyInspectionEvidence]
+    var evidenceLedger: ReadOnlyFinalizationEvidenceLedger
 }
 
 struct ReadOnlyInspectionObservation: Sendable {

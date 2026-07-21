@@ -89,6 +89,10 @@ struct ExecutionPlanApprovalBinding: Codable, Hashable, Sendable {
 enum ExecutionPlanLifecycleEvent: String, Codable, Hashable, Sendable {
     case generated = "PLAN_GENERATED"
     case validated = "PLAN_VALIDATED"
+    case executionStarted = "EXECUTION_STARTED"
+    case toolCalled = "TOOL_CALLED"
+    case toolResult = "TOOL_RESULT"
+    case observationCreated = "OBSERVATION_CREATED"
 }
 
 struct PlanConstraints: Codable, Hashable, Sendable {
