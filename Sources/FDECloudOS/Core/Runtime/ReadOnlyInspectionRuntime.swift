@@ -1025,6 +1025,7 @@ struct ReadOnlyPlanReadinessValidator: Sendable {
 }
 
 struct ReadOnlyInspectionLimits: Hashable, Sendable {
+    var maximumInspectionSteps = 10
     var maximumModelDecisionIterations = 10
     var maximumToolCalls = 12
     var maximumFilesRead = 8
@@ -1093,24 +1094,31 @@ struct ReadOnlyInspectionLimits: Hashable, Sendable {
         switch kind {
         case .simpleFileInspection:
             adaptive = ReadOnlyOperationBudget(
+                maximumInspectionSteps: 4,
                 maximumModelDecisionIterations: 3,
                 maximumToolCalls: 4,
                 maximumFilesRead: 3
             )
         case .projectInspection:
             adaptive = ReadOnlyOperationBudget(
+                maximumInspectionSteps: 8,
                 maximumModelDecisionIterations: 6,
                 maximumToolCalls: 8,
                 maximumFilesRead: 5
             )
         case .broadStaticAssessment:
             adaptive = ReadOnlyOperationBudget(
+                maximumInspectionSteps: 10,
                 maximumModelDecisionIterations: 10,
                 maximumToolCalls: 12,
                 maximumFilesRead: 8
             )
         }
         return ReadOnlyOperationBudget(
+            maximumInspectionSteps: min(
+                max(1, maximumInspectionSteps),
+                adaptive.maximumInspectionSteps
+            ),
             maximumModelDecisionIterations: min(
                 max(1, maximumModelDecisionIterations),
                 adaptive.maximumModelDecisionIterations
@@ -1122,12 +1130,14 @@ struct ReadOnlyInspectionLimits: Hashable, Sendable {
 }
 
 struct ReadOnlyOperationBudget: Hashable, Sendable {
+    var maximumInspectionSteps: Int = 10
     var maximumModelDecisionIterations: Int
     var maximumToolCalls: Int
     var maximumFilesRead: Int
 
     var auditPayload: [String: String] {
         [
+            "selected_inspection_step_budget": String(maximumInspectionSteps),
             "selected_iteration_budget": String(maximumModelDecisionIterations),
             "selected_tool_call_budget": String(maximumToolCalls),
             "selected_file_read_budget": String(maximumFilesRead),
@@ -1188,6 +1198,7 @@ struct ReadOnlyMissionTiming: Sendable {
         startedAt: Date,
         budget: ReadOnlyMissionBudget,
         operationBudget: ReadOnlyOperationBudget = ReadOnlyOperationBudget(
+            maximumInspectionSteps: 10,
             maximumModelDecisionIterations: 8,
             maximumToolCalls: 12,
             maximumFilesRead: 8
@@ -1583,9 +1594,22 @@ struct Phase3B2AReadOnlyAdmissionResult: Sendable {
     var executedStep: PlanStep
     var executedToolCall: ToolCall
     var toolResult: ToolExecutionResult
+    var executedSteps: [PlanStep]
+    var executedToolCalls: [ToolCall]
+    var toolResults: [ToolExecutionResult]
+    var observations: [ToolObservation]
     var evidence: [ReadOnlyInspectionEvidence]
     var evidenceLedger: ReadOnlyFinalizationEvidenceLedger
+    var coverage: InspectionEvidenceCoverage
+    var stopReason: InspectionLoopStopReason
+    var budgetUsage: InspectionLoopBudgetUsage
+
+    var isPartial: Bool {
+        stopReason != .coverageSufficient
+    }
 }
+
+typealias Phase3B2BInspectionLoopResult = Phase3B2AReadOnlyAdmissionResult
 
 struct ReadOnlyInspectionObservation: Sendable {
     var missionGoal: String

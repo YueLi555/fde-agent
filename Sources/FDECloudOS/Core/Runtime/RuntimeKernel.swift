@@ -3448,6 +3448,34 @@ actor RuntimeKernel {
         workspace: Workspace,
         now: Date = Date()
     ) async throws -> Phase3B2AReadOnlyAdmissionResult {
+        try await executeApprovedExecutionPlanInspectionLoop(
+            approvalRequestID: approvalRequestID,
+            workspace: workspace,
+            now: now,
+            phase: "3B.2A"
+        )
+    }
+
+    @discardableResult
+    func executeApprovedExecutionPlanInspectionLoop(
+        approvalRequestID: UUID,
+        workspace: Workspace,
+        now: Date = Date()
+    ) async throws -> Phase3B2BInspectionLoopResult {
+        try await executeApprovedExecutionPlanInspectionLoop(
+            approvalRequestID: approvalRequestID,
+            workspace: workspace,
+            now: now,
+            phase: "3B.2B"
+        )
+    }
+
+    private func executeApprovedExecutionPlanInspectionLoop(
+        approvalRequestID: UUID,
+        workspace: Workspace,
+        now: Date,
+        phase: String
+    ) async throws -> Phase3B2BInspectionLoopResult {
         guard let approval = try await approvalQueue.load(requestID: approvalRequestID) else {
             throw Phase3B2AReadOnlyAdmissionError.approvalNotFound(approvalRequestID)
         }
@@ -3517,50 +3545,79 @@ actor RuntimeKernel {
                 ?? "The read-only plan failed runtime admission."
             throw Phase3B2AReadOnlyAdmissionError.capabilityCeilingViolation(reason)
         }
-        guard let executable = readiness.executableSteps.first else {
+        guard !readiness.executableSteps.isEmpty else {
             throw Phase3B2AReadOnlyAdmissionError.noExecutableInspectionStep
         }
-        guard executable.toolCall.type == .api,
-              ReadOnlyInspectionPolicy.allowedTools.contains(executable.toolCall.command) else {
-            throw Phase3B2AReadOnlyAdmissionError.capabilityCeilingViolation(
-                executable.toolCall.command
+
+        for (index, executable) in readiness.executableSteps.enumerated() {
+            guard executable.toolCall.type == .api,
+                  ReadOnlyInspectionPolicy.allowedTools.contains(executable.toolCall.command),
+                  ReadOnlyToolSchemas.all[executable.toolCall.command] != nil else {
+                throw Phase3B2AReadOnlyAdmissionError.capabilityCeilingViolation(
+                    executable.toolCall.command
+                )
+            }
+            let authorization = authorizationService.authorize(
+                .executeTool,
+                workspace: workspace,
+                action: "execute approved Phase \(phase) read-only inspection step",
+                resource: executable.toolCall.command
             )
+            guard authorization.allowed else {
+                try await recordAuthorizationDenied(
+                    authorization,
+                    workspaceID: workspace.id,
+                    taskID: validated.task.id,
+                    extraPayload: readOnlyToolMetadata(executable, iteration: index + 1)
+                        .merging(validated.binding.metadata) { current, _ in current }
+                )
+                throw AuthorizationError.denied(authorization)
+            }
         }
 
-        let authorization = authorizationService.authorize(
-            .executeTool,
-            workspace: workspace,
-            action: "execute approved Phase 3B.2A read-only inspection step",
-            resource: executable.toolCall.command
+        let missionBudget = readOnlyInspectionLimits.budget(
+            for: plan.objective,
+            workspaceScope: plan.workspaceScope
         )
-        guard authorization.allowed else {
-            try await recordAuthorizationDenied(
-                authorization,
-                workspaceID: workspace.id,
-                taskID: validated.task.id,
-                extraPayload: readOnlyToolMetadata(executable, iteration: 1)
-                    .merging(validated.binding.metadata) { current, _ in current }
-            )
-            throw AuthorizationError.denied(authorization)
-        }
+        let operationBudget = readOnlyInspectionLimits.operationBudget(for: missionBudget.kind)
+        let startedAt = Date()
+        let deadline = startedAt.addingTimeInterval(missionBudget.hardLimit)
+        let selector = EvidenceDrivenInspectionSelector()
+        let initialBudgetUsage = InspectionLoopBudgetUsage(
+            inspectionSteps: 0,
+            toolCalls: 0,
+            filesInspected: 0,
+            maximumInspectionSteps: operationBudget.maximumInspectionSteps,
+            maximumToolCalls: operationBudget.maximumToolCalls,
+            maximumFilesInspected: operationBudget.maximumFilesRead,
+            deadline: deadline
+        )
+        var coverage = InspectionEvidenceCoverage.derive(
+            requirements: requirements,
+            evidence: []
+        )
 
         try stateMachine.transition(&validated.task, to: .running)
         try await persistence.saveTask(validated.task)
         let admissionPayload = validated.binding.metadata.merging([
             "approval_request_id": approval.id.uuidString,
             "approval_state": approval.state.rawValue,
-            "phase": "3B.2A",
-            "bounded_tool_limit": "1",
+            "phase": phase,
+            "inspection_objective": plan.objective,
             "read_only": "true",
             "mutation_allowed": "false",
             "assessment_generated": "false"
         ]) { current, _ in current }
+            .merging(operationBudget.auditPayload) { current, _ in current }
+            .merging(missionBudget.auditPayload) { current, _ in current }
+            .merging(initialBudgetUsage.auditPayload) { current, _ in current }
+            .merging(coverage.auditPayload) { current, _ in current }
 
         try await record(
             type: .stateUpdated,
             workspaceID: workspace.id,
             taskID: validated.task.id,
-            summary: "Approved ExecutionPlan admitted for one read-only inspection step",
+            summary: "Approved ExecutionPlan admitted for bounded evidence inspection",
             payload: admissionPayload.merging([
                 "lifecycle_event": ExecutionPlanLifecycleEvent.executionStarted.rawValue,
                 "state": validated.task.state.rawValue,
@@ -3570,154 +3627,273 @@ actor RuntimeKernel {
                 .merging(runtimeStatePayload(mission: .execute, task: validated.task.state, tool: .idle)) { current, _ in current }
         )
 
-        let toolMetadata = readOnlyToolMetadata(executable, iteration: 1)
-            .merging(admissionPayload) { current, _ in current }
-        let toolCalledEvent = try await record(
-            type: .toolCalled,
-            workspaceID: workspace.id,
-            taskID: validated.task.id,
-            summary: "Phase 3B.2A read-only tool: \(executable.toolCall.command)",
-            payload: toolMetadata.merging([
-                "lifecycle_event": ExecutionPlanLifecycleEvent.toolCalled.rawValue,
-                "state": validated.task.state.rawValue,
-                "attempt": "1",
-                "max_attempts": "1",
-                "evidence_created": "false"
-            ]) { current, _ in current }
-                .merging(runtimeStatePayload(mission: .execute, task: validated.task.state, tool: .running)) { current, _ in current }
+        var executedSteps: [PlanStep] = []
+        var executedToolCalls: [ToolCall] = []
+        var toolResults: [ToolExecutionResult] = []
+        var observations: [ToolObservation] = []
+        var evidence: [ReadOnlyInspectionEvidence] = []
+        var executedToolCallIDs: Set<String> = []
+        var inspectedFileKeys: Set<String> = []
+        var stopReason: InspectionLoopStopReason?
+        var nextExecutable = selector.next(
+            from: readiness.executableSteps,
+            excluding: executedToolCallIDs,
+            coverage: coverage,
+            evidence: evidence,
+            allowFileReads: true
         )
 
-        let toolResult: ToolExecutionResult
-        do {
-            toolResult = try await toolExecutor.execute(executable.toolCall)
-        } catch {
-            toolResult = ToolExecutionResult(
-                callID: executable.toolCall.id,
-                exitCode: 1,
-                standardOutput: "",
-                standardError: AgentPresentationSanitizer.safeContent(
-                    error.localizedDescription,
-                    fallback: "Read-only inspection failed."
-                ),
-                duration: 0
-            )
-        }
-        let succeeded = toolResult.exitCode == 0 && toolResult.callID == executable.toolCall.id
-        let boundedOutput = String(
-            toolResult.standardOutput.prefix(readOnlyInspectionLimits.maximumObservationCharacters)
-        )
-        let boundedError = String(toolResult.standardError.prefix(1_000))
-        let extractedFacts = succeeded
-            ? ReadOnlySafeFactExtractor.extract(
-                toolName: executable.toolCall.command,
-                targetPath: executable.relativeTargetPath,
-                output: toolResult.standardOutput
-            )
-            : nil
-        var toolResultPayload = toolMetadata.merging([
-            "lifecycle_event": ExecutionPlanLifecycleEvent.toolResult.rawValue,
-            "state": validated.task.state.rawValue,
-            "success": succeeded ? "true" : "false",
-            "exit_code": String(toolResult.exitCode),
-            "stdout": String(boundedOutput.prefix(4_000)),
-            "stderr": boundedError,
-            "evidence_eligible": succeeded ? "true" : "false",
-            "evidence_created": "false",
-            "executor_emitted_events_ignored": String(toolResult.emittedEvents.count)
-        ]) { current, _ in current }
-        if let extractedFacts {
-            toolResultPayload.merge(extractedFacts.eventPayload) { current, _ in current }
-        }
-        toolResultPayload.merge(
-            runtimeStatePayload(
-                mission: .observe,
-                task: validated.task.state,
-                tool: succeeded ? .succeeded : .failed
-            )
-        ) { current, _ in current }
-        let toolResultEvent = try await record(
-            type: .stepExecuted,
-            workspaceID: workspace.id,
-            taskID: validated.task.id,
-            summary: succeeded
-                ? "Phase 3B.2A read-only result recorded"
-                : "Phase 3B.2A read-only result failed",
-            payload: toolResultPayload
-        )
+        while let executable = nextExecutable {
+            let iteration = executedSteps.count + 1
+            executedSteps.append(executable.step)
+            executedToolCalls.append(executable.toolCall)
+            executedToolCallIDs.insert(executable.toolCall.id)
+            if executable.toolCall.command == "engineering.read_file" {
+                inspectedFileKeys.insert("\(executable.workspaceIdentity):\(executable.relativeTargetPath)")
+            }
 
-        let evidence: [ReadOnlyInspectionEvidence]
-        if succeeded {
-            evidence = [
-                ReadOnlyInspectionEvidence(
-                    toolCallID: executable.toolCall.id,
-                    toolName: executable.toolCall.command,
-                    workspaceID: workspace.id,
-                    workspaceIdentity: executable.workspaceIdentity,
-                    targetPath: executable.relativeTargetPath,
-                    output: boundedOutput,
-                    toolCalledEventID: toolCalledEvent.id,
-                    toolResultEventID: toolResultEvent.id,
-                    extractedFacts: extractedFacts,
-                    query: readOnlyArgumentValue("query", in: executable.toolCall.arguments)
+            let toolMetadata = readOnlyToolMetadata(executable, iteration: iteration)
+                .merging(admissionPayload) { current, _ in current }
+            let toolCalledEvent = try await record(
+                type: .toolCalled,
+                workspaceID: workspace.id,
+                taskID: validated.task.id,
+                summary: "Phase \(phase) read-only tool: \(executable.toolCall.command)",
+                payload: toolMetadata.merging([
+                    "lifecycle_event": ExecutionPlanLifecycleEvent.toolCalled.rawValue,
+                    "state": validated.task.state.rawValue,
+                    "attempt": "1",
+                    "max_attempts": "1",
+                    "evidence_created": "false"
+                ]) { current, _ in current }
+                    .merging(runtimeStatePayload(mission: .execute, task: validated.task.state, tool: .running)) { current, _ in current }
+            )
+
+            let toolResult: ToolExecutionResult
+            var deadlineReachedDuringTool = false
+            do {
+                toolResult = try await withReadOnlyHardDeadline(
+                    deadline: deadline,
+                    stage: "phase_3b2b_tool_execution"
+                ) { [toolExecutor] in
+                    try await toolExecutor.execute(executable.toolCall)
+                }
+            } catch {
+                if let deadlineError = error as? ReadOnlyMissionDeadlineError,
+                   case .hardDeadlineReached = deadlineError {
+                    deadlineReachedDuringTool = true
+                }
+                toolResult = ToolExecutionResult(
+                    callID: executable.toolCall.id,
+                    exitCode: 1,
+                    standardOutput: "",
+                    standardError: AgentPresentationSanitizer.safeContent(
+                        deadlineReachedDuringTool
+                            ? "The bounded read-only inspection deadline was reached."
+                            : error.localizedDescription,
+                        fallback: deadlineReachedDuringTool
+                            ? "The bounded read-only inspection deadline was reached."
+                            : "Read-only inspection failed."
+                    ),
+                    duration: 0
                 )
-            ]
-        } else {
-            evidence = []
+            }
+            toolResults.append(toolResult)
+            let toolResultSucceeded = toolResult.exitCode == 0
+                && toolResult.callID == executable.toolCall.id
+            let boundedOutput = String(
+                toolResult.standardOutput.prefix(readOnlyInspectionLimits.maximumObservationCharacters)
+            )
+            let boundedError = String(toolResult.standardError.prefix(1_000))
+            let extractedFacts = toolResultSucceeded
+                ? ReadOnlySafeFactExtractor.extract(
+                    toolName: executable.toolCall.command,
+                    targetPath: executable.relativeTargetPath,
+                    output: toolResult.standardOutput
+                )
+                : nil
+            var toolResultPayload = toolMetadata.merging([
+                "lifecycle_event": ExecutionPlanLifecycleEvent.toolResult.rawValue,
+                "state": validated.task.state.rawValue,
+                "success": toolResultSucceeded ? "true" : "false",
+                "exit_code": String(toolResult.exitCode),
+                "stdout": String(boundedOutput.prefix(4_000)),
+                "stderr": boundedError,
+                "evidence_eligible": toolResultSucceeded ? "true" : "false",
+                "evidence_created": "false",
+                "executor_emitted_events_ignored": String(toolResult.emittedEvents.count)
+            ]) { current, _ in current }
+            if let extractedFacts {
+                toolResultPayload.merge(extractedFacts.eventPayload) { current, _ in current }
+            }
+            toolResultPayload.merge(
+                runtimeStatePayload(
+                    mission: .observe,
+                    task: validated.task.state,
+                    tool: toolResultSucceeded ? .succeeded : .failed
+                )
+            ) { current, _ in current }
+            let toolResultEvent = try await record(
+                type: .stepExecuted,
+                workspaceID: workspace.id,
+                taskID: validated.task.id,
+                summary: toolResultSucceeded
+                    ? "Phase \(phase) read-only result recorded"
+                    : "Phase \(phase) read-only result failed",
+                payload: toolResultPayload
+            )
+
+            let observationResult = toolResultSucceeded
+                ? toolResult
+                : ToolExecutionResult(
+                    callID: executable.toolCall.id,
+                    exitCode: toolResult.exitCode == 0 ? 1 : toolResult.exitCode,
+                    standardOutput: toolResult.standardOutput,
+                    standardError: toolResult.standardError,
+                    duration: toolResult.duration
+                )
+            let observation = observationLoop.observeResult(
+                step: executable.step,
+                toolCall: executable.toolCall,
+                result: observationResult,
+                attempt: 1,
+                maxAttempts: 1
+            )
+            observations.append(observation)
+            let observationSucceeded = observation.outcome == .succeeded
+            if toolResultSucceeded && observationSucceeded {
+                evidence.append(
+                    ReadOnlyInspectionEvidence(
+                        toolCallID: executable.toolCall.id,
+                        toolName: executable.toolCall.command,
+                        workspaceID: workspace.id,
+                        workspaceIdentity: executable.workspaceIdentity,
+                        targetPath: executable.relativeTargetPath,
+                        output: boundedOutput,
+                        toolCalledEventID: toolCalledEvent.id,
+                        toolResultEventID: toolResultEvent.id,
+                        extractedFacts: extractedFacts,
+                        query: readOnlyArgumentValue("query", in: executable.toolCall.arguments)
+                    )
+                )
+            }
+
+            coverage = InspectionEvidenceCoverage.derive(
+                requirements: requirements,
+                evidence: evidence
+            )
+            let evidenceLedger = ReadOnlyFinalizationEvidenceLedger(
+                requirements: requirements,
+                evidence: evidence
+            )
+            let allowFileReads = inspectedFileKeys.count < operationBudget.maximumFilesRead
+            let remainingApprovedSteps = readiness.executableSteps.filter {
+                !executedToolCallIDs.contains($0.toolCall.id)
+            }
+            let selectedNext = selector.next(
+                from: readiness.executableSteps,
+                excluding: executedToolCallIDs,
+                coverage: coverage,
+                evidence: evidence,
+                allowFileReads: allowFileReads
+            )
+
+            if coverage.isSufficient {
+                stopReason = .coverageSufficient
+            } else if executedSteps.count >= operationBudget.maximumInspectionSteps {
+                stopReason = .maximumInspectionStepsReached
+            } else if executedToolCalls.count >= operationBudget.maximumToolCalls {
+                stopReason = .maximumToolCallsReached
+            } else if deadlineReachedDuringTool || Date() >= deadline {
+                stopReason = .deadlineReached
+            } else if selectedNext == nil,
+                      !allowFileReads,
+                      remainingApprovedSteps.contains(where: { $0.toolCall.command == "engineering.read_file" }) {
+                stopReason = .maximumFilesInspectedReached
+            } else if selectedNext == nil {
+                stopReason = .evidenceUnavailable
+            }
+
+            if stopReason != nil {
+                try stateMachine.transition(&validated.task, to: .waiting)
+                try await persistence.saveTask(validated.task)
+            }
+            let budgetUsage = InspectionLoopBudgetUsage(
+                inspectionSteps: executedSteps.count,
+                toolCalls: executedToolCalls.count,
+                filesInspected: inspectedFileKeys.count,
+                maximumInspectionSteps: operationBudget.maximumInspectionSteps,
+                maximumToolCalls: operationBudget.maximumToolCalls,
+                maximumFilesInspected: operationBudget.maximumFilesRead,
+                deadline: deadline
+            )
+            try await record(
+                type: .stateUpdated,
+                workspaceID: workspace.id,
+                taskID: validated.task.id,
+                summary: "Phase \(phase) bounded read-only observation created",
+                payload: toolMetadata.merging([
+                    "lifecycle_event": ExecutionPlanLifecycleEvent.observationCreated.rawValue,
+                    "state": validated.task.state.rawValue,
+                    "success": observationSucceeded ? "true" : "false",
+                    "evidence_created": (toolResultSucceeded && observationSucceeded) ? "true" : "false",
+                    "evidence_count": String(evidence.count),
+                    "bounded_inspection_complete": stopReason == nil ? "false" : "true",
+                    "inspection_continues": stopReason == nil ? "true" : "false",
+                    "inspection_stop_reason": stopReason?.rawValue ?? "",
+                    "budget_exhausted": stopReason?.isBudgetExhaustion == true ? "true" : "false",
+                    "deadline_reached_during_tool": deadlineReachedDuringTool ? "true" : "false",
+                    "waiting_partial": stopReason == .coverageSufficient ? "false" : (stopReason == nil ? "false" : "true"),
+                    "assessment_generated": "false",
+                    "additional_execution_authorized": "false",
+                    "tool_called_event_id": toolCalledEvent.id.uuidString,
+                    "tool_result_event_id": toolResultEvent.id.uuidString
+                ]) { current, _ in current }
+                    .merging(observation.auditPayload) { current, _ in current }
+                    .merging(evidenceLedger.auditPayload) { current, _ in current }
+                    .merging(coverage.auditPayload) { current, _ in current }
+                    .merging(budgetUsage.auditPayload) { current, _ in current }
+                    .merging(runtimeStatePayload(mission: .observe, task: validated.task.state, tool: observationSucceeded ? .succeeded : .failed)) { current, _ in current }
+            )
+
+            nextExecutable = stopReason == nil ? selectedNext : nil
         }
-        let evidenceLedger = ReadOnlyFinalizationEvidenceLedger(
+
+        guard let executedStep = executedSteps.first,
+              let executedToolCall = executedToolCalls.first,
+              let toolResult = toolResults.first,
+              let finalStopReason = stopReason else {
+            throw Phase3B2AReadOnlyAdmissionError.noExecutableInspectionStep
+        }
+        let finalEvidenceLedger = ReadOnlyFinalizationEvidenceLedger(
             requirements: requirements,
             evidence: evidence
         )
-        let observationResult = succeeded
-            ? toolResult
-            : ToolExecutionResult(
-                callID: executable.toolCall.id,
-                exitCode: toolResult.exitCode == 0 ? 1 : toolResult.exitCode,
-                standardOutput: toolResult.standardOutput,
-                standardError: toolResult.standardError,
-                duration: toolResult.duration
-            )
-        let observation = observationLoop.observeResult(
-            step: executable.step,
-            toolCall: executable.toolCall,
-            result: observationResult,
-            attempt: 1,
-            maxAttempts: 1
+        let budgetUsage = InspectionLoopBudgetUsage(
+            inspectionSteps: executedSteps.count,
+            toolCalls: executedToolCalls.count,
+            filesInspected: inspectedFileKeys.count,
+            maximumInspectionSteps: operationBudget.maximumInspectionSteps,
+            maximumToolCalls: operationBudget.maximumToolCalls,
+            maximumFilesInspected: operationBudget.maximumFilesRead,
+            deadline: deadline
         )
-
-        try stateMachine.transition(&validated.task, to: .waiting)
-        try await persistence.saveTask(validated.task)
-        try await record(
-            type: .stateUpdated,
-            workspaceID: workspace.id,
-            taskID: validated.task.id,
-            summary: "Phase 3B.2A bounded read-only observation created",
-            payload: toolMetadata.merging([
-                "lifecycle_event": ExecutionPlanLifecycleEvent.observationCreated.rawValue,
-                "state": validated.task.state.rawValue,
-                "success": succeeded ? "true" : "false",
-                "evidence_created": succeeded ? "true" : "false",
-                "evidence_count": String(evidence.count),
-                "bounded_inspection_complete": "true",
-                "assessment_generated": "false",
-                "additional_execution_authorized": "false",
-                "tool_called_event_id": toolCalledEvent.id.uuidString,
-                "tool_result_event_id": toolResultEvent.id.uuidString
-            ]) { current, _ in current }
-                .merging(observation.auditPayload) { current, _ in current }
-                .merging(evidenceLedger.auditPayload) { current, _ in current }
-                .merging(runtimeStatePayload(mission: .observe, task: validated.task.state, tool: succeeded ? .succeeded : .failed)) { current, _ in current }
-        )
-
         return Phase3B2AReadOnlyAdmissionResult(
             task: validated.task,
             plan: plan,
             approval: approval,
-            executedStep: executable.step,
-            executedToolCall: executable.toolCall,
+            executedStep: executedStep,
+            executedToolCall: executedToolCall,
             toolResult: toolResult,
+            executedSteps: executedSteps,
+            executedToolCalls: executedToolCalls,
+            toolResults: toolResults,
+            observations: observations,
             evidence: evidence,
-            evidenceLedger: evidenceLedger
+            evidenceLedger: finalEvidenceLedger,
+            coverage: coverage,
+            stopReason: finalStopReason,
+            budgetUsage: budgetUsage
         )
     }
 
