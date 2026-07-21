@@ -545,6 +545,7 @@ struct FDEChatQualityGuard: Sendable {
         }
 
         if request.selectedMode != .fdeCapabilityExplanation,
+           request.selectedMode != .legacyTransformationAdvisory,
            capabilityEnumerationScore(answer) >= 3 {
             return "capability_enumeration_for_unrelated_question"
         }

@@ -147,7 +147,7 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
         )
 
         XCTAssertEqual(responses.map(\.markdown), ["LLM narration after replacement"])
-        XCTAssertEqual(card.narration, "LLM narration after replacement")
+        XCTAssertEqual(card.narration, "Inspecting the selected scope and preparing an evidence-grounded assessment.")
     }
 
     func testStreamingResponseUpdatesFromIncrementalMessageChunks() throws {
@@ -194,7 +194,7 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
         )
 
         XCTAssertEqual(responses.map(\.markdown), ["Completed checks:\n- Current directory"])
-        XCTAssertEqual(card.narration, "Completed checks:\n- Current directory")
+        XCTAssertEqual(card.narration, "Inspecting the selected scope and preparing an evidence-grounded assessment.")
     }
 
     func testRuntimeStreamingResponseKeepsSameNarrationFromDistinctEvents() throws {
@@ -242,7 +242,7 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
         XCTAssertEqual(responses.count, 2)
         XCTAssertEqual(Set(responses.map(\.markdown)).count, 1)
         XCTAssertNotEqual(responses[0].id, responses[1].id)
-        XCTAssertEqual(cards.count, 2)
+        XCTAssertEqual(cards.count, 1)
     }
 
     func testStableEventIDDeduplicatesMainStreamAndWorkStatus() throws {
@@ -389,19 +389,10 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
             events: events
         )
         XCTAssertFalse(cards.isEmpty)
-        XCTAssertEqual(
-            cards.first(where: { $0.rawEvents.contains { $0.id == activeTool.id } })?.status,
-            .active
-        )
-        XCTAssertEqual(
-            cards.first(where: { $0.rawEvents.contains { $0.id == waitingApproval.id } })?.status,
-            .waitingApproval
-        )
-        XCTAssertTrue(cards.contains { card in
-            card.kind == .result
-                && card.status == .completed
-                && card.rawEvents.contains { $0.eventType == .taskCompleted }
-        })
+        XCTAssertEqual(cards.count, 1)
+        XCTAssertEqual(cards.first?.status, .completed)
+        XCTAssertTrue(cards.first?.rawEvents.contains { $0.eventType == .taskCompleted } == true)
+        XCTAssertFalse(cards.first?.rawEvents.contains { $0.id == activeTool.id || $0.id == waitingApproval.id } == true)
     }
 
     func testSyntheticLifecycleEventsDoNotCountAsExecutionEvidence() {
@@ -560,10 +551,11 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
             "/usr/bin/swift build"
         ])
         XCTAssertEqual(completedSteps.count, 3)
-        XCTAssertEqual(evidenceCards.count, 3)
-        XCTAssertTrue(evidenceCards.allSatisfy { card in
-            card.rawEvents.contains { $0.eventType == .stepExecuted }
-        })
+        XCTAssertEqual(evidenceCards.count, 1)
+        XCTAssertEqual(
+            evidenceCards.first?.rawEvents.filter { $0.eventType == .stepExecuted }.count,
+            3
+        )
     }
 
     func testRepairableWorkspaceAndPlannerFailuresProjectBlockedWorkStatus() {
@@ -601,7 +593,7 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
             )
             let blocked = cards.first { $0.status == .blocked }
             XCTAssertNotNil(blocked, "Expected BLOCKED Work Status for \(blocker)")
-            XCTAssertEqual(blocked?.narration, "Work is blocked and has not completed.")
+            XCTAssertEqual(blocked?.narration, "The bounded run stopped before it could complete.")
             XCTAssertFalse(cards.contains { $0.status == .failed })
         }
     }
@@ -696,7 +688,8 @@ final class AgentConversationWorkUnitAdapterTests: XCTestCase {
         XCTAssertEqual(task.state, .completed)
         XCTAssertFalse(events.isEmpty)
         XCTAssertEqual(streamingResponseCount, runtimeMessageCount)
-        XCTAssertLessThan(workUnitCardCount, runtimeMessageCount)
+        XCTAssertEqual(workUnitCardCount, 1)
+        XCTAssertEqual(runtimeMessageCount, 1)
         XCTAssertEqual(liveTrace.timeline.count, events.count)
     }
 

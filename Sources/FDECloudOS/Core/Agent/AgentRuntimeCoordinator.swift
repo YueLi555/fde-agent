@@ -83,6 +83,27 @@ enum AgentRequestRoute: String, Codable, Hashable, Sendable {
     case activeMissionResume
 }
 
+/// The authoritative boundary between conversation and execution. This is
+/// intentionally sentence-level: nouns such as "Legacy", "Agent", "inspect",
+/// or "patch" never grant runtime authority on their own.
+enum FDEExecutionIntentClassification: String, Codable, CaseIterable, Hashable, Sendable {
+    case advisoryConversation
+    case clarificationRequired
+    case executableReadOnly
+    case executableCandidateChange
+    case ordinaryConversation
+    case otherExecutable
+
+    var startsRuntime: Bool {
+        switch self {
+        case .executableReadOnly, .executableCandidateChange, .otherExecutable:
+            return true
+        case .advisoryConversation, .clarificationRequired, .ordinaryConversation:
+            return false
+        }
+    }
+}
+
 struct AgentRuntimePreflightContext: Equatable, Sendable {
     var hasExactProductionReadinessReport: Bool
 
@@ -247,19 +268,27 @@ struct AgentRuntimeCoordinator: Sendable {
             intent: intent,
             hasActiveRuntimeTask: false
         )
-        let preflight = ConversationRuntimePreflight.evaluate(
-            safeInput,
-            context: preflightContext
+        let executionIntent = missionClassifier.executionIntentClassification(
+            for: safeInput,
+            intent: intent
         )
-        let route = preflight == nil
-            ? route(
+        let preflight = executionIntent == .advisoryConversation
+            || executionIntent == .ordinaryConversation
+            ? nil
+            : ConversationRuntimePreflight.evaluate(safeInput, context: preflightContext)
+        let route: AgentRequestRoute
+        if preflight != nil || executionIntent == .clarificationRequired {
+            route = .clarificationRequired
+        } else {
+            route = self.route(
                 input: safeInput,
                 intent: intent,
                 isCapabilityQuestion: isCapabilityQuestion,
                 isExplicitMission: isExplicitMission,
-                selectedMode: selectedMode
+                selectedMode: selectedMode,
+                executionIntent: executionIntent
             )
-            : .clarificationRequired
+        }
         let missionSemantic = MissionExecutionSemantic(intent: intent)
         let startsRuntime = route == .workspaceReadOnlyInvestigation
             || route == .safeSandboxAcceptance
@@ -299,6 +328,7 @@ struct AgentRuntimeCoordinator: Sendable {
                 "interaction_state": session.interactionState.rawValue,
                 "agent_loop_phase": "observe",
                 "selected_route": route.rawValue,
+                "execution_intent_classification": executionIntent.rawValue,
                 "mission_semantic": missionSemantic.rawValue,
                 "runtime_mode": startsRuntime
                     ? AgentRuntimeMode.agentTask.rawValue
@@ -454,17 +484,22 @@ struct AgentRuntimeCoordinator: Sendable {
             session: session,
             events: linkedTaskEvents
         )
-        let preflight = ConversationRuntimePreflight.evaluate(
-            reply,
-            context: preflightContext
+        let executionIntent = missionClassifier.executionIntentClassification(
+            for: reply,
+            intent: replyIntent
         )
-        let requestRoute = preflight == nil
+        let preflight = executionIntent == .advisoryConversation
+            || executionIntent == .ordinaryConversation
+            ? nil
+            : ConversationRuntimePreflight.evaluate(reply, context: preflightContext)
+        let requestRoute = preflight == nil && executionIntent != .clarificationRequired
             ? route(
                 input: reply,
                 intent: replyIntent,
                 isCapabilityQuestion: isCapabilityQuestion,
                 isExplicitMission: isExplicitMission,
-                selectedMode: selectedMode
+                selectedMode: selectedMode,
+                executionIntent: executionIntent
             )
             : .clarificationRequired
         let route: AgentRequestRoute
@@ -968,8 +1003,15 @@ struct AgentRuntimeCoordinator: Sendable {
         intent: MissionIntent,
         isCapabilityQuestion: Bool,
         isExplicitMission: Bool,
-        selectedMode: FDEConversationMode
+        selectedMode: FDEConversationMode,
+        executionIntent: FDEExecutionIntentClassification
     ) -> AgentRequestRoute {
+        if executionIntent == .advisoryConversation || executionIntent == .ordinaryConversation {
+            return .conversationalChat
+        }
+        if executionIntent == .clarificationRequired {
+            return .clarificationRequired
+        }
         if intent.intentType == .candidatePatchSandboxDestroy {
             return .candidatePatchSandboxDestroy
         }
@@ -985,7 +1027,7 @@ struct AgentRuntimeCoordinator: Sendable {
         if intent.intentType == .safeSandboxAcceptance {
             return .safeSandboxAcceptance
         }
-        if missionClassifier.requiresReadOnlyRuntime(input, intent: intent) {
+        if executionIntent == .executableReadOnly {
             return .workspaceReadOnlyInvestigation
         }
         if missionClassifier.isPriorWorkQuestion(input) {
@@ -1641,9 +1683,12 @@ struct AgentRuntimeCoordinator: Sendable {
         case .running:
             session.currentState = .executing
             session.setInteractionState(.running)
-        case .waiting, .pendingApproval:
+        case .pendingApproval:
             session.currentState = .waitingApproval
             session.setInteractionState(.waitingForApproval)
+        case .waiting:
+            session.currentState = .waitingApproval
+            session.setInteractionState(.waitingForUser)
         case .completed, .replayed:
             session.currentState = .completed
             session.setInteractionState(.completed)
@@ -1716,14 +1761,14 @@ struct AgentMissionClassifier: Sendable {
             || resolvedIntent.intentType == .candidatePatchSandboxDestroy {
             return .executableEngineeringTask
         }
+        if isLegacyTransformationAdvisory(input) {
+            return .legacyTransformationAdvisory
+        }
         if isIdentityQuestion(input) || isCapabilityQuestion(input) || isAgentAbilityQuestion(input) {
             return .fdeCapabilityExplanation
         }
         if requiresReadOnlyRuntime(input, intent: resolvedIntent) {
             return .workspaceReadOnlyInvestigation
-        }
-        if isLegacyTransformationAdvisory(input) {
-            return .legacyTransformationAdvisory
         }
         if isPassiveWorkspaceSummaryRequest(input)
             || isWorkspaceQuestion(input, intent: resolvedIntent) {
@@ -1740,6 +1785,9 @@ struct AgentMissionClassifier: Sendable {
 
     func isLegacyTransformationAdvisory(_ input: String) -> Bool {
         let text = normalized(input)
+        guard isQuestionForm(input), !isExplicitReadOnlyActivation(input) else {
+            return false
+        }
         let refersToTransformation = containsAny(
             text,
             [
@@ -1750,8 +1798,8 @@ struct AgentMissionClassifier: Sendable {
         let advisoryQuestion = containsAny(
             text,
             [
-                "how", "which", "whether", "readiness", "suitable", "assess", "evaluate", "design",
-                "怎么", "如何", "哪些", "能不能", "适合", "判断", "评估", "设计", "权限", "审批"
+                "what", "how", "which", "whether", "would", "should", "readiness", "suitable", "assess", "evaluate", "design", "first",
+                "什么", "怎么", "如何", "哪些", "会先", "首先会", "需要考虑", "能不能", "适合", "判断", "评估", "设计", "权限", "审批"
             ]
         )
         let asksAboutFDEAbility = containsAny(text, ["你能", "你可以", "can you", "could you"])
@@ -1759,7 +1807,91 @@ struct AgentMissionClassifier: Sendable {
             text,
             ["this project", "current project", "selected workspace", "这个项目", "当前项目", "当前工作区", "这个工作区"]
         )
-        return refersToTransformation && advisoryQuestion && !asksAboutFDEAbility && !explicitlySelectedWorkspace
+        return refersToTransformation
+            && advisoryQuestion
+            && !asksAboutFDEAbility
+            && !explicitlySelectedWorkspace
+    }
+
+    func executionIntentClassification(
+        for input: String,
+        intent: MissionIntent? = nil
+    ) -> FDEExecutionIntentClassification {
+        let resolvedIntent = intent ?? self.intent(for: input)
+
+        if isCasualChat(input)
+            || isFeedbackOrComplaint(input)
+            || isIdentityQuestion(input)
+            || isCapabilityQuestion(input)
+            || isAgentAbilityQuestion(input) {
+            return .ordinaryConversation
+        }
+        switch resolvedIntent.intentType {
+        case .candidatePatchGeneration,
+             .candidatePatchRevert,
+             .candidatePatchSandboxDestroy:
+            return needsMissionClarification(input, intent: resolvedIntent)
+                ? .clarificationRequired
+                : .executableCandidateChange
+        case .generatedTestPlan,
+             .safeSandboxAcceptance,
+             .modifyCode,
+             .runTests,
+             .createFeature,
+             .refactorCode,
+             .manageRuntime:
+            return needsMissionClarification(input, intent: resolvedIntent)
+                ? .clarificationRequired
+                : .otherExecutable
+        default:
+            break
+        }
+        if isExplicitReadOnlyActivation(input)
+            || (isImperativeWorkspaceRequest(input, intent: resolvedIntent)
+                && (requiresReadOnlyRuntime(input, intent: resolvedIntent)
+                    || containsSourceFileReference(input))) {
+            return .executableReadOnly
+        }
+        if isPriorWorkQuestion(input) {
+            return .ordinaryConversation
+        }
+        if isLegacyTransformationAdvisory(input) || isHypotheticalInspectionQuestion(input) {
+            return .advisoryConversation
+        }
+        if ConversationRuntimePreflight.evaluate(input) != nil {
+            return .clarificationRequired
+        }
+        switch resolvedIntent.intentType {
+        case .candidatePatchGeneration,
+             .candidatePatchRevert,
+             .candidatePatchSandboxDestroy,
+             .generatedTestPlan,
+             .safeSandboxAcceptance,
+             .modifyCode,
+             .runTests,
+             .createFeature,
+             .refactorCode,
+             .manageRuntime:
+            // Handled above so explicit mutation/runtime intents cannot be
+            // downgraded merely because their scope references prior evidence.
+            return .otherExecutable
+        case .aiAgentCompatibilityAssessment,
+             .inspectWorkspace,
+             .architectureAnalysis,
+             .explainCode,
+             .generateReport:
+            if isExplicitReadOnlyActivation(input)
+                || isImperativeWorkspaceRequest(input, intent: resolvedIntent) {
+                return .executableReadOnly
+            }
+            return isQuestionForm(input) ? .advisoryConversation : .executableReadOnly
+        case .debugIssue:
+            return needsMissionClarification(input, intent: resolvedIntent)
+                ? .clarificationRequired
+                : .otherExecutable
+        case .answerQuestion, .unknown:
+            return .ordinaryConversation
+        }
     }
 
     func isEngineeringExplanation(_ input: String, intent: MissionIntent? = nil) -> Bool {
@@ -2192,6 +2324,94 @@ struct AgentMissionClassifier: Sendable {
             ]
         )
         return asksForOverview || asksForFileCounts || asksForSelectedProjects
+    }
+
+    private func isHypotheticalInspectionQuestion(_ input: String) -> Bool {
+        let text = normalized(input)
+        guard isQuestionForm(input) else { return false }
+        let hypothetical = containsAny(
+            text,
+            [
+                "what would you", "how would you", "what do you inspect", "what would be inspected",
+                "would you inspect", "what should be considered", "what should i consider",
+                "你会检查什么", "你会先检查", "你首先会检查", "会先检查什么", "首先检查什么",
+                "需要考虑什么", "会怎么检查", "会如何检查"
+            ]
+        )
+        let methodologyDomain = containsAny(
+            text,
+            [
+                "legacy", "traditional software", "existing system", "ai agent", "agent integration",
+                "传统软件", "旧系统", "现有系统", "智能体", "接入 agent", "集成 agent"
+            ]
+        )
+        return hypothetical && methodologyDomain && !isExplicitReadOnlyActivation(input)
+    }
+
+    private func isQuestionForm(_ input: String) -> Bool {
+        let text = normalized(input)
+        return input.contains("?")
+            || input.contains("？")
+            || containsAny(
+                text,
+                [
+                    "what", "why", "how", "which", "whether", "would", "should", "can you",
+                    "什么", "为什么", "如何", "怎么", "哪些", "是否", "会不会", "你会", "吗"
+                ]
+            )
+    }
+
+    private func isExplicitReadOnlyActivation(_ input: String) -> Bool {
+        let text = normalized(input)
+        let directActivation = containsAny(
+            text,
+            [
+                "start read-only assessment", "start the read-only assessment", "begin read-only assessment",
+                "start a read-only inspection", "start the read-only inspection", "now start read-only",
+                "inspect the selected", "inspect both selected", "assess the selected", "analyze the selected",
+                "现在开始只读", "开始只读检查", "开始只读评估", "开始只读分析", "启动只读评估",
+                "检查我选中的", "检查当前选择的", "只读检查我选中的", "只读分析我选中的"
+            ]
+        )
+        let boundedContinuation = containsAny(
+            text,
+            [
+                "continue inspecting", "continue the inspection", "continue checking", "continue reading",
+                "继续检查", "继续只读检查", "继续读取"
+            ]
+        ) && containsAny(
+            text,
+            ["read-only", "do not modify", "without modifying", "只读", "不要修改", "不修改"]
+        )
+        return directActivation || boundedContinuation
+    }
+
+    private func isImperativeWorkspaceRequest(_ input: String, intent: MissionIntent) -> Bool {
+        let text = normalized(input)
+        let imperativePrefix = [
+            "inspect ", "review ", "analyze ", "analyse ", "assess ", "audit ", "read ", "check ",
+            "检查", "查看", "分析", "评估", "审查", "读取", "对比"
+        ].contains { text.hasPrefix($0) }
+        if isQuestionForm(input)
+            && !isExplicitReadOnlyActivation(input)
+            && !imperativePrefix {
+            return false
+        }
+        let selectedTarget = containsAny(
+            text,
+            [
+                "selected", "current project", "current workspace", "this project", "both projects", "both workspaces",
+                "选中的", "当前项目", "当前工作区", "两个项目", "legacy 和 agent", "legacy 与 agent"
+            ]
+        )
+        return imperativePrefix
+            || (selectedTarget && [
+                MissionIntentType.aiAgentCompatibilityAssessment,
+                .inspectWorkspace,
+                .architectureAnalysis,
+                .explainCode,
+                .generateReport
+            ].contains(intent.intentType))
     }
 
     private func containsSourceFileReference(_ input: String) -> Bool {

@@ -150,7 +150,7 @@ final class AgentInteractionControllerTests: XCTestCase {
         XCTAssertTrue(session.artifacts.contains { $0.type == .report && $0.relatedTaskID == taskID })
         XCTAssertTrue(session.artifacts.contains { $0.type == .configChange && $0.approvalStatus == .approved })
         XCTAssertTrue(session.conversation.messages.contains { $0.type == .result })
-        XCTAssertTrue(session.conversation.messages.contains { $0.type == .decision && $0.content.contains("planning lesson") })
+        XCTAssertFalse(session.conversation.messages.contains { $0.type == .decision && $0.content.contains("planning lesson") })
     }
 
     func testReplayCompatibilityIncludesUserInteractionEventsInOrder() {
@@ -173,7 +173,6 @@ final class AgentInteractionControllerTests: XCTestCase {
 
         XCTAssertEqual(conversation.messages.map(\.content), [
             "Debug customer integration",
-            "I'll take a quick look at the workspace first, then turn that into a plan.",
             "User added an instruction",
             "User selected a path forward",
             "Finished successfully."

@@ -1419,6 +1419,7 @@ enum ReadOnlyFinalAnswerContractFailure: String, Codable, CaseIterable, Hashable
     case incorrectLanguage = "incorrect_language"
     case contradictoryCompletionState = "contradictory_completion_state"
     case assessmentSemanticInconsistency = "assessment_semantic_inconsistency"
+    case unboundAssessmentClaim = "unbound_assessment_claim"
 }
 
 enum ReadOnlyFinalAnswerContract {
@@ -1542,6 +1543,61 @@ enum ReadOnlyFinalAnswerContract {
             accepted: issues.isEmpty,
             issues: unique(issues),
             safeContractFailures: uniqueFailures(safeFailures),
+            ledger: ledger
+        )
+    }
+
+    /// Canonical assessment reports use their structured claim/evidence graph
+    /// as the single grounding authority. Prose keyword/path heuristics remain
+    /// available for generic read-only answers, but must not override a valid
+    /// structured assessment.
+    static func validateAssessment(
+        report: FDEIntegrationAssessment,
+        answer: String,
+        request: String,
+        requirements: ReadOnlyEvidenceRequirements,
+        evidence: [ReadOnlyInspectionEvidence],
+        requireComplete: Bool
+    ) -> ReadOnlyFinalAnswerValidation {
+        let ledger = ReadOnlyFinalizationEvidenceLedger(
+            requirements: requirements,
+            evidence: evidence,
+            finalAnswer: answer
+        )
+        var issues: [String] = []
+        var failures: [ReadOnlyFinalAnswerContractFailure] = []
+        let language = ReadOnlyResponseLanguage(request: request)
+        if !language.matches(answer) {
+            issues.append("final_answer_language_mismatch_expected_\(language.rawValue)")
+            failures.append(.incorrectLanguage)
+        }
+        if requireComplete, !ledger.allMaterialRequirementsSatisfied {
+            issues.append("material_requirements_unsatisfied")
+            failures.append(.missingExplicitRequirement)
+        }
+        if report.markdown(language: language) != answer {
+            issues.append("canonical_assessment_does_not_match_visible_answer")
+            failures.append(.assessmentSemanticInconsistency)
+        }
+        if !AssessmentSemanticConsistencyValidator.validate(report).isValid {
+            issues.append("assessment_semantic_inconsistency")
+            failures.append(.assessmentSemanticInconsistency)
+        }
+        let grounding = FDEAssessmentGroundingValidator.validate(report, evidence: evidence)
+        if !grounding.accepted {
+            issues.append(contentsOf: grounding.unsupportedClaimIDs.map { "unbound_assessment_claim:\($0)" })
+            issues.append(contentsOf: grounding.invalidEvidenceReferenceIDs.map { "invalid_assessment_evidence_reference:\($0)" })
+            failures.append(.unboundAssessmentClaim)
+        }
+        if !requireComplete, !ledger.allMaterialRequirementsSatisfied,
+           report.unknownsAndNextInvestigationSteps.isEmpty {
+            issues.append("partial_assessment_does_not_identify_remaining_requirements")
+            failures.append(.contradictoryCompletionState)
+        }
+        return ReadOnlyFinalAnswerValidation(
+            accepted: issues.isEmpty,
+            issues: unique(issues),
+            safeContractFailures: uniqueFailures(failures),
             ledger: ledger
         )
     }

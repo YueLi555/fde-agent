@@ -166,7 +166,8 @@ final class AppStore: ObservableObject {
     }
 
     var selectedTask: FDETask? {
-        guard let runtimeTaskID = selectedAgentSession?.runtimeTaskID else { return nil }
+        guard selectedAgentSession?.hasCurrentMissionAuthority == true,
+              let runtimeTaskID = selectedAgentSession?.runtimeTaskID else { return nil }
         return tasks.first { $0.id == runtimeTaskID }
     }
 
@@ -186,7 +187,8 @@ final class AppStore: ObservableObject {
     }
 
     var selectedTaskPendingApprovals: [ApprovalRequest] {
-        guard let scope = selectedConversationScope,
+        guard selectedAgentSession?.hasCurrentMissionAuthority == true,
+              let scope = selectedConversationScope,
               scope.hasLinkedMission,
               let interactionState = selectedAgentSession?.interactionState else {
             return []
@@ -270,6 +272,7 @@ final class AppStore: ObservableObject {
     var selectedMissionPresentation: MissionPresentationState? {
         guard let session = selectedAgentSession,
               !session.isEmptyConversation,
+              session.hasCurrentMissionAuthority,
               selectedConversationScope?.hasLinkedMission == true else {
             return nil
         }
@@ -293,7 +296,8 @@ final class AppStore: ObservableObject {
     }
 
     var selectedConversationAssetProjection: AgentConversationAssetProjection {
-        guard let scope = selectedConversationScope,
+        guard selectedAgentSession?.hasCurrentMissionAuthority == true,
+              let scope = selectedConversationScope,
               scope.hasLinkedMission,
               let session = selectedAgentSession,
               let missionRunID = MissionPresentationProjector.selectedMissionRunID(
@@ -3171,7 +3175,19 @@ final class AppStore: ObservableObject {
                     partialEvent?.payload["blocker_reason"]
                         ?? events.last(where: { $0.taskID == task.id })?.payload["blocker_reason"]
                 )
-            case .created, .planned, .running, .waiting, .pendingApproval:
+            case .waiting:
+                let partialEvent = events.last { event in
+                    event.taskID == task.id
+                        && event.payload["partial_result_kind"] == "GROUNDED_PARTIAL_RESULT"
+                }
+                if let partialEvent {
+                    activity.kind = .partial
+                    activity.metadata.unsatisfiedRequirementCount = partialEvent.payload["evidence_requirements_unsatisfied_count"].flatMap(Int.init)
+                    activity.metadata.blockerReason = AgentConversationActivityCopy.blockerReason(
+                        partialEvent.payload["blocker_reason"]
+                    )
+                }
+            case .created, .planned, .running, .pendingApproval:
                 break
             }
         } else if activity.metadata.taskID == nil {

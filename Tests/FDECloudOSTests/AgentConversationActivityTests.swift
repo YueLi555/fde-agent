@@ -483,9 +483,9 @@ final class AgentConversationActivityTests: XCTestCase {
             events: events
         )
 
-        XCTAssertEqual(session.conversation.messages.filter { $0.sender == .agent }.count, 6)
+        XCTAssertEqual(session.conversation.messages.filter { $0.sender == .agent }.count, 1)
         XCTAssertTrue(session.conversation.messages.last?.content.contains("Canonical grounded report") == true)
-        XCTAssertEqual(visible.count, 7)
+        XCTAssertEqual(visible.count, 2)
         XCTAssertFalse(AgentConversationWorkUnitAdapter.workStatusCards(
             conversation: session.conversation,
             events: events

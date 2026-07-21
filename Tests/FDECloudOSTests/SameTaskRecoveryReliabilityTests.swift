@@ -141,7 +141,7 @@ final class SameTaskRecoveryReliabilityTests: XCTestCase {
             router: router
         )
 
-        XCTAssertEqual(task.state, .blocked, eventDiagnostic(events))
+        XCTAssertEqual(task.state, .waiting, eventDiagnostic(events))
         XCTAssertEqual(events.filter { $0.type == .toolCalled }.compactMap { $0.payload["target_path"] }, [
             ".", "server/package.json", "server/src/missing.ts", "package.json"
         ])
@@ -181,7 +181,7 @@ final class SameTaskRecoveryReliabilityTests: XCTestCase {
             router: router
         )
 
-        XCTAssertEqual(task.state, .blocked)
+        XCTAssertEqual(task.state, .waiting)
         let fallback = try XCTUnwrap(events.first {
             $0.payload["lifecycle_event"] == "GRACEFUL_FINALIZATION_FALLBACK"
                 && $0.payload["provider_stage"] == "recoverable_tool_failure"

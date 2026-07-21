@@ -594,7 +594,11 @@ struct WorkspaceInspectorView: View {
     private var artifacts: some View {
         if let summary = store.selectedMissionPresentation?.current {
             VStack(alignment: .leading, spacing: 12) {
-                inspectorCard("Assessment", value: summary.goal, symbol: "magnifyingglass")
+                inspectorCard(
+                    summary.exactDetails.contains(where: { $0.label == "Assessment ID" }) ? "FDE Assessment" : "Mission",
+                    value: summary.goal,
+                    symbol: "magnifyingglass"
+                )
                 if let patch = summary.candidatePatch {
                     inspectorCard(
                         "Candidate Patch",
@@ -657,6 +661,17 @@ struct WorkspaceInspectorView: View {
                         }
                     }
                     .padding(.top, 6)
+                }
+            }
+        } else if let session = store.selectedAgentSession,
+                  session.artifacts.contains(where: { $0.authorityClassification == .legacyInvalidAssessment }) {
+            VStack(alignment: .leading, spacing: 8) {
+                ContentUnavailableView("No authoritative artifacts", systemImage: "tray")
+                DisclosureGroup("Advanced details") {
+                    Text("A historical assessment-like artifact is retained as legacy-invalid and cannot create current Mission, status, approval, or Human Action authority.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
             }
         } else {

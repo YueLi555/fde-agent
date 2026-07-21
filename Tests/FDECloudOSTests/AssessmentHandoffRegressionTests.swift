@@ -235,7 +235,7 @@ final class AssessmentHandoffRegressionTests: XCTestCase {
         )
 
         let task = try XCTUnwrap(result.task)
-        XCTAssertEqual(task.state, .blocked)
+        XCTAssertEqual(task.state, .waiting)
         let events = try await fixture.persistence.loadEvents(
             workspaceID: fixture.workspace.id,
             taskID: task.id

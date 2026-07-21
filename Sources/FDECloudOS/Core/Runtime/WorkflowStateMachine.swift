@@ -31,6 +31,7 @@ struct WorkflowStateMachine: Sendable {
              (.running, .failed),
              (.running, .blocked),
              (.running, .completed),
+             (.waiting, .planned),
              (.waiting, .running),
              (.waiting, .failed),
              (.pendingApproval, .running),

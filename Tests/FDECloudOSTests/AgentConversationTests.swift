@@ -39,21 +39,9 @@ final class AgentConversationTests: XCTestCase {
         let messages = AgentResponseComposer.messages(for: events)
 
         XCTAssertEqual(messages.map(\.content), [
-            "Runtime task created for the executable request.",
-            "Plan generated from model output.",
-            "Checking the workspace now.",
-            "Checking the external system path now.",
-            "Policy event recorded from execution evidence.",
             "The runtime did not provide a grounded completion report."
         ])
-        XCTAssertEqual(messages.map(\.type), [
-            .progressUpdate,
-            .planUpdate,
-            .actionUpdate,
-            .actionUpdate,
-            .decision,
-            .result
-        ])
+        XCTAssertEqual(messages.map(\.type), [.result])
     }
 
     func testComposerDeduplicatesRepeatedTraceEventsForConversation() {
@@ -68,8 +56,7 @@ final class AgentConversationTests: XCTestCase {
 
         let messages = AgentResponseComposer.messages(for: events)
 
-        XCTAssertEqual(messages.count, 2)
-        XCTAssertEqual(messages.first?.content, "Inspecting the workspace files.")
+        XCTAssertTrue(messages.isEmpty)
     }
 
     func testComposerDoesNotLeakChainOfThoughtStdoutOrSecrets() {
@@ -143,8 +130,6 @@ final class AgentConversationTests: XCTestCase {
 
         XCTAssertEqual(conversation.messages.map(\.content), [
             "Fix customer API failure",
-            "Runtime task created for the executable request.",
-            "Plan generated from model output.",
             "The runtime did not provide a grounded completion report."
         ])
     }

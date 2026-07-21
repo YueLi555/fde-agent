@@ -48,7 +48,9 @@ struct AppEnvironment: Sendable {
         let authorizationService = AuthorizationService()
         let connectorRegistry = ConnectorRegistry.default()
         let agentResponseComposer = AgentResponseComposer.live(configuration: modelConfiguration)
-        let agentChatProvider = ModelProviderFactory.chatProvider(configuration: modelConfiguration)
+        let agentChatProvider: any AgentChatProviding = ModelProviderFactory.chatProvider(
+            configuration: modelConfiguration
+        ) ?? StateMachineChatProvider()
         let enterpriseMemoryStore = InMemoryEnterpriseMemoryStore()
         let memoryRetriever = EnterpriseMemoryRetriever(store: enterpriseMemoryStore)
         let enterpriseSystemGraphStore = InMemoryEnterpriseSystemGraphStore()

@@ -495,6 +495,14 @@ private enum LegacyMissionPresentationProjector {
         if activity?.kind == .failed || session.interactionState == .failed {
             return (.assess, .failed, activity?.metadata.blockerReason ?? "This run failed safely.", nil)
         }
+        if activity?.kind == .partial {
+            return (
+                .assess,
+                .assessing,
+                "A grounded partial assessment is ready. More information is needed to complete the recommendation.",
+                .continueAssessment
+            )
+        }
         if activity?.kind == .blocked || activity?.kind == .candidatePatchBlocked
             || activity?.kind == .generatedTestPlanningBlocked || session.interactionState == .blocked {
             return (.assess, .blocked, activity?.metadata.blockerReason ?? "This run needs attention before it can continue.", .resolveBlocker)

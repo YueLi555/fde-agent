@@ -91,6 +91,7 @@ struct AgentWorkspaceProjection: Sendable {
         }
 
         let projectedArtifacts = (artifacts ?? session?.artifacts ?? [])
+            .filter(\.hasCurrentAuthority)
             .filter { artifact in
                 guard let sourceEventID = artifact.sourceEventID else { return true }
                 return !existingEventIDs.contains(sourceEventID)

@@ -141,18 +141,130 @@ struct AgentConversationWorkUnitAdapter: Sendable {
                 pairs.map(\.1).sortedByMessageTime()
             }
 
-        return normalizedWorkUnits(
+        let units = normalizedWorkUnits(
             EventToWorkUnitAggregator.workUnits(from: orderedEvents),
             events: orderedEvents
         )
             .filter(shouldRenderAsConversationCard)
-            .map { unit in
+        let latestTaskID = orderedEvents.reversed().compactMap(\.taskID).first
+        let scopedUnits = latestTaskID.map { taskID in
+            units.filter { $0.taskID == taskID }
+        } ?? units
+        let cards = scopedUnits.map { unit in
                 card(
                     for: unit,
                     eventsByID: eventsByID,
                     messagesByEventID: messagesByEventID
                 )
             }
+        guard !cards.isEmpty else { return [] }
+
+        // The transcript owns one task-level Work Status projection. The
+        // individual planning/tool/result units remain available through the
+        // raw event rows and Inspector evidence, but never become a waterfall
+        // of central conversation cards.
+        let allEvents = scopedUnits
+            .flatMap(\.eventIDs)
+            .compactMap { eventsByID[$0] }
+            .sortedByConversationWorkUnitOrder()
+        let status = consolidatedStatus(cards.map(\.status), events: allEvents)
+        return [AgentConversationWorkUnitCard(
+            id: "work-status-\(latestTaskID?.uuidString ?? conversation.sessionID.uuidString)",
+            title: consolidatedTitle(status: status, events: allEvents),
+            status: status,
+            narration: consolidatedNarration(status: status),
+            completedSteps: unique(cards.flatMap(\.completedSteps)),
+            toolsUsed: unique(cards.flatMap(\.toolsUsed)),
+            evidenceSummary: evidenceSummary(from: allEvents),
+            rawEvents: allEvents.map(rawEventRow),
+            metrics: metrics(from: allEvents, allEvents: allEvents),
+            kind: .execution,
+            agent: cards.reversed().compactMap(\.agent).first
+        )]
+    }
+
+    private static func consolidatedStatus(
+        _ statuses: [AgentWorkUnitStatus],
+        events: [ExecutionEvent]
+    ) -> AgentWorkUnitStatus {
+        for event in events.reversed() {
+            if event.payload["partial_result_kind"] == "GROUNDED_PARTIAL_RESULT"
+                || event.payload["partial_completion_state"] == "BLOCKED_WITH_PARTIAL_RESULT" {
+                return .partial
+            }
+            if event.type == .taskCompleted,
+               event.payload["completion_gate_passed"] != "false" {
+                return .completed
+            }
+            switch event.payload["state"].flatMap(TaskState.init(rawValue:)) {
+            case .failed: return .failed
+            case .blocked: return .blocked
+            case .pendingApproval: return .waitingApproval
+            case .waiting: return .partial
+            case .completed, .replayed: return .completed
+            case .running: return .active
+            case .planned, .created: return .planned
+            case nil: break
+            }
+        }
+        if statuses.contains(.partial) { return .partial }
+        if statuses.contains(.failed) { return .failed }
+        if statuses.contains(.blocked) { return .blocked }
+        if statuses.contains(.waitingApproval) { return .waitingApproval }
+        if statuses.contains(.active) { return .active }
+        if statuses.contains(.planned) { return .planned }
+        return .completed
+    }
+
+    private static func consolidatedTitle(
+        status: AgentWorkUnitStatus,
+        events: [ExecutionEvent]
+    ) -> String {
+        let isReadOnlyAssessment = events.contains { event in
+            event.payload["completion_contract"] == RuntimeCompletionContractKind.readOnlyInspection.rawValue
+                || event.payload["intent_type"] == MissionIntentType.aiAgentCompatibilityAssessment.rawValue
+                || event.payload["tool_name"] == "engineering.read_file"
+        }
+        if isReadOnlyAssessment {
+            let workspaceIdentities = Set(events.compactMap {
+                $0.payload["workspace_identity"]?.lowercased()
+            })
+            let activeTitle: String
+            if workspaceIdentities.contains("legacy") && workspaceIdentities.contains("agent") {
+                activeTitle = "Inspecting Legacy and Agent workspaces"
+            } else if workspaceIdentities.contains("agent") {
+                activeTitle = "Inspecting the Agent workspace"
+            } else if workspaceIdentities.contains("legacy") {
+                activeTitle = "Inspecting the Legacy workspace"
+            } else {
+                activeTitle = "Inspecting the selected workspace scope"
+            }
+            switch status {
+            case .partial: return "Read-only assessment needs more information"
+            case .completed: return "Read-only assessment completed"
+            case .failed, .blocked: return "Read-only assessment stopped"
+            case .planned, .active, .waitingApproval:
+                return activeTitle
+            }
+        }
+        switch status {
+        case .partial: return "Work completed with a partial result"
+        case .completed: return "Work completed"
+        case .failed, .blocked: return "Work stopped"
+        case .planned, .active, .waitingApproval: return "Work in progress"
+        }
+    }
+
+    private static func consolidatedNarration(status: AgentWorkUnitStatus) -> String {
+        switch status {
+        case .planned: return "Preparing the bounded execution plan."
+        case .active: return "Inspecting the selected scope and preparing an evidence-grounded assessment."
+        case .waitingApproval: return "Waiting for the exact user action required to continue."
+        case .partial: return "A grounded partial result is available; more information is needed for a complete recommendation."
+        case .completed: return "The assessment finished with validated evidence."
+        case .blocked: return "The bounded run stopped before it could complete."
+        case .failed: return "The bounded run did not complete successfully."
+        }
     }
 
     private static func normalizedWorkUnits(

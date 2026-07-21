@@ -731,7 +731,7 @@ final class AgentRuntimeCoordinatorTests: XCTestCase {
             $0.content.contains("I have your clarification")
         })
         let recordedEvents = await runtime.recordedEvents()
-        XCTAssertEqual(recordedEvents.last?.payload["selected_route"], AgentRequestRoute.executableTask.rawValue)
+        XCTAssertEqual(recordedEvents.last?.payload["selected_route"], AgentRequestRoute.workspaceReadOnlyInvestigation.rawValue)
     }
 
     func testCapabilityQuestionWhileWaitingDoesNotStartRuntime() async throws {

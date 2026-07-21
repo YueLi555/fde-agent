@@ -110,7 +110,7 @@ struct AgentResponseComposer: Sendable {
             id: stableMessageID,
             timestamp: event.timestamp,
             sender: sender(for: event.type),
-            type: messageType(for: event.type),
+            type: isCanonicalGroundedAnswerEvent(event) ? .result : messageType(for: event.type),
             content: content(for: event),
             turnID: event.payload["turn_id"].flatMap(UUID.init(uuidString:))
                 ?? (event.type == .userMessageReceived ? stableMessageID : nil),
@@ -122,7 +122,7 @@ struct AgentResponseComposer: Sendable {
 
     static func messages(for events: [ExecutionEvent]) -> [AgentMessage] {
         events.sortedByComposerOrder().reduce(into: [AgentMessage]()) { result, event in
-            guard shouldComposeNarration(event) else { return }
+            guard shouldPresentInConversation(event) else { return }
             let message = message(for: event)
             guard shouldAppend(message, to: result) else { return }
             result.append(message)
@@ -649,6 +649,11 @@ struct AgentResponseComposer: Sendable {
             let blocker = event.payload["blocker_reason"] ?? ""
             let isChinese = event.payload["response_language"] == "zh"
             let noReadEvidence = event.payload["successful_read_evidence"] != "true"
+            if blocker == PlanReadinessBlocker.ungroundedFinalAnswer.rawValue {
+                return isChinese
+                    ? "只读检查已经结束，但现有证据还不足以支持完整的最终接入建议。已验证的观察和仍缺少的信息会保留在结果中。"
+                    : "The read-only inspection finished, but the available evidence is not sufficient for a complete integration recommendation. Verified observations and missing information remain available in the result."
+            }
             if blocker == PlanReadinessBlocker.workingDirectoryOutsideWorkspace.rawValue
                 || blocker == PlanReadinessBlocker.workspaceScopeMismatch.rawValue {
                 return isChinese

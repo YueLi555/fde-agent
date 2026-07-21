@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct AgentWorkspaceContext: Codable, Hashable, Sendable {
@@ -211,6 +212,24 @@ enum AgentArtifactApprovalStatus: String, Codable, CaseIterable, Hashable, Ident
     var id: String { rawValue }
 }
 
+enum AgentArtifactAuthorityClassification: String, Codable, CaseIterable, Hashable, Sendable {
+    case authoritativeAssessment = "AUTHORITATIVE_ASSESSMENT"
+    case legacyInvalidAssessment = "LEGACY_INVALID_ASSESSMENT"
+    case notAssessment = "NOT_ASSESSMENT"
+}
+
+struct AssessmentArtifactProvenance: Codable, Hashable, Sendable {
+    var sessionID: UUID
+    var workspaceID: UUID
+    var turnID: UUID
+    var requestID: UUID
+    var executableIntentClassification: FDEExecutionIntentClassification
+    var runtimeTaskID: UUID
+    var missionID: UUID
+    var evidenceLineageEventIDs: [UUID]
+    var artifactDigest: String
+}
+
 struct AgentArtifact: Identifiable, Codable, Hashable, Sendable {
     let id: String
     var type: AgentArtifactType
@@ -222,6 +241,20 @@ struct AgentArtifact: Identifiable, Codable, Hashable, Sendable {
     var sourceEventID: UUID?
     var approvalStatus: AgentArtifactApprovalStatus
     var createdAt: Date
+    var assessmentProvenance: AssessmentArtifactProvenance?
+    var authorityClassification: AgentArtifactAuthorityClassification?
+
+    var isAssessment: Bool {
+        authorityClassification == .authoritativeAssessment
+            || authorityClassification == .legacyInvalidAssessment
+            || detail.contains("# FDE AI Integration Assessment")
+            || detail.contains("# FDE AI 接入评估")
+            || title.localizedCaseInsensitiveContains("assessment")
+    }
+
+    var hasCurrentAuthority: Bool {
+        !isAssessment || authorityClassification == .authoritativeAssessment
+    }
 
     init(
         id: String,
@@ -233,7 +266,9 @@ struct AgentArtifact: Identifiable, Codable, Hashable, Sendable {
         relatedTaskID: UUID? = nil,
         sourceEventID: UUID? = nil,
         approvalStatus: AgentArtifactApprovalStatus = .notRequired,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        assessmentProvenance: AssessmentArtifactProvenance? = nil,
+        authorityClassification: AgentArtifactAuthorityClassification? = nil
     ) {
         self.id = id
         self.type = type
@@ -245,6 +280,8 @@ struct AgentArtifact: Identifiable, Codable, Hashable, Sendable {
         self.sourceEventID = sourceEventID
         self.approvalStatus = approvalStatus
         self.createdAt = createdAt
+        self.assessmentProvenance = assessmentProvenance
+        self.authorityClassification = authorityClassification
     }
 
     init?(event: ExecutionEvent) {
@@ -259,8 +296,17 @@ struct AgentArtifact: Identifiable, Codable, Hashable, Sendable {
                 return nil
             }
             type = .report
-            title = "Completion summary"
+            title = Self.isAssessmentEvent(event) ? "FDE Assessment" : "Completion summary"
             fallback = "Task completed"
+            approvalStatus = .notRequired
+        case .stateUpdated:
+            guard event.payload["partial_result_kind"] == "GROUNDED_PARTIAL_RESULT",
+                  event.payload["grounded_answer"] == "true" else {
+                return nil
+            }
+            type = .report
+            title = Self.isAssessmentEvent(event) ? "FDE Assessment" : "Partial result"
+            fallback = "Grounded partial result"
             approvalStatus = .notRequired
         case .feedbackGenerated:
             switch event.payload["kind"] {
@@ -336,7 +382,49 @@ struct AgentArtifact: Identifiable, Codable, Hashable, Sendable {
             relatedTaskID: event.taskID,
             sourceEventID: event.id,
             approvalStatus: approvalStatus,
-            createdAt: event.timestamp
+            createdAt: event.timestamp,
+            authorityClassification: Self.isAssessmentEvent(event) ? .legacyInvalidAssessment : .notAssessment
         )
+    }
+
+    mutating func bindAssessmentAuthority(
+        sessionID: UUID,
+        workspaceID: UUID,
+        turnID: UUID,
+        requestID: UUID,
+        intent: FDEExecutionIntentClassification,
+        runtimeTaskID: UUID,
+        missionID: UUID,
+        evidenceEventIDs: [UUID]
+    ) {
+        guard isAssessment,
+              intent == .executableReadOnly,
+              !evidenceEventIDs.isEmpty else {
+            authorityClassification = isAssessment ? .legacyInvalidAssessment : .notAssessment
+            assessmentProvenance = nil
+            return
+        }
+        let lineage = Array(Set(evidenceEventIDs)).sorted { $0.uuidString < $1.uuidString }
+        let digest = SHA256.hash(data: Data(detail.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        assessmentProvenance = AssessmentArtifactProvenance(
+            sessionID: sessionID,
+            workspaceID: workspaceID,
+            turnID: turnID,
+            requestID: requestID,
+            executableIntentClassification: intent,
+            runtimeTaskID: runtimeTaskID,
+            missionID: missionID,
+            evidenceLineageEventIDs: lineage,
+            artifactDigest: digest
+        )
+        authorityClassification = .authoritativeAssessment
+    }
+
+    private static func isAssessmentEvent(_ event: ExecutionEvent) -> Bool {
+        event.payload["ai_assessment_capability"]?.isEmpty == false
+            || event.payload["detail"]?.contains("# FDE AI Integration Assessment") == true
+            || event.payload["detail"]?.contains("# FDE AI 接入评估") == true
     }
 }

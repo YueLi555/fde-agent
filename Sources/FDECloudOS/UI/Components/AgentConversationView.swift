@@ -67,6 +67,14 @@ struct AgentConversationView: View {
         )
     }
 
+    private var liveWorkStatusCards: [AgentConversationWorkUnitCard] {
+        workStatusCards.filter { $0.status == .planned || $0.status == .active }
+    }
+
+    private var settledWorkStatusCards: [AgentConversationWorkUnitCard] {
+        workStatusCards.filter { $0.status != .planned && $0.status != .active }
+    }
+
     private var missionPresentation: MissionPresentationState {
         MissionPresentationProjector.project(
             session: session,
@@ -121,6 +129,10 @@ struct AgentConversationView: View {
                         item: item,
                         onSelectOption: onSelectOption
                     )
+                }
+
+                if !liveWorkStatusCards.isEmpty {
+                    AgentConversationWorkStatusCard(cards: liveWorkStatusCards)
                 }
 
                 if showsMissionPresentation {
@@ -182,8 +194,8 @@ struct AgentConversationView: View {
                                 onPlanGeneratedTests: nil
                             )
                         }
-                        if !workStatusCards.isEmpty {
-                            AgentConversationWorkStatusCard(cards: workStatusCards)
+                        if !settledWorkStatusCards.isEmpty {
+                            AgentConversationWorkStatusCard(cards: settledWorkStatusCards)
                         }
                     }
                     .padding(.top, 8)

@@ -321,6 +321,7 @@ struct AssessmentVerificationStatus: Codable, Hashable, Sendable {
 
 struct AssessmentEvidenceReference: Codable, Hashable, Sendable, Identifiable {
     var source: AssessmentEvidenceSource
+    var workspaceIdentity: String?
     var path: String
     var fact: String
     var claimLevel: ReadOnlyEngineeringClaimLevel?
@@ -332,10 +333,11 @@ struct AssessmentEvidenceReference: Codable, Hashable, Sendable, Identifiable {
     var workspaceSnapshotIdentifier: String?
     var relatedToolEventID: UUID?
 
-    var id: String { "\(source.rawValue):\(path):\(fact)" }
+    var id: String { "\(source.rawValue):\(workspaceIdentity ?? "request"):\(path):\(fact)" }
 
     init(
         source: AssessmentEvidenceSource,
+        workspaceIdentity: String? = nil,
         path: String,
         fact: String,
         claimLevel: ReadOnlyEngineeringClaimLevel?,
@@ -348,6 +350,7 @@ struct AssessmentEvidenceReference: Codable, Hashable, Sendable, Identifiable {
         relatedToolEventID: UUID? = nil
     ) {
         self.source = source
+        self.workspaceIdentity = workspaceIdentity
         self.path = path
         self.fact = fact
         self.claimLevel = claimLevel
@@ -488,6 +491,7 @@ struct LegacyArchitecture: Codable, Hashable, Sendable {
             }
             let reference = AssessmentEvidenceReference(
                 source: .staticSearch,
+                workspaceIdentity: item.workspaceIdentity,
                 path: item.targetPath,
                 fact: "Bounded static search for '\(query)' returned zero matches.",
                 claimLevel: .discovered,
@@ -536,6 +540,7 @@ struct LegacyArchitecture: Codable, Hashable, Sendable {
             func reference(_ fact: String) -> AssessmentEvidenceReference {
                 AssessmentEvidenceReference(
                     source: source,
+                    workspaceIdentity: item.workspaceIdentity,
                     path: item.targetPath,
                     fact: fact,
                     claimLevel: level,
@@ -744,6 +749,7 @@ struct LegacyArchitecture: Codable, Hashable, Sendable {
         }
         return AssessmentEvidenceReference(
             source: source,
+            workspaceIdentity: item.workspaceIdentity,
             path: item.targetPath,
             fact: safeSummary,
             claimLevel: level,
@@ -1101,6 +1107,16 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
 
     var verdict: AgentIntegrationVerdict { compatibilityMatrix.verdict }
 
+    var materialClaims: [AssessmentClaim] {
+        [executiveSummary]
+            + legacySystemUnderstanding
+            + compatibilityMatrix.entries.map(\.claim)
+            + integrationOpportunities.map(\.claim)
+            + securityAssessment.claims
+            + integrationBlockers.blockers.map(\.claim)
+            + [recommendedArchitecture.claim]
+    }
+
     var activitySnapshot: AIAssessmentActivitySnapshot {
         AIAssessmentActivitySnapshot(
             capability: requestedAICapability.name,
@@ -1125,6 +1141,19 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
     }
 
     private func englishMarkdown() -> String {
+        let readiness: String
+        switch verdict {
+        case .yes: readiness = "Ready"
+        case .partial: readiness = "Partial"
+        case .no: readiness = "Not Ready"
+        }
+        let highestPriorityBlocker = integrationBlockers.blockers.first?.reason
+            ?? "No evidence-backed blocker is confirmed; runtime validation remains outstanding."
+        let recommendedNextAction = unknownsAndNextInvestigationSteps.first
+            ?? "Create a bounded Integration Plan for the permission-aware read-only adapter."
+        let agentWorkspaceInspected = evidenceRecords.contains {
+            $0.workspaceIdentity?.lowercased().contains("agent") == true
+        }
         var lines: [String] = [
             "# FDE AI Integration Assessment Report",
             "",
@@ -1132,6 +1161,10 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
             "",
             "**\(verdict.rawValue)** — \(executiveSummary.statement)",
             claimDetails(executiveSummary),
+            "- Readiness: **\(readiness)**",
+            "- Recommended integration pattern: \(recommendedArchitecture.dataFlow.joined(separator: " → "))",
+            "- Highest-priority blocker: \(highestPriorityBlocker)",
+            "- Recommended next step: \(recommendedNextAction)",
             "",
             "## 2. Legacy System Understanding",
             ""
@@ -1139,11 +1172,29 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
         lines.append(contentsOf: legacySystemUnderstanding.flatMap { ["- \($0.statement)", "  \(claimDetails($0))"] })
         lines += [
             "",
+            "### Business and workflow objective",
+            "",
+            "- Requested business outcome: enable \(requestedAICapability.name) through a bounded Legacy integration.",
+            "- Current workflow: not established by repository evidence unless described in the observed facts below.",
+            "- Human decision points: approve any move beyond authorized reads and review consequential Agent output.",
+            "- Success criteria: authenticated, permission-filtered, auditable output with deterministic failure-closed behavior.",
+            "- Workflow unknowns: product ownership, service-level objectives, and customer acceptance criteria were not inspected.",
+            "",
             "## 3. Requested AI Capability",
             "",
             "- Normalized capability ID: `\(requestedAICapability.normalizedCapabilityID)`",
             "- Display label: \(requestedAICapability.name)",
             "- Required capabilities: \(requestedAICapability.requiredCapabilities.map { $0.capability.displayName }.joined(separator: ", "))",
+            "",
+            "### AI Agent Contract",
+            "",
+            "- Input/output: accept an authenticated, scoped request and return a schema-bounded answer with uncertainty.",
+            "- Tool contract: use only allowlisted, permission-aware service operations; no direct database or Legacy mutation access.",
+            "- State and memory: treat memory as untrusted context and re-check authorization on every operation.",
+            "- Permissions: propagate user identity, enforce record-level scope, and fail closed on drift.",
+            "- Failure/retry: bound retries, preserve audit evidence, and return a truthful partial result when evidence is insufficient.",
+            "- Human in the loop: require explicit approval before any future consequential or write-capable action.",
+            "- Agent workspace inspection: \(agentWorkspaceInspected ? "evidence from an Agent-identified workspace is present." : "the Agent workspace was not inspected; this contract is a recommendation, not an observed Agent implementation fact.")",
             "",
             "## 4. Compatibility Matrix",
             ""
@@ -1151,12 +1202,30 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
         for (index, entry) in compatibilityMatrix.entries.enumerated() {
             lines += matrixCard(entry, index: index + 1, language: .english)
         }
-        lines += ["", "## 5. Integration Opportunities", ""]
+        lines += ["", "## 5. Candidate Integration Seams", ""]
         if integrationOpportunities.isEmpty {
-            lines.append("- No supported integration opportunity is confirmed yet.")
+            lines += [
+                "- **Recommendation — approval-gated read-only copilot**",
+                "  - Component/boundary: a new permission-aware adapter in front of the Legacy service boundary.",
+                "  - Pattern: read-only copilot; this is not an observed existing seam.",
+                "  - Evidence: no complete supported seam is confirmed by current evidence.",
+                "  - Benefit: isolates Agent uncertainty from the Legacy system.",
+                "  - Risk: identity, data minimization, and service ownership remain unknown.",
+                "  - Required changes: define the service contract, authorization policy, audit trail, and approval boundary.",
+                "  - Confidence: LOW (recommendation)."
+            ]
         } else {
-            lines.append(contentsOf: integrationOpportunities.map {
-                "- **\($0.feature):** \($0.possibleIntegration.joined(separator: " → ")) (\($0.confidence.rawValue); evidence: \($0.evidence.map(\.path).joined(separator: ", ")))"
+            lines.append(contentsOf: integrationOpportunities.flatMap { opportunity in
+                [
+                    "- **\(opportunity.feature)**",
+                    "  - Component/boundary: \(opportunity.possibleIntegration.last ?? opportunity.feature)",
+                    "  - Integration pattern: \(opportunity.possibleIntegration.joined(separator: " → "))",
+                    "  - Evidence: \(opportunity.evidence.map { "\($0.workspaceIdentity ?? "workspace"):\($0.path)" }.joined(separator: ", "))",
+                    "  - Benefit: exposes only the supported subset through a mediated boundary.",
+                    "  - Risk: unsupported capabilities and runtime behavior remain outside the static evidence.",
+                    "  - Required changes: define a stable contract, permission checks, audit events, and failure behavior.",
+                    "  - Confidence: \(opportunity.confidence.rawValue)."
+                ]
             })
         }
         lines += [
@@ -1167,6 +1236,12 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
             "- Permission Risk: \(securityAssessment.permissionRisk.rawValue)",
             "- Modification Risk: \(securityAssessment.modificationRisk.rawValue)",
             "- Human Approval Required: \(securityAssessment.humanApprovalRequired ? "YES" : "NO")",
+            "- Read/write boundary: current authority is read-only; no Legacy mutation is authorized.",
+            "- Sensitive-data exposure: minimize response fields and avoid credentials, secrets, and unrestricted payloads.",
+            "- Permission drift: re-authorize each call against the originating user and selected workspace.",
+            "- Production restrictions: no rollout or production execution is authorized by this assessment.",
+            "- Audit/replay: persist request, decision, tool, evidence, and approval lineage without sensitive payload leakage.",
+            "- Rollback: future changes must remain isolated and reversible before review.",
             "",
             "## 7. Integration Blockers",
             ""
@@ -1189,12 +1264,36 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
         lines.append(contentsOf: integrationPlan.steps.map {
             "- Phase \($0.phase), **\($0.title):** \($0.purpose) Validation: \($0.validationRequirement)"
         })
-        lines += ["", "## 9. Validation Test Plan", "", "Generated only; no tests were executed."]
+        lines += ["", "## 9. Validation Test Plan", "", "Generated only; no tests were executed.", "", "Required coverage: unit tests, integration tests, contract tests, sandbox validation, failure simulation, observability checks, and explicit acceptance criteria."]
         lines.append(contentsOf: validationTestPlan.tests.map {
             "- **\($0.name):** \($0.purpose) Expected: \($0.expectedResult)"
         })
         lines += ["", "## 10. Unknowns and Next Investigation Steps", ""]
         lines.append(contentsOf: unknownsAndNextInvestigationSteps.map { "- \($0)" })
+        lines += [
+            "",
+            "### Observed facts",
+            "",
+            "- Repository observations are limited to the claims carrying evidence IDs and workspace/path provenance in this report.",
+            "",
+            "### Inferences",
+            "",
+            "- Compatibility and risk conclusions are bounded inferences from those observed facts; they are not runtime verification.",
+            "",
+            "### Unknowns",
+            ""
+        ]
+        lines.append(contentsOf: (unknownsAndNextInvestigationSteps.isEmpty ? ["No additional unknown was recorded."] : unknownsAndNextInvestigationSteps).map { "- \($0)" })
+        lines += [
+            "",
+            "### Recommendations",
+            "",
+            "- \(recommendedArchitecture.claim.statement)",
+            "",
+            "### Recommended next action",
+            "",
+            "- \(recommendedNextAction)"
+        ]
         lines += ["", "## 11. Proposed Operational Workflow", "", "These workflows are proposed and are not runtime-verified."]
         lines.append(contentsOf: expectedAgentWorkflows.flatMap { workflow in
             [
@@ -1237,7 +1336,7 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
                     evidence.workspaceSnapshotIdentifier.map { "snapshot=\($0)" },
                     evidence.relatedToolEventID.map { "tool_event=\($0.uuidString)" }
                 ].compactMap { $0 }.joined(separator: "; ")
-                return "- \(evidence.id) | path=\(evidence.path) | maturity=\(evidence.claimLevel?.rawValue ?? "not_applicable") | status=\(evidence.observationStatus.rawValue) | component=\(evidence.sourceComponent) | \(evidence.safeEvidenceSummary)\(optional.isEmpty ? "" : " | \(optional)")"
+                return "- \(evidence.id) | workspace=\(evidence.workspaceIdentity ?? "request") | path=\(evidence.path) | maturity=\(evidence.claimLevel?.rawValue ?? "not_applicable") | status=\(evidence.observationStatus.rawValue) | component=\(evidence.sourceComponent) | \(evidence.safeEvidenceSummary)\(optional.isEmpty ? "" : " | \(optional)")"
             })
         }
         return lines.joined(separator: "\n")
@@ -1245,13 +1344,24 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
 
     private func chineseMarkdown() -> String {
         let conclusion: String
+        let readiness: String
         switch verdict {
         case .yes:
             conclusion = "静态证据确认了所有必要边界；仍需在后续获批阶段进行运行时验证。"
+            readiness = "就绪"
         case .partial:
             conclusion = "已确认部分可支持能力，但仍有被阻断或调查后仍未知的关键要求，当前只能提出受限的只读接入方案。"
+            readiness = "部分就绪"
         case .no:
             conclusion = "现有证据未形成可安全推进的完整接入机会，必须先解决已确认的阻断项。"
+            readiness = "未就绪"
+        }
+        let highestPriorityBlocker = integrationBlockers.blockers.first?.reason
+            ?? "当前没有经证据确认的阻断项，但运行时验证仍未执行。"
+        let recommendedNextAction = unknownsAndNextInvestigationSteps.first
+            ?? "为带权限边界的只读适配器创建一个受限的 Integration Plan。"
+        let agentWorkspaceInspected = evidenceRecords.contains {
+            $0.workspaceIdentity?.lowercased().contains("agent") == true
         }
         var lines: [String] = [
             "# FDE AI 接入评估报告",
@@ -1260,6 +1370,10 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
             "",
             "**\(verdict.rawValue)** — \(conclusion)",
             claimDetails(executiveSummary, language: .chinese),
+            "- 就绪度：**\(readiness)**",
+            "- 推荐接入模式：\(recommendedArchitecture.dataFlow.joined(separator: " → "))",
+            "- 最高优先级阻断项：\(highestPriorityBlocker)",
+            "- 推荐下一步：\(recommendedNextAction)",
             "",
             "## 2. Legacy 系统理解",
             ""
@@ -1273,11 +1387,29 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
         }
         lines += [
             "",
+            "### 业务目标与工作流",
+            "",
+            "- 请求的业务结果：通过受限的 Legacy 接入实现 \(requestedAICapability.name)。",
+            "- 当前工作流：除非下方观察事实明确说明，否则仓库证据尚未建立现行业务流程。",
+            "- 人工决策点：任何超出授权只读范围的动作都需要批准，并由人复核重要 Agent 输出。",
+            "- 成功标准：输出经过身份认证、权限过滤、可审计，并在失败时确定性关闭。",
+            "- 工作流未知项：产品负责人、服务目标和客户验收标准未被检查。",
+            "",
             "## 3. 请求的 AI 能力",
             "",
             "- 规范化能力 ID：`\(requestedAICapability.normalizedCapabilityID)`",
             "- 显示名称：\(requestedAICapability.name)",
             "- 明确要求：\(requestedAICapability.requiredCapabilities.map { $0.capability.displayName }.joined(separator: ", "))",
+            "",
+            "### AI Agent 契约",
+            "",
+            "- 输入/输出：接收经过身份认证且限定范围的请求，返回符合 Schema 且标注不确定性的答案。",
+            "- 工具契约：仅使用允许列表内、感知权限的服务操作；不得直接访问数据库或修改 Legacy。",
+            "- 状态与记忆：将记忆视为不可信上下文，每次操作都重新检查授权。",
+            "- 权限：传递原始用户身份，执行记录级范围，并在权限漂移时失败关闭。",
+            "- 失败/重试：限制重试次数、保留审计证据，证据不足时返回真实的部分结果。",
+            "- 人机协作：任何未来有后果或具备写能力的动作都必须先获得明确批准。",
+            "- Agent 工作区检查：\(agentWorkspaceInspected ? "存在来自 Agent 标识工作区的证据。" : "未检查 Agent 工作区；本契约是建议，不是对现有 Agent 实现的观察事实。")",
             "",
             "## 4. 兼容性矩阵",
             ""
@@ -1285,12 +1417,30 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
         for (index, entry) in compatibilityMatrix.entries.enumerated() {
             lines += matrixCard(entry, index: index + 1, language: .chinese)
         }
-        lines += ["", "## 5. 接入机会", ""]
+        lines += ["", "## 5. 候选接入缝隙", ""]
         if integrationOpportunities.isEmpty {
-            lines.append("- 当前没有证据充分的受支持接入机会。")
+            lines += [
+                "- **建议 — 需要批准的只读 Copilot**",
+                "  - 组件/边界：在 Legacy 服务边界之前新增感知权限的适配器。",
+                "  - 模式：只读 Copilot；这不是已观察到的现有缝隙。",
+                "  - 证据：当前证据尚未确认完整可用的接入缝隙。",
+                "  - 收益：将 Agent 不确定性与 Legacy 系统隔离。",
+                "  - 风险：身份、数据最小化和服务归属仍未知。",
+                "  - 所需变更：定义服务契约、授权策略、审计轨迹和批准边界。",
+                "  - 置信度：LOW（建议）。"
+            ]
         } else {
-            lines.append(contentsOf: integrationOpportunities.map { opportunity in
-                "- **\(opportunity.feature)**：\(opportunity.possibleIntegration.joined(separator: " → "))；置信度 \(opportunity.confidence.rawValue)；证据 \(evidenceList(opportunity.evidence))."
+            lines.append(contentsOf: integrationOpportunities.flatMap { opportunity in
+                [
+                    "- **\(opportunity.feature)**",
+                    "  - 组件/边界：\(opportunity.possibleIntegration.last ?? opportunity.feature)",
+                    "  - 接入模式：\(opportunity.possibleIntegration.joined(separator: " → "))",
+                    "  - 证据：\(opportunity.evidence.map { "\($0.workspaceIdentity ?? "workspace"):\($0.path)" }.joined(separator: ", "))",
+                    "  - 收益：仅通过中介边界暴露证据支持的能力子集。",
+                    "  - 风险：静态证据之外的能力与运行行为仍未知。",
+                    "  - 所需变更：定义稳定契约、权限检查、审计事件和失败行为。",
+                    "  - 置信度：\(opportunity.confidence.rawValue)。"
+                ]
             })
         }
         lines += [
@@ -1301,6 +1451,12 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
             "- 权限风险：\(securityAssessment.permissionRisk.rawValue)",
             "- 修改风险：\(securityAssessment.modificationRisk.rawValue)",
             "- 在推进实现或扩大影响前需要人工批准：\(securityAssessment.humanApprovalRequired ? "YES" : "NO")",
+            "- 读写边界：当前权限仅允许读取；不授权修改 Legacy。",
+            "- 敏感数据暴露：最小化响应字段，避免凭据、密钥和无限制载荷。",
+            "- 权限漂移：每次调用都依据原始用户和选定工作区重新授权。",
+            "- 生产限制：本评估不授权发布或生产执行。",
+            "- 审计/重放：保留请求、决策、工具、证据和批准血缘，不泄漏敏感载荷。",
+            "- 回滚：未来变更在复核前必须保持隔离且可逆。",
             "",
             "## 7. 接入阻断项",
             ""
@@ -1322,7 +1478,9 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
             "",
             "## 9. 验证测试计划",
             "",
-            "以下测试仅生成，未执行。"
+            "以下测试仅生成，未执行。",
+            "",
+            "必需覆盖：单元测试、集成测试、契约测试、Sandbox 验证、失败模拟、可观测性检查和明确验收标准。"
         ]
         lines.append(contentsOf: validationTestPlan.tests.map { "- **\($0.name)**：\($0.purpose)；预期：\($0.expectedResult)" })
         lines += ["", "## 10. 未知项与下一步调查", ""]
@@ -1331,6 +1489,30 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
         } else {
             lines.append(contentsOf: unknownsAndNextInvestigationSteps.map { "- \($0)" })
         }
+        lines += [
+            "",
+            "### 观察事实",
+            "",
+            "- 仓库观察仅限于本报告中携带证据 ID 与工作区/路径来源的声明。",
+            "",
+            "### 推断",
+            "",
+            "- 兼容性与风险结论是基于观察事实的受限推断，不等同于运行时验证。",
+            "",
+            "### 未知项",
+            ""
+        ]
+        lines.append(contentsOf: (unknownsAndNextInvestigationSteps.isEmpty ? ["未记录额外未知项。"] : unknownsAndNextInvestigationSteps).map { "- \($0)" })
+        lines += [
+            "",
+            "### 建议",
+            "",
+            "- \(recommendedArchitecture.claim.statement)",
+            "",
+            "### 推荐的下一动作",
+            "",
+            "- \(recommendedNextAction)"
+        ]
         lines += [
             "",
             "## 11. 建议的运行流程",
@@ -1361,7 +1543,7 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
             lines.append("- 没有可用的实质性 Legacy 证据记录。")
         } else {
             lines.append(contentsOf: evidenceRecords.map { evidence in
-                "- \(evidence.id) | path=\(evidence.path) | maturity=\(evidence.claimLevel?.rawValue ?? "not_applicable") | status=\(evidence.observationStatus.rawValue) | component=\(evidence.sourceComponent)"
+                "- \(evidence.id) | workspace=\(evidence.workspaceIdentity ?? "request") | path=\(evidence.path) | maturity=\(evidence.claimLevel?.rawValue ?? "not_applicable") | status=\(evidence.observationStatus.rawValue) | component=\(evidence.sourceComponent)"
             })
         }
         return lines.joined(separator: "\n")
@@ -1428,6 +1610,114 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
         case .medium: return 1
         case .high: return 2
         }
+    }
+}
+
+typealias FDEIntegrationAssessment = FDEAIIntegrationAssessmentReport
+
+struct FDEAssessmentGroundingValidation: Hashable, Sendable {
+    var accepted: Bool
+    var unsupportedClaimIDs: [String]
+    var invalidEvidenceReferenceIDs: [String]
+}
+
+enum FDEAssessmentGroundingValidator {
+    static func validate(
+        _ report: FDEIntegrationAssessment,
+        evidence: [ReadOnlyInspectionEvidence]
+    ) -> FDEAssessmentGroundingValidation {
+        let evidenceRecordIDs = Set(report.evidenceRecords.map(\.id))
+        let evidenceByEventID = Dictionary(uniqueKeysWithValues: evidence.map { ($0.toolResultEventID, $0) })
+        var unsupportedClaims: [String] = []
+        var invalidReferences: [String] = []
+
+        for claim in report.materialClaims {
+            let requiresObservedEvidence = claim.confidence == .high || claim.confidence == .medium
+            let usable = claim.evidence.filter { reference in
+                if reference.source == .userIntent { return true }
+                guard evidenceRecordIDs.contains(reference.id),
+                      let eventID = reference.relatedToolEventID,
+                      let source = evidenceByEventID[eventID] else {
+                    invalidReferences.append(reference.id)
+                    return false
+                }
+                let sameWorkspace = reference.workspaceIdentity == nil
+                    || reference.workspaceIdentity == source.workspaceIdentity
+                let samePath = reference.path == source.targetPath
+                if !sameWorkspace || !samePath {
+                    invalidReferences.append(reference.id)
+                    return false
+                }
+                return true
+            }
+            if requiresObservedEvidence && usable.isEmpty {
+                unsupportedClaims.append(claim.claimID)
+            }
+        }
+        return FDEAssessmentGroundingValidation(
+            accepted: unsupportedClaims.isEmpty && invalidReferences.isEmpty,
+            unsupportedClaimIDs: unique(unsupportedClaims),
+            invalidEvidenceReferenceIDs: unique(invalidReferences)
+        )
+    }
+
+    /// One bounded deterministic repair removes unbound references and
+    /// relabels an affected material statement as an explicit inference.
+    static func repair(
+        _ report: FDEIntegrationAssessment,
+        evidence: [ReadOnlyInspectionEvidence]
+    ) -> FDEIntegrationAssessment {
+        var repaired = report
+        let eventByID = Dictionary(uniqueKeysWithValues: evidence.map { ($0.toolResultEventID, $0) })
+        let evidenceRecordIDs = Set(report.evidenceRecords.map(\.id))
+
+        func repairClaim(_ claim: AssessmentClaim) -> AssessmentClaim {
+            var value = claim
+            value.evidence = claim.evidence.filter { reference in
+                if reference.source == .userIntent { return true }
+                guard evidenceRecordIDs.contains(reference.id),
+                      let eventID = reference.relatedToolEventID,
+                      let source = eventByID[eventID] else { return false }
+                return (reference.workspaceIdentity == nil || reference.workspaceIdentity == source.workspaceIdentity)
+                    && reference.path == source.targetPath
+            }
+            if value.evidence.isEmpty && (value.confidence == .high || value.confidence == .medium) {
+                value.statement = "Inference (not directly evidenced): \(value.statement)"
+                value.confidence = .low
+                if !value.unknowns.contains("No immutable evidence record currently binds this inference.") {
+                    value.unknowns.append("No immutable evidence record currently binds this inference.")
+                }
+            }
+            return value
+        }
+
+        repaired.executiveSummary = repairClaim(repaired.executiveSummary)
+        repaired.legacySystemUnderstanding = repaired.legacySystemUnderstanding.map(repairClaim)
+        repaired.compatibilityMatrix.entries = repaired.compatibilityMatrix.entries.map { entry in
+            var value = entry
+            value.claim = repairClaim(value.claim)
+            return value
+        }
+        repaired.integrationOpportunities = repaired.integrationOpportunities.map { opportunity in
+            var value = opportunity
+            value.claim = repairClaim(value.claim)
+            value.evidence = value.claim.evidence
+            value.confidence = value.claim.confidence
+            return value
+        }
+        repaired.securityAssessment.claims = repaired.securityAssessment.claims.map(repairClaim)
+        repaired.integrationBlockers.blockers = repaired.integrationBlockers.blockers.map { blocker in
+            var value = blocker
+            value.claim = repairClaim(value.claim)
+            return value
+        }
+        repaired.recommendedArchitecture.claim = repairClaim(repaired.recommendedArchitecture.claim)
+        return repaired
+    }
+
+    private static func unique(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.filter { seen.insert($0).inserted }
     }
 }
 

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum RuntimeKernelError: LocalizedError, Equatable {
@@ -2547,16 +2548,20 @@ actor RuntimeKernel {
     ) async throws -> FDETask? {
         let recoveryStartedAt = Date()
         guard var task = try await persistence.loadTasks(workspaceID: workspace.id)
-            .first(where: { $0.id == taskID }),
-              task.state == .blocked else {
+            .first(where: { $0.id == taskID }) else {
             return nil
         }
+        let events = try await persistence.loadEvents(workspaceID: workspace.id, taskID: taskID)
+        let isGroundedPartialWaiting = task.state == .waiting && events.contains {
+            $0.payload["partial_result_kind"] == "GROUNDED_PARTIAL_RESULT"
+                && $0.payload["same_task_resumable"] == "true"
+        }
+        guard task.state == .blocked || isGroundedPartialWaiting else { return nil }
         let originalIntent = MissionIntentParser().parse(task.rawInput)
         guard MissionExecutionSemantic(intent: originalIntent) == .readOnlyWorkspaceInspection else {
             return nil
         }
 
-        let events = try await persistence.loadEvents(workspaceID: workspace.id, taskID: taskID)
         let recoveryAttempt = events.filter {
             $0.type == .recoveryAttempted && $0.payload["recovery_kind"] == "read_only_same_task"
         }.count + 1
@@ -5342,12 +5347,30 @@ actor RuntimeKernel {
             }
         }
 
-        guard var finalAnswer = pendingFinalAnswer else {
+        var finalAnswer: String
+        if let pendingFinalAnswer {
+            finalAnswer = pendingFinalAnswer
+        } else if !evidence.isEmpty {
+            let unsatisfied = evidenceRequirements.unsatisfied(by: evidence)
+            let resolution = ReadOnlyBudgetStopResolution(
+                decision: unsatisfied.isEmpty ? .completeWithCurrentEvidence : .partialWithCurrentEvidence,
+                trigger: .restoredEvidence
+            )
+            finalAnswer = groundedEvidenceFallback(
+                request: effectiveRequest,
+                evidence: evidence,
+                satisfied: evidenceRequirements.satisfied(by: evidence),
+                unsatisfied: unsatisfied,
+                decision: resolution.decision
+            )
+            finalizationResolution = resolution
+            partialFinalizationRequired = !unsatisfied.isEmpty
+        } else {
             return try await blockReadOnlyInspection(
                 task: &task,
                 workspace: workspace,
                 reason: .ungroundedFinalAnswer,
-                detail: "The model did not provide a final answer grounded in recorded workspace evidence.",
+                detail: "The inspection produced no immutable read-only evidence from which to compose a truthful result.",
                 providerStage: "final_grounded_answer",
                 providerDiagnostic: "provider_output_invalid",
                 timingPayload: missionTiming.auditPayload(),
@@ -5404,6 +5427,14 @@ actor RuntimeKernel {
             )
             canonicalAssessmentReport = report
             finalAnswer = report.markdown(language: responseLanguage)
+            let assessmentUnsatisfied = evidenceRequirements.unsatisfied(by: evidence)
+            if !assessmentUnsatisfied.isEmpty {
+                partialFinalizationRequired = true
+                finalizationResolution = finalizationResolution ?? ReadOnlyBudgetStopResolution(
+                    decision: .partialWithCurrentEvidence,
+                    trigger: .restoredEvidence
+                )
+            }
             let finalizationEvents = try await persistence.loadEvents(
                 workspaceID: workspace.id,
                 taskID: task.id
@@ -5415,15 +5446,28 @@ actor RuntimeKernel {
             }
         }
 
-        var finalAnswerValidation = ReadOnlyFinalAnswerContract.validate(
+        var groundingRepairAttemptCount = 0
+        var finalAnswerValidation = canonicalAssessmentReport.map {
+            ReadOnlyFinalAnswerContract.validateAssessment(
+                report: $0,
+                answer: finalAnswer,
+                request: effectiveRequest,
+                requirements: evidenceRequirements,
+                evidence: evidence,
+                requireComplete: !partialFinalizationRequired
+            )
+        } ?? ReadOnlyFinalAnswerContract.validate(
             answer: finalAnswer,
             request: effectiveRequest,
             requirements: evidenceRequirements,
             evidence: evidence,
             requireComplete: !partialFinalizationRequired
         )
-        if !isGroundedFinalAnswer(finalAnswer, evidence: evidence, request: effectiveRequest)
-            || !finalAnswerValidation.accepted {
+        let initiallyGrounded = canonicalAssessmentReport != nil
+            ? finalAnswerValidation.accepted
+            : isGroundedFinalAnswer(finalAnswer, evidence: evidence, request: effectiveRequest)
+        if !initiallyGrounded || !finalAnswerValidation.accepted {
+            groundingRepairAttemptCount = 1
             guard !evidence.isEmpty else {
                 return try await blockReadOnlyInspection(
                     task: &task,
@@ -5437,10 +5481,12 @@ actor RuntimeKernel {
                 )
             }
             if let assessmentReport = canonicalAssessmentReport {
-                let fallbackReport = AssessmentSemanticConsistencyValidator.repair(assessmentReport)
+                let semanticRepair = AssessmentSemanticConsistencyValidator.repair(assessmentReport)
+                let fallbackReport = FDEAssessmentGroundingValidator.repair(semanticRepair, evidence: evidence)
                 let fallbackSemanticValidation = AssessmentSemanticConsistencyValidator.validate(fallbackReport)
                 let fallback = fallbackReport.markdown(language: ReadOnlyResponseLanguage(request: effectiveRequest))
-                let fallbackValidation = ReadOnlyFinalAnswerContract.validate(
+                let fallbackValidation = ReadOnlyFinalAnswerContract.validateAssessment(
+                    report: fallbackReport,
                     answer: fallback,
                     request: effectiveRequest,
                     requirements: evidenceRequirements,
@@ -5448,17 +5494,27 @@ actor RuntimeKernel {
                     requireComplete: !partialFinalizationRequired
                 )
                 guard fallbackSemanticValidation.isValid,
-                      isGroundedFinalAnswer(fallback, evidence: evidence, request: effectiveRequest),
                       fallbackValidation.accepted else {
-                    return try await blockReadOnlyInspection(
+                    let partial = groundedEvidenceFallback(
+                        request: effectiveRequest,
+                        evidence: evidence,
+                        satisfied: evidenceRequirements.satisfied(by: evidence),
+                        unsatisfied: evidenceRequirements.unsatisfied(by: evidence),
+                        decision: .partialWithCurrentEvidence
+                    )
+                    return try await finalizePartialReadOnlyInspection(
                         task: &task,
                         workspace: workspace,
-                        reason: .assessmentSemanticInconsistency,
-                        detail: "Neither the normal assessment nor its deterministic grounded fallback passed canonical validation.",
-                        providerStage: "final_grounded_answer_validation",
-                        providerDiagnostic: ReadOnlyFinalAnswerContractFailure.assessmentSemanticInconsistency.rawValue,
-                        timingPayload: missionTiming.auditPayload(),
-                        evidenceRequirementsPayload: fallbackValidation.ledger.auditPayload
+                        request: effectiveRequest,
+                        answer: partial,
+                        evidence: evidence,
+                        requirements: evidenceRequirements,
+                        timing: missionTiming,
+                        resolution: ReadOnlyBudgetStopResolution(
+                            decision: .partialWithCurrentEvidence,
+                            trigger: .restoredEvidence
+                        ),
+                        groundingRepairAttemptCount: groundingRepairAttemptCount
                     )
                 }
                 finalAnswer = fallback
@@ -5539,17 +5595,26 @@ actor RuntimeKernel {
             )
             guard canonicalMarkdown == finalAnswer,
                   AssessmentSemanticConsistencyValidator.validate(canonicalAssessmentReport).isValid,
-                  finalAnswerValidation.accepted,
-                  isGroundedFinalAnswer(finalAnswer, evidence: evidence, request: effectiveRequest) else {
-                return try await blockReadOnlyInspection(
+                  finalAnswerValidation.accepted else {
+                return try await finalizePartialReadOnlyInspection(
                     task: &task,
                     workspace: workspace,
-                    reason: .assessmentSemanticInconsistency,
-                    detail: "The canonical assessment, visible report, and validation state did not match; no Candidate Patch handoff was persisted.",
-                    providerStage: "canonical_assessment_persistence",
-                    providerDiagnostic: ReadOnlyFinalAnswerContractFailure.assessmentSemanticInconsistency.rawValue,
-                    timingPayload: missionTiming.auditPayload(),
-                    evidenceRequirementsPayload: finalAnswerValidation.ledger.auditPayload
+                    request: effectiveRequest,
+                    answer: groundedEvidenceFallback(
+                        request: effectiveRequest,
+                        evidence: evidence,
+                        satisfied: evidenceRequirements.satisfied(by: evidence),
+                        unsatisfied: evidenceRequirements.unsatisfied(by: evidence),
+                        decision: .partialWithCurrentEvidence
+                    ),
+                    evidence: evidence,
+                    requirements: evidenceRequirements,
+                    timing: missionTiming,
+                    resolution: ReadOnlyBudgetStopResolution(
+                        decision: .partialWithCurrentEvidence,
+                        trigger: .restoredEvidence
+                    ),
+                    groundingRepairAttemptCount: groundingRepairAttemptCount
                 )
             }
         }
@@ -5567,7 +5632,8 @@ actor RuntimeKernel {
                 evidence: evidence,
                 requirements: evidenceRequirements,
                 timing: missionTiming,
-                resolution: resolution
+                resolution: resolution,
+                groundingRepairAttemptCount: groundingRepairAttemptCount
             )
         }
 
@@ -5582,10 +5648,20 @@ actor RuntimeKernel {
             "lifecycle_event": "INSPECTION_COMPLETED",
             "grounded_answer": "true",
             "final_answer": finalAnswerEventDetail,
+            "agent_response_kind": aiAssessmentActivity == nil ? "READ_ONLY_RESULT" : "FDE_ASSESSMENT",
             "evidence_count": String(evidence.count),
             "workspace_identity": Array(Set(evidence.map(\.workspaceIdentity))).sorted().joined(separator: " | "),
             "response_language": ReadOnlyResponseLanguage(request: effectiveRequest).rawValue,
-            "state": task.state.rawValue
+            "state": task.state.rawValue,
+            "intent_type": MissionIntentParser().parse(effectiveRequest).intentType.rawValue,
+            "execution_intent_classification": FDEExecutionIntentClassification.executableReadOnly.rawValue,
+            "runtime_task_id": task.id.uuidString,
+            "mission_id": task.id.uuidString,
+            "workspace_id": workspace.id.uuidString,
+            "evidence_lineage_event_ids": evidence.map(\.toolResultEventID.uuidString).joined(separator: " | "),
+            "artifact_digest": SHA256.hash(data: Data(finalAnswerEventDetail.utf8)).map { String(format: "%02x", $0) }.joined(),
+            "grounding_repair_attempt_count": String(groundingRepairAttemptCount),
+            "claim_evidence_binding_count": String(canonicalAssessmentReport?.materialClaims.flatMap(\.evidence).count ?? 0)
         ]
         preparedPayload.merge(missionTiming.auditPayload()) { current, _ in current }
         preparedPayload.merge(aiAssessmentActivity?.eventPayload ?? [:]) { current, _ in current }
@@ -5622,12 +5698,22 @@ actor RuntimeKernel {
             "lifecycle_event": "INSPECTION_COMPLETED",
             "completion_contract": completionContract.kind.rawValue,
             "grounded_answer": "true",
+            "agent_response_kind": aiAssessmentActivity == nil ? "READ_ONLY_RESULT" : "FDE_ASSESSMENT",
             "completion_evidence": gate.report,
             "detail": finalAnswerEventDetail,
             "actual_result": finalAnswerEventDetail,
             "success": "true",
             "evidence_count": String(evidence.count),
-            "response_language": ReadOnlyResponseLanguage(request: effectiveRequest).rawValue
+            "response_language": ReadOnlyResponseLanguage(request: effectiveRequest).rawValue,
+            "intent_type": MissionIntentParser().parse(effectiveRequest).intentType.rawValue,
+            "execution_intent_classification": FDEExecutionIntentClassification.executableReadOnly.rawValue,
+            "runtime_task_id": task.id.uuidString,
+            "mission_id": task.id.uuidString,
+            "workspace_id": workspace.id.uuidString,
+            "evidence_lineage_event_ids": evidence.map(\.toolResultEventID.uuidString).joined(separator: " | "),
+            "artifact_digest": SHA256.hash(data: Data(finalAnswerEventDetail.utf8)).map { String(format: "%02x", $0) }.joined(),
+            "grounding_repair_attempt_count": String(groundingRepairAttemptCount),
+            "claim_evidence_binding_count": String(canonicalAssessmentReport?.materialClaims.flatMap(\.evidence).count ?? 0)
         ]
         completionPayload.merge(missionTiming.auditPayload()) { current, _ in current }
         completionPayload.merge(aiAssessmentActivity?.eventPayload ?? [:]) { current, _ in current }
@@ -6052,9 +6138,10 @@ actor RuntimeKernel {
         evidence: [ReadOnlyInspectionEvidence],
         requirements: ReadOnlyEvidenceRequirements,
         timing: ReadOnlyMissionTiming,
-        resolution: ReadOnlyBudgetStopResolution
+        resolution: ReadOnlyBudgetStopResolution,
+        groundingRepairAttemptCount: Int = 0
     ) async throws -> FDETask {
-        try stateMachine.transition(&task, to: .blocked)
+        try stateMachine.transition(&task, to: .waiting)
         try await persistence.saveTask(task)
         let usesChinese = ReadOnlyResponseLanguage(request: request) == .chinese
         let finalLedger = ReadOnlyFinalizationEvidenceLedger(
@@ -6099,9 +6186,11 @@ actor RuntimeKernel {
                 "lifecycle_event": "INSPECTION_PARTIALLY_FINALIZED",
                 "blocker_reason": resolution.trigger.blockerReason.rawValue,
                 "partial_completion_state": "BLOCKED_WITH_PARTIAL_RESULT",
+                "partial_result_kind": "GROUNDED_PARTIAL_RESULT",
                 "partial_result": "true",
                 "requested_scope_complete": "false",
                 "grounded_answer": "true",
+                "agent_response_kind": answer.contains("# FDE AI ") ? "FDE_ASSESSMENT" : "READ_ONLY_RESULT",
                 "final_answer": String(answer.prefix(12_000)),
                 "detail": String(answer.prefix(12_000)),
                 "actual_result": String(answer.prefix(12_000)),
@@ -6111,11 +6200,20 @@ actor RuntimeKernel {
                 "user_visible_message": userVisibleMessage,
                 "response_language": usesChinese ? "zh" : "en",
                 "successful_read_evidence": evidence.contains { $0.toolName == "engineering.read_file" } ? "true" : "false",
-                "success": "false"
+                "intent_type": MissionIntentParser().parse(request).intentType.rawValue,
+                "execution_intent_classification": FDEExecutionIntentClassification.executableReadOnly.rawValue,
+                "runtime_task_id": task.id.uuidString,
+                "mission_id": task.id.uuidString,
+                "workspace_id": workspace.id.uuidString,
+                "evidence_lineage_event_ids": evidence.map(\.toolResultEventID.uuidString).joined(separator: " | "),
+                "artifact_digest": SHA256.hash(data: Data(String(answer.prefix(12_000)).utf8)).map { String(format: "%02x", $0) }.joined(),
+                "grounding_repair_attempt_count": String(min(1, max(0, groundingRepairAttemptCount))),
+                "interaction_state": AgentInteractionState.waitingForUser.rawValue,
+                "success": "true"
             ].merging(timing.auditPayload()) { current, _ in current }
                 .merging(finalLedger.auditPayload) { current, _ in current }
                 .merging(resolution.auditPayload) { current, _ in current }
-                .merging(runtimeStatePayload(mission: .blocked, task: task.state, tool: .succeeded)) { current, _ in current }
+                .merging(runtimeStatePayload(mission: .verifying, task: task.state, tool: .succeeded)) { current, _ in current }
         )
         return task
     }
@@ -7327,14 +7425,27 @@ actor RuntimeKernel {
             }
             let answer = action.finalAnswer!.trimmingCharacters(in: .whitespacesAndNewlines)
             let evidenceRequirementsSatisfied = evidenceRequirements.unsatisfied(by: evidence).isEmpty
+            let isStructuredAssessment = MissionIntentParser().parse(request).intentType
+                == .aiAgentCompatibilityAssessment
             guard (allowPartialFinalization || (
                 evidenceRequirementsSatisfied
                     && hasSufficientEvidenceToFinalize(request: request, evidence: evidence)
-            )), isGroundedFinalAnswer(answer, evidence: evidence, request: request) else {
+            )), (isStructuredAssessment ? !evidence.isEmpty : isGroundedFinalAnswer(
+                answer,
+                evidence: evidence,
+                request: request
+            )) else {
                 return reject(
                     .insufficientEvidenceToFinalize,
                     "The final answer does not yet meet the request-specific workspace evidence threshold; gather another read-only result."
                 )
+            }
+            if isStructuredAssessment {
+                // For assessment missions this text is only the provider's
+                // finalization signal. The canonical report is composed later
+                // from structured claims and immutable evidence, then validated
+                // once by ReadOnlyFinalAnswerContract.validateAssessment.
+                return .accepted(.finalAnswer(answer))
             }
             let answerContract = ReadOnlyFinalAnswerContract.validate(
                 answer: answer,

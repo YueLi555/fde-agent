@@ -660,7 +660,7 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
             let fallback = try XCTUnwrap(events.first { $0.payload["lifecycle_event"] == "GRACEFUL_FINALIZATION_FALLBACK" })
             let partial = try XCTUnwrap(events.last { $0.payload["partial_completion_state"] == "BLOCKED_WITH_PARTIAL_RESULT" })
 
-            XCTAssertEqual(task.state, .blocked)
+            XCTAssertEqual(task.state, .waiting)
             XCTAssertTrue(fallback.payload["provider_stage"]?.contains("final_grounded_answer") == true)
             XCTAssertEqual(fallback.payload["provider_failure_phase"], phase)
             XCTAssertEqual(fallback.payload["model"], "gpt-4.1-mini")
@@ -1225,7 +1225,7 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
             limits: limits
         )
 
-        XCTAssertEqual(task.state, .blocked)
+        XCTAssertEqual(task.state, .waiting)
         XCTAssertEqual(events.filter { $0.type == .toolCalled }.count, 1)
         XCTAssertTrue(events.contains {
             $0.payload["lifecycle_event"] == "GRACEFUL_FINALIZATION_STARTED"
@@ -1260,7 +1260,7 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
             limits: limits
         )
 
-        XCTAssertEqual(task.state, .blocked)
+        XCTAssertEqual(task.state, .waiting)
         XCTAssertEqual(events.filter { $0.type == .toolCalled }.count, 1)
         let finalization = try XCTUnwrap(events.first { $0.payload["lifecycle_event"] == "GRACEFUL_FINALIZATION_STARTED" })
         XCTAssertEqual(finalization.payload["budget_stop_trigger"], ReadOnlyFinalizationTrigger.toolCallLimit.rawValue)
@@ -1290,7 +1290,7 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
             limits: limits
         )
 
-        XCTAssertEqual(task.state, .blocked)
+        XCTAssertEqual(task.state, .waiting)
         XCTAssertEqual(events.filter { $0.type == .toolCalled }.count, 2)
         let finalization = try XCTUnwrap(events.first { $0.payload["lifecycle_event"] == "GRACEFUL_FINALIZATION_STARTED" })
         XCTAssertEqual(finalization.payload["budget_stop_trigger"], ReadOnlyFinalizationTrigger.fileReadLimit.rawValue)
@@ -1464,7 +1464,7 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(task.state, .blocked)
+        XCTAssertEqual(task.state, .waiting)
         XCTAssertTrue(events.contains { $0.payload["rejection_reason"] == PlanReadinessBlocker.insufficientEvidenceToFinalize.rawValue })
         XCTAssertEqual(events.filter { $0.type == .toolCalled && $0.payload["command"] == "engineering.read_file" }.count, 1)
         XCTAssertTrue(events.last { $0.payload["partial_completion_state"] == "BLOCKED_WITH_PARTIAL_RESULT" }?.payload["detail"]?.contains("Package.swift") == true)
@@ -1570,7 +1570,7 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
             limits: limits
         )
 
-        XCTAssertEqual(task.state, .blocked)
+        XCTAssertEqual(task.state, .waiting)
         XCTAssertEqual(events.filter { $0.type == .toolCalled }.compactMap { $0.payload["command"] }, [
             "engineering.inspect_project", "engineering.read_file", "engineering.list_directory"
         ])
@@ -1700,7 +1700,7 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
         )
 
         let first = try await kernel.submitTask(input: "Inspect Legacy project dependencies", workspace: fixture.workspace)
-        XCTAssertEqual(first.state, .blocked)
+        XCTAssertEqual(first.state, .waiting)
         let recovered = try await kernel.recoverTask(
             taskID: first.id,
             instruction: "继续读取剩余 manifest",
@@ -2010,7 +2010,7 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(task.state, .blocked)
+        XCTAssertEqual(task.state, .waiting)
         XCTAssertFalse(events.contains { $0.type == .toolCalled && $0.payload["target_path"] == "server/src/index.js" })
         XCTAssertTrue(events.contains { $0.type == .toolCalled && $0.payload["target_path"] == "server/package.json" })
         let repair = events.first {
@@ -2081,7 +2081,7 @@ final class ReadOnlyInspectionRuntimeTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(task.state, .blocked)
+        XCTAssertEqual(task.state, .waiting)
         XCTAssertFalse(events.contains {
             $0.type == .toolCalled && $0.payload["target_path"] == "index.ts"
         })

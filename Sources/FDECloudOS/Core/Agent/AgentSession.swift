@@ -62,6 +62,13 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
             workspaceID: workspaceID,
             workspaceName: "Workspace"
         )
+        if let initialRequest = initialConversation.messages.last(where: { $0.sender == .user }) {
+            self.workspaceContext.activeTurnID = self.workspaceContext.activeTurnID
+                ?? initialRequest.turnID
+                ?? initialRequest.id
+            self.workspaceContext.activeUserMessageID = self.workspaceContext.activeUserMessageID
+                ?? initialRequest.id
+        }
     }
 
     init(workspace: Workspace, userGoal: String, createdAt: Date = Date()) {
@@ -177,9 +184,12 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
         case .completed, .replayed:
             currentState = .completed
             interactionState = .completed
-        case .pendingApproval, .waiting:
+        case .pendingApproval:
             currentState = .waitingApproval
             interactionState = .waitingForApproval
+        case .waiting:
+            currentState = .waitingApproval
+            interactionState = .waitingForUser
         case .created:
             currentState = .understanding
             interactionState = .understanding
@@ -283,7 +293,7 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
                 workspaceContext.activeTurnID = message.turnID ?? message.id
                 workspaceContext.activeUserMessageID = message.id
             }
-        } else if !isUserInteractionEvent(event.type), AgentResponseComposer.shouldComposeNarration(event) {
+        } else if !isUserInteractionEvent(event.type), AgentResponseComposer.shouldPresentInConversation(event) {
             var message = AgentResponseComposer.message(for: event)
             let identity = workspaceContext.interactionIdentity(
                 taskID: event.taskID ?? event.exactParentMissionRunID
@@ -297,9 +307,44 @@ struct AgentSession: Identifiable, Codable, Hashable, Sendable {
             }
         }
 
-        if let artifact = AgentArtifact(event: event) {
+        if var artifact = AgentArtifact(event: event) {
+            if artifact.isAssessment,
+               let eventTaskID = event.taskID,
+               eventTaskID == runtimeTaskID,
+               event.workspaceID == workspaceID {
+                let identity = workspaceContext.interactionIdentity(taskID: eventTaskID)
+                let requestMessage = identity.userMessageID.flatMap { requestID in
+                    conversation.messages.first { $0.id == requestID && $0.sender == .user }
+                }
+                if let turnID = identity.turnID,
+                   let requestID = identity.userMessageID,
+                   let requestMessage {
+                    let intent = AgentMissionClassifier().executionIntentClassification(
+                        for: requestMessage.content
+                    )
+                    artifact.bindAssessmentAuthority(
+                        sessionID: sessionID,
+                        workspaceID: workspaceID,
+                        turnID: turnID,
+                        requestID: requestID,
+                        intent: intent,
+                        runtimeTaskID: eventTaskID,
+                        missionID: eventTaskID,
+                        evidenceEventIDs: evidence.compactMap(\.sourceEventID)
+                    )
+                }
+            }
             addArtifact(artifact)
         }
+    }
+
+    var hasCurrentMissionAuthority: Bool {
+        guard let runtimeTaskID else { return false }
+        let identity = workspaceContext.interactionIdentity(taskID: runtimeTaskID)
+        let request = identity.userMessageID.flatMap { requestID in
+            conversation.messages.first { $0.id == requestID && $0.sender == .user }?.content
+        } ?? userGoal
+        return AgentMissionClassifier().executionIntentClassification(for: request).startsRuntime
     }
 
     @discardableResult
