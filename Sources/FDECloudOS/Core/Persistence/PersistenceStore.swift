@@ -9,6 +9,8 @@ protocol PersistenceStore: Sendable {
     func clearSessionMetadata() async throws
     func loadTasks(workspaceID: UUID) async throws -> [FDETask]
     func saveTask(_ task: FDETask) async throws
+    func saveExecutionPlan(_ plan: ExecutionPlan) async throws
+    func loadExecutionPlans(workspaceID: UUID, taskID: UUID?) async throws -> [ExecutionPlan]
     func appendEvent(
         _ event: ExecutionEvent,
         mode: EventAppendMode,
@@ -72,6 +74,7 @@ enum PersistenceError: LocalizedError, Sendable {
     case eventStoreUnavailable
     case eventStoreCorrupt
     case eventTransactionFailed
+    case executionPlanRevisionAlreadyExists(planID: UUID, revision: Int)
 
     var eventStoreFailureCategory: EventStoreFailureCategory? {
         switch self {
@@ -85,6 +88,8 @@ enum PersistenceError: LocalizedError, Sendable {
             return .eventStoreCorrupt
         case .eventTransactionFailed, .encodingFailed:
             return .eventTransactionFailed
+        case .executionPlanRevisionAlreadyExists:
+            return nil
         }
     }
 
@@ -94,6 +99,8 @@ enum PersistenceError: LocalizedError, Sendable {
              .eventStoreCorrupt, .eventTransactionFailed:
             return true
         case .databaseUnavailable, .encodingFailed, .decodingFailed:
+            return false
+        case .executionPlanRevisionAlreadyExists:
             return false
         }
     }
@@ -116,6 +123,8 @@ enum PersistenceError: LocalizedError, Sendable {
             return "Event store failure: \(EventStoreFailureCategory.eventStoreCorrupt.rawValue)"
         case .eventTransactionFailed:
             return "Event store failure: \(EventStoreFailureCategory.eventTransactionFailed.rawValue)"
+        case .executionPlanRevisionAlreadyExists(let planID, let revision):
+            return "ExecutionPlan revision is immutable and already exists: \(planID.uuidString) revision \(revision)."
         }
     }
 }

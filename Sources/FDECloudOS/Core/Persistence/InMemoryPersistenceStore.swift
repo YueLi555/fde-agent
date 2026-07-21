@@ -3,6 +3,7 @@ import Foundation
 actor InMemoryPersistenceStore: PersistenceStore {
     private var workspaces: [UUID: Workspace] = [:]
     private var tasks: [UUID: FDETask] = [:]
+    private var executionPlans: [ExecutionPlanRevisionKey: ExecutionPlan] = [:]
     private var events: [ExecutionEvent] = []
     private var lastEventSequenceByWorkspace: [UUID: Int64] = [:]
     private var nodes: [String: SystemGraphNode] = [:]
@@ -55,6 +56,41 @@ actor InMemoryPersistenceStore: PersistenceStore {
 
     func saveTask(_ task: FDETask) async throws {
         tasks[task.id] = task
+    }
+
+    func saveExecutionPlan(_ plan: ExecutionPlan) async throws {
+        try plan.validate()
+        let key = ExecutionPlanRevisionKey(planID: plan.id, revision: plan.revision.number)
+        guard executionPlans[key] == nil else {
+            throw PersistenceError.executionPlanRevisionAlreadyExists(
+                planID: plan.id,
+                revision: plan.revision.number
+            )
+        }
+        executionPlans[key] = plan
+    }
+
+    func loadExecutionPlans(workspaceID: UUID, taskID: UUID?) async throws -> [ExecutionPlan] {
+        let plans = executionPlans.values
+            .filter { plan in
+                plan.workspaceID == workspaceID && (taskID == nil || plan.taskID == taskID)
+            }
+            .sorted { lhs, rhs in
+                if lhs.createdAt == rhs.createdAt {
+                    if lhs.id == rhs.id {
+                        return lhs.revision.number < rhs.revision.number
+                    }
+                    return lhs.id.uuidString < rhs.id.uuidString
+                }
+                return lhs.createdAt < rhs.createdAt
+            }
+        for plan in plans {
+            guard try PlanDigest.compute(plan) == plan.digest else {
+                throw ExecutionPlanValidationError.digestMismatch
+            }
+            try plan.validate()
+        }
+        return plans
     }
 
     func appendEvent(
@@ -240,4 +276,9 @@ actor InMemoryPersistenceStore: PersistenceStore {
             .filter { $0.workspaceID == workspaceID }
             .sorted { $0.createdAt > $1.createdAt }
     }
+}
+
+private struct ExecutionPlanRevisionKey: Hashable {
+    var planID: UUID
+    var revision: Int
 }

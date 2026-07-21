@@ -6,14 +6,10 @@ final class AssessmentHandoffRegressionTests: XCTestCase {
         let fixture = try await makeFixture(includeFinalization: true)
         defer { fixture.cleanup() }
 
-        var assessmentSession = AgentSession(workspace: fixture.workspace, userGoal: fixture.assessmentInput)
-        let assessmentResult = try await AgentRuntimeCoordinator().startMission(
+        let assessmentTask = try await fixture.kernel.submitTask(
             input: fixture.assessmentInput,
-            workspace: fixture.workspace,
-            session: &assessmentSession,
-            runtime: fixture.kernel
+            workspace: fixture.workspace
         )
-        let assessmentTask = try XCTUnwrap(assessmentResult.task)
         XCTAssertEqual(assessmentTask.state, .completed)
 
         let assessmentEvents = try await fixture.persistence.loadEvents(
@@ -179,16 +175,10 @@ final class AssessmentHandoffRegressionTests: XCTestCase {
     func testAssessmentFallbackPreservesCapabilityConcreteEvidenceAndReadableDecision() async throws {
         let fixture = try await makeFixture(includeFinalization: false)
         defer { fixture.cleanup() }
-        var session = AgentSession(workspace: fixture.workspace, userGoal: fixture.assessmentInput)
-
-        let result = try await AgentRuntimeCoordinator().startMission(
+        let task = try await fixture.kernel.submitTask(
             input: fixture.assessmentInput,
-            workspace: fixture.workspace,
-            session: &session,
-            runtime: fixture.kernel
+            workspace: fixture.workspace
         )
-
-        let task = try XCTUnwrap(result.task)
         XCTAssertEqual(task.state, .completed)
         let events = try await fixture.persistence.loadEvents(workspaceID: fixture.workspace.id, taskID: task.id)
         XCTAssertTrue(events.contains { $0.payload["lifecycle_event"] == "GRACEFUL_FINALIZATION_FALLBACK" })
@@ -225,16 +215,10 @@ final class AssessmentHandoffRegressionTests: XCTestCase {
         Do not modify files, create a Candidate Patch, run builds or tests, execute Shell or Git, install packages, deploy, or access credentials.
         """
         let activeSandboxesBefore = try fixture.kernelSandboxCount()
-        var session = AgentSession(workspace: fixture.workspace, userGoal: input)
-
-        let result = try await AgentRuntimeCoordinator().startMission(
+        let task = try await fixture.kernel.submitTask(
             input: input,
-            workspace: fixture.workspace,
-            session: &session,
-            runtime: fixture.kernel
+            workspace: fixture.workspace
         )
-
-        let task = try XCTUnwrap(result.task)
         XCTAssertEqual(task.state, .waiting)
         let events = try await fixture.persistence.loadEvents(
             workspaceID: fixture.workspace.id,
@@ -266,14 +250,11 @@ final class AssessmentHandoffRegressionTests: XCTestCase {
     func testCanonicalCapabilityIDSurvivesApprovalKeywordDuringCandidatePatchHandoff() async throws {
         let fixture = try await makeFixture(includeFinalization: true)
         defer { fixture.cleanup() }
-        var assessmentSession = AgentSession(workspace: fixture.workspace, userGoal: fixture.assessmentInput)
-        let assessment = try await AgentRuntimeCoordinator().startMission(
+        let assessment = try await fixture.kernel.submitTask(
             input: fixture.assessmentInput,
-            workspace: fixture.workspace,
-            session: &assessmentSession,
-            runtime: fixture.kernel
+            workspace: fixture.workspace
         )
-        XCTAssertEqual(try XCTUnwrap(assessment.task).state, .completed)
+        XCTAssertEqual(assessment.state, .completed)
 
         let candidateInput = """
         Using the validated TestableLegacy assessment for the customer_support_order_lookup capability, prepare an evidence-grounded Candidate Patch.

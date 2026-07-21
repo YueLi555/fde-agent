@@ -15,6 +15,38 @@ enum RuntimeKernelError: LocalizedError, Equatable {
     }
 }
 
+enum ExecutionPlanApprovalError: LocalizedError, Equatable {
+    case invalidBinding
+    case planNotFound
+    case bindingMismatch
+    case originMismatch
+    case staleRevision(expected: Int, actual: Int)
+    case approvalNotPending(ApprovalState)
+    case approvalExpired
+    case invalidRevision
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidBinding:
+            return "ExecutionPlan approval binding is missing or malformed."
+        case .planNotFound:
+            return "The exact immutable ExecutionPlan revision could not be found."
+        case .bindingMismatch:
+            return "ExecutionPlan approval does not match the persisted plan digest, task, or workspace."
+        case .originMismatch:
+            return "ExecutionPlan approval does not match the originating conversation."
+        case .staleRevision(let expected, let actual):
+            return "ExecutionPlan approval is stale: current revision is \(expected), requested revision is \(actual)."
+        case .approvalNotPending(let state):
+            return "ExecutionPlan approval is \(state.rawValue) and cannot be approved."
+        case .approvalExpired:
+            return "ExecutionPlan approval has expired."
+        case .invalidRevision:
+            return "ExecutionPlan revision does not extend the latest immutable revision."
+        }
+    }
+}
+
 private enum RuntimeStepHandlingResult {
     case runStep
     case skipStep
@@ -1361,6 +1393,18 @@ actor RuntimeKernel {
     }
 
     func submitTask(input: String, workspace: Workspace) async throws -> FDETask {
+        try await submitTaskInternal(input: input, workspace: workspace, origin: nil)
+    }
+
+    func submitTask(input: String, workspace: Workspace, origin: OriginBinding) async throws -> FDETask {
+        try await submitTaskInternal(input: input, workspace: workspace, origin: origin)
+    }
+
+    private func submitTaskInternal(
+        input: String,
+        workspace: Workspace,
+        origin: OriginBinding?
+    ) async throws -> FDETask {
         let missionStartedAt = Date()
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -1452,6 +1496,22 @@ actor RuntimeKernel {
         let policyDeltas = try await persistence.loadPolicyDeltas(workspaceID: workspace.id)
         let systemFailureProfile = try await persistence.loadLatestSystemFailureProfile(workspaceID: workspace.id)
         let globalExecutionPolicy = try await persistence.loadLatestGlobalExecutionPolicy(workspaceID: workspace.id)
+        if missionIntent.intentType == .aiAgentCompatibilityAssessment, let origin {
+            return try await createPlanOnlyExecutionPlan(
+                input: trimmed,
+                origin: origin,
+                missionIntent: missionIntent,
+                missionWorkspaceScope: missionWorkspaceScope,
+                evidenceRequirements: readOnlyEvidenceRequirements,
+                workspace: workspace,
+                task: &task,
+                recentTasks: recentTasks,
+                graph: graph,
+                policyDeltas: policyDeltas,
+                systemFailureProfile: systemFailureProfile,
+                globalExecutionPolicy: globalExecutionPolicy
+            )
+        }
         let contextCompilationStartedAt = Date()
         let context: ExecutionContext
         do {
@@ -2429,6 +2489,321 @@ actor RuntimeKernel {
         return try ReplayEngine().frames(events: events, graph: graph)
     }
 
+    private func createPlanOnlyExecutionPlan(
+        input: String,
+        origin: OriginBinding,
+        missionIntent: MissionIntent,
+        missionWorkspaceScope: MissionWorkspaceScope,
+        evidenceRequirements: ReadOnlyEvidenceRequirements,
+        workspace: Workspace,
+        task: inout FDETask,
+        recentTasks: [FDETask],
+        graph: ([SystemGraphNode], [SystemGraphEdge]),
+        policyDeltas: [ExecutionPolicyDelta],
+        systemFailureProfile: SystemFailureProfile?,
+        globalExecutionPolicy: GlobalExecutionPolicy?
+    ) async throws -> FDETask {
+        let graphSummary = graph.0.prefix(20).map { node in
+            "\(node.type.rawValue):\(node.title)"
+        }.joined(separator: " | ")
+        let context = ExecutionContext(
+            workspace: workspace,
+            policyRules: [
+                "Phase 3B.1B is plan-only.",
+                "Do not execute tools, read workspace files, create evidence, or mutate state outside planning records."
+            ],
+            graphSummary: graphSummary.isEmpty ? "No persisted graph context yet." : graphSummary,
+            recentTaskTitles: recentTasks.prefix(5).map(\.title),
+            taskFingerprint: TaskFingerprint.make(from: input),
+            policyDeltas: policyDeltas,
+            failurePatterns: [],
+            systemFailureProfile: systemFailureProfile,
+            globalExecutionPolicy: globalExecutionPolicy,
+            missionIntent: missionIntent,
+            missionWorkspaceScope: missionWorkspaceScope,
+            contextBundle: nil
+        )
+
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Planner request pending",
+            payload: [
+                "state": task.state.rawValue,
+                "lifecycle_event": "PROVIDER_REQUEST_PENDING",
+                "provider_stage": "planner",
+                "provider_request_pending": "true",
+                "plan_only": "true",
+                "workspace_files_read": "false",
+                "success": ""
+            ].merging(runtimeStatePayload(mission: .plan, task: task.state, tool: .idle)) { current, _ in current }
+        )
+
+        var output = try await generatePlannerOutput(
+            input: input,
+            context: context,
+            workspace: workspace,
+            task: task
+        )
+        let governorResult = globalGovernor.govern(
+            taskID: task.id,
+            workspaceID: workspace.id,
+            plannerOutput: output,
+            globalPolicy: globalExecutionPolicy,
+            systemFailureProfile: systemFailureProfile
+        )
+        output = governorResult.output
+        try validator.validate(output)
+
+        let createdAt = Date()
+        let executionPlan = try ExecutionPlan.make(
+            taskID: task.id,
+            workspaceID: workspace.id,
+            origin: origin,
+            missionSemantic: .readOnlyWorkspaceInspection,
+            workspaceScope: missionWorkspaceScope,
+            objective: input,
+            summary: output.plan.prefix(8).map(\.title).joined(separator: " | "),
+            steps: output.plan,
+            toolCalls: output.toolCalls,
+            evidenceRequirementIDs: evidenceRequirements.required.map(\.rawValue),
+            risks: output.risks,
+            constraints: .phase3B1AReadOnly,
+            revision: .initial(createdAt: createdAt),
+            createdAt: createdAt
+        )
+        let verifiedDigest = try PlanDigest.compute(executionPlan)
+        guard verifiedDigest == executionPlan.digest else {
+            throw ExecutionPlanValidationError.digestMismatch
+        }
+        try executionPlan.validate()
+
+        try await persistence.saveGlobalGovernorDecision(governorResult.decision)
+        try await persistence.saveExecutionPlan(executionPlan)
+
+        task.plan = executionPlan.steps
+        try stateMachine.transition(&task, to: .planned)
+        try await persistence.saveTask(task)
+
+        let binding = ExecutionPlanApprovalBinding(plan: executionPlan)
+        let commonPayload = binding.metadata.merging([
+            "state": task.state.rawValue,
+            "plan_schema_version": String(executionPlan.schemaVersion),
+            "plan_step_count": String(executionPlan.steps.count),
+            "tool_call_count": String(executionPlan.toolCalls.count),
+            "execution_enabled": "false",
+            "mutation_allowed": "false",
+            "workspace_files_read": "false",
+            "evidence_created": "false",
+            "executor_invoked": "false"
+        ]) { current, _ in current }
+
+        try await record(
+            type: .planGenerated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "ExecutionPlan revision 1 generated",
+            payload: commonPayload
+                .merging([
+                    "lifecycle_event": ExecutionPlanLifecycleEvent.generated.rawValue,
+                    "mission_disposition": "PLANNED",
+                    "revision_count": "1",
+                    "governor_decision_id": governorResult.decision.id.uuidString
+                ]) { current, _ in current }
+                .merging(runtimeStatePayload(mission: .plan, task: task.state, tool: .idle)) { current, _ in current }
+        )
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "ExecutionPlan digest validated",
+            payload: commonPayload
+                .merging([
+                    "lifecycle_event": ExecutionPlanLifecycleEvent.validated.rawValue,
+                    "digest_verified": "true"
+                ]) { current, _ in current }
+                .merging(runtimeStatePayload(mission: .plan, task: task.state, tool: .idle)) { current, _ in current }
+        )
+
+        _ = try await enqueueExecutionPlanApproval(
+            for: executionPlan,
+            task: task,
+            workspace: workspace
+        )
+        return task
+    }
+
+    private func enqueueExecutionPlanApproval(
+        for plan: ExecutionPlan,
+        task: FDETask,
+        workspace: Workspace
+    ) async throws -> ApprovalRequest {
+        let binding = ExecutionPlanApprovalBinding(plan: plan)
+        let approval = ApprovalRequest(
+            id: UUID(),
+            workspaceID: workspace.id,
+            taskID: task.id,
+            stepID: nil,
+            toolCallID: nil,
+            targetKind: .executionPlan,
+            action: "approve_execution_plan",
+            resource: plan.id.uuidString,
+            riskLevel: .medium,
+            state: .pending,
+            requestedByRole: workspace.role,
+            decidedByRole: nil,
+            decisionReason: nil,
+            requestedAt: Date(),
+            decidedAt: nil,
+            expiresAt: nil,
+            metadata: binding.metadata.merging([
+                "approval_scope": "plan_record_only",
+                "runtime_resume_allowed": "false",
+                "execution_enabled": "false"
+            ]) { current, _ in current }
+        )
+        _ = try await approvalQueue.enqueue(approval)
+        try await record(
+            type: .humanApprovalRequested,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "Human approval requested for ExecutionPlan revision \(plan.revision.number)",
+            payload: binding.metadata.merging([
+                "state": task.state.rawValue,
+                "approval_request_id": approval.id.uuidString,
+                "approval_target_kind": ApprovalTargetKind.executionPlan.rawValue,
+                "approval_scope": "plan_record_only",
+                "runtime_resume_allowed": "false",
+                "execution_enabled": "false"
+            ]) { current, _ in current }
+            .merging(runtimeStatePayload(mission: .plan, task: task.state, tool: .idle)) { current, _ in current }
+        )
+        return approval
+    }
+
+    @discardableResult
+    func reviseExecutionPlan(
+        _ proposedPlan: ExecutionPlan,
+        workspace: Workspace
+    ) async throws -> ApprovalRequest {
+        guard proposedPlan.workspaceID == workspace.id else {
+            throw ExecutionPlanApprovalError.bindingMismatch
+        }
+        guard try PlanDigest.compute(proposedPlan) == proposedPlan.digest else {
+            throw ExecutionPlanValidationError.digestMismatch
+        }
+        try proposedPlan.validate()
+
+        let history = try await persistence.loadExecutionPlans(
+            workspaceID: workspace.id,
+            taskID: proposedPlan.taskID
+        )
+        guard let latest = history.max(by: { $0.revision.number < $1.revision.number }),
+              proposedPlan.id == latest.id,
+              proposedPlan.taskID == latest.taskID,
+              proposedPlan.workspaceID == latest.workspaceID,
+              proposedPlan.origin == latest.origin,
+              proposedPlan.revision.number == latest.revision.number + 1,
+              proposedPlan.revision.parentDigest == latest.digest,
+              proposedPlan.revision.reason == .humanRequestedChanges else {
+            throw ExecutionPlanApprovalError.invalidRevision
+        }
+        guard var task = try await persistence.loadTasks(workspaceID: workspace.id).first(where: {
+            $0.id == proposedPlan.taskID
+        }), task.state == .planned else {
+            throw ExecutionPlanApprovalError.bindingMismatch
+        }
+
+        try await persistence.saveExecutionPlan(proposedPlan)
+        task.plan = proposedPlan.steps
+        try await persistence.saveTask(task)
+
+        let pending = try await persistence.loadApprovalRequests(
+            workspaceID: workspace.id,
+            state: .pending
+        ).filter { request in
+            guard request.targetKind == .executionPlan,
+                  request.taskID == task.id,
+                  let binding = ExecutionPlanApprovalBinding(metadata: request.metadata) else {
+                return false
+            }
+            return binding.planID == proposedPlan.id
+                && binding.revision < proposedPlan.revision.number
+        }
+        for request in pending {
+            _ = try await approvalQueue.supersede(
+                requestID: request.id,
+                approverRole: workspace.role,
+                reason: "A newer immutable ExecutionPlan revision requires review.",
+                metadata: [
+                    "superseded_by_plan_id": proposedPlan.id.uuidString,
+                    "superseded_by_plan_revision": String(proposedPlan.revision.number),
+                    "superseded_by_plan_digest": proposedPlan.digest.sha256,
+                    "execution_started": "false"
+                ]
+            )
+            try await record(
+                type: .stateUpdated,
+                workspaceID: workspace.id,
+                taskID: task.id,
+                summary: "Prior ExecutionPlan approval superseded",
+                payload: [
+                    "state": task.state.rawValue,
+                    "lifecycle_event": "PLAN_APPROVAL_SUPERSEDED",
+                    "approval_request_id": request.id.uuidString,
+                    "plan_id": proposedPlan.id.uuidString,
+                    "superseded_plan_revision": request.metadata["plan_revision"] ?? "",
+                    "superseded_by_plan_revision": String(proposedPlan.revision.number),
+                    "execution_started": "false"
+                ].merging(runtimeStatePayload(mission: .plan, task: task.state, tool: .idle)) { current, _ in current }
+            )
+        }
+
+        let binding = ExecutionPlanApprovalBinding(plan: proposedPlan)
+        let revisionPayload = binding.metadata.merging([
+            "state": task.state.rawValue,
+            "plan_schema_version": String(proposedPlan.schemaVersion),
+            "plan_step_count": String(proposedPlan.steps.count),
+            "tool_call_count": String(proposedPlan.toolCalls.count),
+            "execution_enabled": "false",
+            "mutation_allowed": "false",
+            "workspace_files_read": "false",
+            "evidence_created": "false",
+            "executor_invoked": "false",
+            "revision_count": String(history.count + 1)
+        ]) { current, _ in current }
+        try await record(
+            type: .planGenerated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "ExecutionPlan revision \(proposedPlan.revision.number) generated",
+            payload: revisionPayload
+                .merging([
+                    "lifecycle_event": ExecutionPlanLifecycleEvent.generated.rawValue,
+                    "mission_disposition": "PLANNED"
+                ]) { current, _ in current }
+                .merging(runtimeStatePayload(mission: .plan, task: task.state, tool: .idle)) { current, _ in current }
+        )
+        try await record(
+            type: .stateUpdated,
+            workspaceID: workspace.id,
+            taskID: task.id,
+            summary: "ExecutionPlan revision \(proposedPlan.revision.number) digest validated",
+            payload: revisionPayload
+                .merging([
+                    "lifecycle_event": ExecutionPlanLifecycleEvent.validated.rawValue,
+                    "digest_verified": "true"
+                ]) { current, _ in current }
+                .merging(runtimeStatePayload(mission: .plan, task: task.state, tool: .idle)) { current, _ in current }
+        )
+        return try await enqueueExecutionPlanApproval(
+            for: proposedPlan,
+            task: task,
+            workspace: workspace
+        )
+    }
+
     private func generatePlannerOutput(
         input: String,
         context: ExecutionContext,
@@ -2550,6 +2925,9 @@ actor RuntimeKernel {
         guard var task = try await persistence.loadTasks(workspaceID: workspace.id)
             .first(where: { $0.id == taskID }) else {
             return nil
+        }
+        if await blockPhase3B1RuntimeControl(taskID: taskID, action: "recover_or_retry") {
+            return task
         }
         let events = try await persistence.loadEvents(workspaceID: workspace.id, taskID: taskID)
         let isGroundedPartialWaiting = task.state == .waiting && events.contains {
@@ -2850,10 +3228,16 @@ actor RuntimeKernel {
     }
 
     func resumeTask(taskID: UUID, instruction: String? = nil) async {
+        if await blockPhase3B1RuntimeControl(taskID: taskID, action: "resume") {
+            return
+        }
         await stepAdapter.resume(taskID: taskID, instruction: instruction)
     }
 
     func changeTaskApproach(taskID: UUID, instruction: String) async {
+        if await blockPhase3B1RuntimeControl(taskID: taskID, action: "change_approach") {
+            return
+        }
         await stepAdapter.changeApproach(taskID: taskID, instruction: instruction)
     }
 
@@ -2861,8 +3245,59 @@ actor RuntimeKernel {
         await stepAdapter.stop(taskID: taskID, reason: reason)
     }
 
+    private func blockPhase3B1RuntimeControl(taskID: UUID, action: String) async -> Bool {
+        do {
+            let approvals = try await persistence.loadApprovalRequests(workspaceID: nil, state: nil)
+            guard let approval = approvals.first(where: {
+                $0.taskID == taskID && $0.targetKind == .executionPlan
+            }) else {
+                return false
+            }
+            let plans = try await persistence.loadExecutionPlans(
+                workspaceID: approval.workspaceID,
+                taskID: taskID
+            )
+            guard !plans.isEmpty else {
+                // An approval record without its immutable plan is an
+                // integrity failure, never permission to use a legacy path.
+                return true
+            }
+            let taskState = try await persistence.loadTasks(workspaceID: approval.workspaceID)
+                .first(where: { $0.id == taskID })?
+                .state ?? .planned
+            try await record(
+                type: .stateUpdated,
+                workspaceID: approval.workspaceID,
+                taskID: taskID,
+                summary: "Phase 3B.1 plan-only runtime guard blocked \(action)",
+                payload: [
+                    "state": taskState.rawValue,
+                    "lifecycle_event": "PLAN_ONLY_RUNTIME_GUARD",
+                    "blocked_action": action,
+                    "approval_request_id": approval.id.uuidString,
+                    "approval_state": approval.state.rawValue,
+                    "execution_started": "false",
+                    "executor_invoked": "false",
+                    "future_execution_phase_required": "3B.2",
+                    "success": "false"
+                ].merging(runtimeStatePayload(mission: .plan, task: taskState, tool: .skipped)) { current, _ in current }
+            )
+            return true
+        } catch {
+            // Persistence or digest corruption at this authority boundary must
+            // fail closed. A missing/corrupt plan can never fall through to a
+            // legacy resume channel.
+            return true
+        }
+    }
+
     @discardableResult
-    func approveApprovalRequest(_ requestID: UUID, workspace: Workspace, reason: String) async throws -> ApprovalRequest {
+    func approveApprovalRequest(
+        _ requestID: UUID,
+        workspace: Workspace,
+        reason: String,
+        origin: OriginBinding? = nil
+    ) async throws -> ApprovalRequest {
         let request = try await approvalQueue.load(requestID: requestID)
         if request?.targetKind == .candidatePatchPlan {
             throw CandidatePatchRuntimeError.approvalConfirmationRequired
@@ -2882,12 +3317,110 @@ actor RuntimeKernel {
             )
             throw AuthorizationError.denied(decision)
         }
+        if let request, request.targetKind == .executionPlan {
+            let binding = try await validateExecutionPlanApprovalBinding(
+                request,
+                workspace: workspace,
+                approvalOrigin: origin
+            )
+            let approved = try await approvalQueue.approve(
+                requestID: requestID,
+                approverRole: workspace.role,
+                reason: reason,
+                metadata: [
+                    "approval_recorded_only": "true",
+                    "runtime_resumed": "false",
+                    "execution_started": "false"
+                ]
+            )
+            try await record(
+                type: .humanApproved,
+                workspaceID: workspace.id,
+                taskID: binding.taskID,
+                summary: "ExecutionPlan approval recorded without execution",
+                payload: binding.metadata.merging([
+                    "state": TaskState.planned.rawValue,
+                    "approval_request_id": requestID.uuidString,
+                    "approval_target_kind": ApprovalTargetKind.executionPlan.rawValue,
+                    "approval_recorded_only": "true",
+                    "runtime_resumed": "false",
+                    "execution_started": "false"
+                ]) { current, _ in current }
+                .merging(runtimeStatePayload(mission: .plan, task: .planned, tool: .idle)) { current, _ in current }
+            )
+            return approved
+        }
         let approved = try await approvalQueue.approve(
             requestID: requestID,
             approverRole: workspace.role,
             reason: reason
         )
         return approved
+    }
+
+    private func validateExecutionPlanApprovalBinding(
+        _ request: ApprovalRequest,
+        workspace: Workspace,
+        approvalOrigin: OriginBinding?,
+        now: Date = Date()
+    ) async throws -> ExecutionPlanApprovalBinding {
+        guard request.state == .pending else {
+            throw ExecutionPlanApprovalError.approvalNotPending(request.state)
+        }
+        if request.expiresAt.map({ $0 <= now }) == true {
+            _ = try await approvalQueue.expirePending(now: now)
+            throw ExecutionPlanApprovalError.approvalExpired
+        }
+        guard let binding = ExecutionPlanApprovalBinding(metadata: request.metadata),
+              binding.digest.isWellFormed else {
+            throw ExecutionPlanApprovalError.invalidBinding
+        }
+        guard request.workspaceID == workspace.id,
+              request.taskID == binding.taskID,
+              binding.workspaceID == workspace.id,
+              request.resource == binding.planID.uuidString,
+              request.action == "approve_execution_plan" else {
+            throw ExecutionPlanApprovalError.bindingMismatch
+        }
+        let plans = try await persistence.loadExecutionPlans(
+            workspaceID: binding.workspaceID,
+            taskID: nil
+        )
+        guard let plan = plans.first(where: {
+            $0.id == binding.planID && $0.revision.number == binding.revision
+        }) else {
+            throw ExecutionPlanApprovalError.planNotFound
+        }
+        guard let latestRevision = plans
+            .filter({ $0.id == binding.planID })
+            .map(\.revision.number)
+            .max() else {
+            throw ExecutionPlanApprovalError.planNotFound
+        }
+        guard binding.revision == latestRevision else {
+            throw ExecutionPlanApprovalError.staleRevision(
+                expected: latestRevision,
+                actual: binding.revision
+            )
+        }
+        let task = try await persistence.loadTasks(workspaceID: binding.workspaceID).first {
+            $0.id == binding.taskID
+        }
+        try plan.validate()
+        guard task?.state == .planned,
+              plan.taskID == binding.taskID,
+              plan.workspaceID == binding.workspaceID,
+              plan.digest == binding.digest,
+              try PlanDigest.compute(plan) == binding.digest else {
+            throw ExecutionPlanApprovalError.bindingMismatch
+        }
+        if let origin = binding.origin, origin != plan.origin {
+            throw ExecutionPlanApprovalError.originMismatch
+        }
+        if let approvalOrigin, binding.origin != approvalOrigin {
+            throw ExecutionPlanApprovalError.originMismatch
+        }
+        return binding
     }
 
     func beginCandidatePatchApprovalConfirmation(

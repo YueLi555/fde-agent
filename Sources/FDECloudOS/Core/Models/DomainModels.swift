@@ -690,6 +690,7 @@ enum ApprovalTargetKind: String, Codable, CaseIterable, Identifiable, Sendable {
     case connectorOperation
     case systemChange
     case candidatePatchPlan
+    case executionPlan
 
     var id: String { rawValue }
 }

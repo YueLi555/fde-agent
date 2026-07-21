@@ -2,6 +2,7 @@ import Foundation
 
 protocol AgentRuntimeExecuting: Sendable {
     func submitTask(input: String, workspace: Workspace) async throws -> FDETask
+    func submitTask(input: String, workspace: Workspace, origin: OriginBinding) async throws -> FDETask
     func runSafeSandboxAcceptance(input: String, workspace: Workspace) async throws -> FDETask
     func runCandidatePatchGeneration(input: String, workspace: Workspace) async throws -> FDETask
     func runGeneratedTestPlanning(input: String, workspace: Workspace) async throws -> FDETask
@@ -30,6 +31,10 @@ protocol AgentRuntimeExecuting: Sendable {
 }
 
 extension AgentRuntimeExecuting {
+    func submitTask(input: String, workspace: Workspace, origin: OriginBinding) async throws -> FDETask {
+        try await submitTask(input: input, workspace: workspace)
+    }
+
     func loadAuditEvents(workspaceID: UUID, taskID: UUID?) async throws -> [ExecutionEvent] { [] }
     func recoverTask(taskID: UUID, instruction: String, workspace: Workspace) async throws -> FDETask? { nil }
     func runSafeSandboxAcceptance(input: String, workspace: Workspace) async throws -> FDETask {
@@ -445,7 +450,15 @@ struct AgentRuntimeCoordinator: Sendable {
         }
 
         session.setInteractionState(.running)
-        let task = try await runtime.submitTask(input: safeInput, workspace: workspace)
+        let task = try await runtime.submitTask(
+            input: safeInput,
+            workspace: workspace,
+            origin: OriginBinding(
+                sessionID: session.sessionID,
+                turnID: session.workspaceContext.activeTurnID ?? logicalUserEventID,
+                requestMessageID: logicalUserEventID
+            )
+        )
         return .running(task: task, recordedEvents: [userEvent])
     }
 
@@ -756,7 +769,15 @@ struct AgentRuntimeCoordinator: Sendable {
 
         if route == .workspaceReadOnlyInvestigation {
             session.setInteractionState(.running)
-            let task = try await runtime.submitTask(input: reply, workspace: workspace)
+            let task = try await runtime.submitTask(
+                input: reply,
+                workspace: workspace,
+                origin: OriginBinding(
+                    sessionID: session.sessionID,
+                    turnID: session.workspaceContext.activeTurnID ?? logicalUserEventID,
+                    requestMessageID: logicalUserEventID
+                )
+            )
             return .running(task: task, recordedEvents: [recordedUserEvent])
         }
 

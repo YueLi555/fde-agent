@@ -78,6 +78,22 @@ actor SQLitePersistenceStore: PersistenceStore {
         """)
 
         try connection.execute("""
+        CREATE TABLE IF NOT EXISTS execution_plans (
+            plan_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            workspace_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            digest TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            PRIMARY KEY (plan_id, revision)
+        );
+        """)
+        try connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_execution_plans_workspace_task ON execution_plans(workspace_id, task_id, created_at);"
+        )
+
+        try connection.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id TEXT PRIMARY KEY,
             parent_event_id TEXT,
@@ -441,6 +457,82 @@ actor SQLitePersistenceStore: PersistenceStore {
 
     func saveTask(_ task: FDETask) async throws {
         try upsertTask(task)
+    }
+
+    func saveExecutionPlan(_ plan: ExecutionPlan) async throws {
+        try plan.validate()
+        let existing = try connection.query(
+            "SELECT plan_id FROM execution_plans WHERE plan_id = ? AND revision = ? LIMIT 1;",
+            parameters: [.text(plan.id.uuidString), .int(Int64(plan.revision.number))]
+        )
+        guard existing.isEmpty else {
+            throw PersistenceError.executionPlanRevisionAlreadyExists(
+                planID: plan.id,
+                revision: plan.revision.number
+            )
+        }
+
+        do {
+            try connection.execute(
+                """
+                INSERT INTO execution_plans (
+                    plan_id, revision, workspace_id, task_id, digest, created_at, plan_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                parameters: [
+                    .text(plan.id.uuidString),
+                    .int(Int64(plan.revision.number)),
+                    .text(plan.workspaceID.uuidString),
+                    .text(plan.taskID.uuidString),
+                    .text(plan.digest.sha256),
+                    .text(DateCodec.encode(plan.createdAt)),
+                    .text(try JSONCoding.encode(plan))
+                ]
+            )
+        } catch {
+            if case .constraint = connection.failureKind {
+                throw PersistenceError.executionPlanRevisionAlreadyExists(
+                    planID: plan.id,
+                    revision: plan.revision.number
+                )
+            }
+            throw error
+        }
+    }
+
+    func loadExecutionPlans(workspaceID: UUID, taskID: UUID?) async throws -> [ExecutionPlan] {
+        let rows: [[String: String?]]
+        if let taskID {
+            rows = try connection.query(
+                "SELECT plan_id, revision, workspace_id, task_id, digest, plan_json FROM execution_plans WHERE workspace_id = ? AND task_id = ? ORDER BY created_at ASC, plan_id ASC, revision ASC;",
+                parameters: [.text(workspaceID.uuidString), .text(taskID.uuidString)]
+            )
+        } else {
+            rows = try connection.query(
+                "SELECT plan_id, revision, workspace_id, task_id, digest, plan_json FROM execution_plans WHERE workspace_id = ? ORDER BY created_at ASC, plan_id ASC, revision ASC;",
+                parameters: [.text(workspaceID.uuidString)]
+            )
+        }
+        return try rows.map { row in
+            let plan = try JSONCoding.decode(ExecutionPlan.self, from: try required(row, "plan_json"))
+            let persistedPlanID = try requiredUUID(row, "plan_id")
+            let persistedRevision = Int(try requiredInt(row, "revision"))
+            let persistedWorkspaceID = try requiredUUID(row, "workspace_id")
+            let persistedTaskID = try requiredUUID(row, "task_id")
+            let persistedDigest = try required(row, "digest")
+            let recomputedDigest = try PlanDigest.compute(plan)
+            guard plan.id == persistedPlanID,
+                  plan.revision.number == persistedRevision,
+                  plan.workspaceID == persistedWorkspaceID,
+                  plan.taskID == persistedTaskID,
+                  plan.digest.sha256 == persistedDigest,
+                  recomputedDigest == plan.digest else {
+                throw ExecutionPlanValidationError.digestMismatch
+            }
+            try plan.validate()
+            return plan
+        }
     }
 
     private func upsertTask(_ task: FDETask) throws {
