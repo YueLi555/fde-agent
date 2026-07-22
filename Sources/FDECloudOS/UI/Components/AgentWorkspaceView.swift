@@ -160,6 +160,7 @@ struct AgentWorkspaceView: View {
                     controlledEvalSessionAuthority: store.controlledEvalSessionAuthority,
                     controlledEvalExecutionAuthorizations: store.controlledEvalExecutionAuthorizations,
                     controlledEvalResultReviewAuthorizations: store.controlledEvalResultReviewAuthorizations,
+                    assessmentHumanReviewBundles: store.selectedAssessmentHumanReviewBundles,
                     approvals: store.selectedTaskPendingApprovals,
                     showsHeader: false,
                     showsMissionPresentation: false,

@@ -17,6 +17,7 @@ struct AgentConversationView: View {
     var controlledEvalSessionAuthority: ControlledEvalSessionAuthority? = nil
     var controlledEvalExecutionAuthorizations: [ControlledEvalExecutionAuthorization] = []
     var controlledEvalResultReviewAuthorizations: [ControlledEvalResultReviewAuthorization] = []
+    var assessmentHumanReviewBundles: [AssessmentHumanReviewBundle] = []
     let approvals: [ApprovalRequest]
     var showsHeader = true
     var showsMissionPresentation = true
@@ -133,6 +134,10 @@ struct AgentConversationView: View {
 
                 if !liveWorkStatusCards.isEmpty {
                     AgentConversationWorkStatusCard(cards: liveWorkStatusCards)
+                }
+
+                if let assessmentReview = assessmentHumanReviewBundles.last {
+                    AssessmentHumanReviewCard(bundle: assessmentReview)
                 }
 
                 if showsMissionPresentation {
@@ -778,6 +783,147 @@ func sandboxSourceColor(for snapshot: SandboxActivitySnapshot) -> Color {
     case .some(true): .green
     case .some(false): .orange
     case .none: .secondary
+    }
+}
+
+private struct AssessmentHumanReviewCard: View {
+    let bundle: AssessmentHumanReviewBundle
+    @State private var showsRecommendations = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Label("Advisory assessment review", systemImage: "person.crop.circle.badge.checkmark")
+                    .font(.headline)
+                Spacer()
+                Text(statusLabel)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(statusColor.opacity(0.10), in: Capsule())
+            }
+
+            HStack(spacing: 8) {
+                reviewMetric("Recommendation", display(bundle.recommendationSet.decision.rawValue))
+                reviewMetric("Confidence", bundle.recommendationSet.sourceConfidence.rawValue)
+                reviewMetric("Items", String(bundle.recommendationSet.recommendations.count))
+            }
+
+            Label(
+                "Advisory review only. Acknowledgement accepts this assessment as advice for future planning. No execution is authorized. No code change is authorized. No deployment is authorized.",
+                systemImage: "lock.shield"
+            )
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            DisclosureGroup(isExpanded: $showsRecommendations) {
+                VStack(alignment: .leading, spacing: 9) {
+                    ForEach(bundle.recommendationSet.recommendations) { recommendation in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(recommendation.title)
+                                    .font(.callout.weight(.semibold))
+                                Spacer()
+                                Text(recommendation.priority.rawValue)
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(priorityColor(recommendation.priority))
+                            }
+                            Text(recommendation.action)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("Evidence: \(recommendation.sourceClaimIDs.count) validated claim(s)")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(9)
+                        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+                .padding(.top, 8)
+            } label: {
+                Text("Review grounded recommendations")
+                    .font(.callout.weight(.semibold))
+            }
+
+            if let decision = bundle.review.decision {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("Finalized read-only history", systemImage: "lock")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text("Assessment disposition")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(display(decision.disposition.rawValue))
+                        .font(.callout.weight(.semibold))
+                    if let note = decision.reviewerNote {
+                        Text(note)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+
+            Text("Report \(abbreviated(bundle.review.sourceReportID)) · Review \(abbreviated(bundle.review.reviewID))")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.tertiary)
+                .textSelection(.enabled)
+        }
+        .frame(maxWidth: 680, alignment: .leading)
+        .padding(14)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(statusColor.opacity(0.22), lineWidth: 0.8)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Advisory assessment review, \(statusLabel), read-only assessment history")
+        .accessibilityIdentifier("assessment.humanReview.card")
+    }
+
+    private var statusLabel: String { display(bundle.review.status.rawValue) }
+
+    private var statusColor: Color {
+        switch bundle.review.status {
+        case .awaitingReview: return .accentColor
+        case .acknowledgedForPlanning: return .green
+        case .changesRequested: return .orange
+        case .rejected: return .red
+        }
+    }
+
+    private func reviewMetric(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(.quaternary.opacity(0.32), in: RoundedRectangle(cornerRadius: 7))
+    }
+
+    private func priorityColor(_ priority: AssessmentRecommendationPriority) -> Color {
+        switch priority {
+        case .critical: return .red
+        case .high: return .orange
+        case .medium: return .blue
+        case .low: return .secondary
+        }
+    }
+
+    private func display(_ value: String) -> String {
+        value.replacingOccurrences(of: "_", with: " ").localizedCapitalized
+    }
+
+    private func abbreviated(_ value: String) -> String {
+        value.count > 24 ? "\(value.prefix(12))…\(value.suffix(8))" : value
     }
 }
 

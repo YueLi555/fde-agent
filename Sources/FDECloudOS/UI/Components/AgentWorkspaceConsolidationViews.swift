@@ -861,6 +861,7 @@ struct WorkspaceInspectorView: View {
 }
 
 private enum WorkspaceHumanActionTarget {
+    case assessment(AssessmentHumanReviewBundle)
     case candidate(ApprovalRequest)
     case generatedTest(GeneratedTestArtifact)
     case readiness(ProductionReadinessReport)
@@ -903,6 +904,11 @@ struct HumanActionBar: View {
                     .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
                 Text("Human review")
                     .font(WorkspaceVisualStyle.Typography.messageTitle)
+                if action.descriptor.domain == .assessmentRecommendation {
+                    Text("Advisory assessment")
+                        .font(WorkspaceVisualStyle.Typography.label)
+                        .foregroundStyle(WorkspaceVisualStyle.color(.textSecondary))
+                }
                 Spacer()
                 Text(action.descriptor.status)
                     .font(WorkspaceVisualStyle.Typography.label)
@@ -983,12 +989,18 @@ struct HumanActionBar: View {
                 Button {
                     submit(action, decision: .approve)
                 } label: {
-                    decisionButtonLabel("Approve", systemImage: "checkmark")
+                    if action.descriptor.domain == .assessmentRecommendation {
+                        decisionButtonLabel("Acknowledge assessment", systemImage: "checkmark")
+                    } else {
+                        decisionButtonLabel("Approve", systemImage: "checkmark")
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(!action.descriptor.canSubmit(decision: .approve, note: reviewNote) || isSubmitting)
-                .accessibilityLabel(isSubmitting ? "Submitting approval" : "Approve")
-                .accessibilityIdentifier("humanAction.approve")
+                .accessibilityLabel(isSubmitting ? "Submitting decision" : primaryDecisionTitle(action))
+                .accessibilityIdentifier(action.descriptor.domain == .assessmentRecommendation
+                    ? "humanAction.acknowledgeAssessment"
+                    : "humanAction.approve")
             }
 
             let secondaryDecisions = action.descriptor.decisions.filter { $0 != .approve }
@@ -999,13 +1011,13 @@ struct HumanActionBar: View {
                             Button(role: .destructive) {
                                 selectedDecision = decision
                             } label: {
-                                Label(decision.rawValue, systemImage: decisionSymbol(decision))
+                                Label(decisionTitle(action, decision), systemImage: decisionSymbol(decision))
                             }
                         } else {
                             Button {
                                 selectedDecision = decision
                             } label: {
-                                Label(decision.rawValue, systemImage: decisionSymbol(decision))
+                                Label(decisionTitle(action, decision), systemImage: decisionSymbol(decision))
                             }
                         }
                     }
@@ -1027,7 +1039,7 @@ struct HumanActionBar: View {
     ) -> some View {
         HStack(alignment: .center, spacing: WorkspaceVisualStyle.Spacing.x12) {
             VStack(alignment: .leading, spacing: WorkspaceVisualStyle.Spacing.x4) {
-                Label(decision.rawValue, systemImage: decisionSymbol(decision))
+                Label(decisionTitle(action, decision), systemImage: decisionSymbol(decision))
                     .font(WorkspaceVisualStyle.Typography.label)
                     .foregroundStyle(decision == .reject
                         ? WorkspaceVisualStyle.color(.danger)
@@ -1049,12 +1061,12 @@ struct HumanActionBar: View {
             Button {
                 submit(action, decision: decision)
             } label: {
-                decisionButtonLabel(decision.rawValue, systemImage: decisionSymbol(decision))
+                decisionButtonLabel(decisionTitle(action, decision), systemImage: decisionSymbol(decision))
             }
             .buttonStyle(.borderedProminent)
             .tint(decision == .reject ? WorkspaceVisualStyle.color(.danger) : nil)
             .disabled(!action.descriptor.canSubmit(decision: decision, note: reviewNote) || isSubmitting)
-            .accessibilityLabel(isSubmitting ? "Submitting decision" : decision.rawValue)
+            .accessibilityLabel(isSubmitting ? "Submitting decision" : decisionTitle(action, decision))
             .accessibilityIdentifier("humanAction.submitDecision")
         }
     }
@@ -1071,6 +1083,24 @@ struct HumanActionBar: View {
             }
         }
         .frame(minWidth: 112)
+    }
+
+    private func primaryDecisionTitle(_ action: WorkspaceHumanAction) -> String {
+        action.descriptor.domain == .assessmentRecommendation ? "Acknowledge assessment" : "Approve"
+    }
+
+    private func decisionTitle(
+        _ action: WorkspaceHumanAction,
+        _ decision: HumanReviewDecision
+    ) -> String {
+        guard action.descriptor.domain == .assessmentRecommendation else {
+            return decision.rawValue
+        }
+        switch decision {
+        case .approve: return "Acknowledge assessment"
+        case .requestChanges: return "Request assessment changes"
+        case .reject: return "Reject assessment"
+        }
     }
 
     private func decisionSymbol(_ decision: HumanReviewDecision) -> String {
@@ -1099,6 +1129,22 @@ struct HumanActionBar: View {
         }
         var actions: [WorkspaceHumanAction] = []
         let decisions = HumanReviewDecision.allCases
+
+        if let assessment = store.selectedAssessmentHumanReviewBundles.last,
+           store.assessmentHumanReviewEligibility(assessment).isAvailable {
+            actions.append(.init(
+                descriptor: descriptor(
+                    id: "assessment-review:\(assessment.review.reviewID)",
+                    domain: .assessmentRecommendation,
+                    title: "Acknowledge or respond to assessment advice",
+                    scope: "Advisory review only. No execution, code change, validation, mutation, deployment, or production access is authorized.",
+                    revision: nil,
+                    status: assessment.review.status.rawValue,
+                    decisions: decisions
+                ),
+                target: .assessment(assessment)
+            ))
+        }
 
         if let run = summary.evalRun,
            store.evalResultsReviewEligibility(run).isAvailable {
@@ -1306,6 +1352,12 @@ struct HumanActionBar: View {
         let note = reviewNote.trimmingCharacters(in: .whitespacesAndNewlines)
 
         switch action.target {
+        case let .assessment(bundle):
+            store.reviewAssessmentRecommendations(
+                bundle,
+                disposition: assessmentDisposition(decision),
+                note: note.nilIfEmpty
+            )
         case let .candidate(approval):
             switch decision {
             case .approve: store.approve(approval)
@@ -1341,6 +1393,11 @@ struct HumanActionBar: View {
 
     private func actionIsStillBoundToSelectedConversation(_ action: WorkspaceHumanAction) -> Bool {
         switch action.target {
+        case let .assessment(bundle):
+            return store.selectedAssessmentHumanReviewBundles.contains {
+                $0.review.reviewID == bundle.review.reviewID
+                    && $0.review == bundle.review
+            }
         case let .candidate(approval), let .generic(approval):
             return store.isApprovalBoundToSelectedConversation(approval)
         case let .undo(summary),
@@ -1366,6 +1423,16 @@ struct HumanActionBar: View {
         case .approve: return .approvePlan
         case .requestChanges: return .requestChanges
         case .reject: return .reject
+        }
+    }
+
+    private func assessmentDisposition(
+        _ decision: HumanReviewDecision
+    ) -> AssessmentHumanReviewDisposition {
+        switch decision {
+        case .approve: return .acknowledgeForPlanning
+        case .requestChanges: return .requestChanges
+        case .reject: return .rejectRecommendations
         }
     }
 

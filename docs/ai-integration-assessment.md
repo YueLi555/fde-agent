@@ -14,6 +14,7 @@ The assessment asks whether a specified AI Agent could be integrated with a sele
 6. Produce a grounded overall answer: `YES`, `PARTIAL`, `NO`, or `UNKNOWN` for Phase 3B.3B reports.
 7. Describe Legacy blockers, model-side black boxes, an operational workflow, and a validation plan.
 8. For Phase 3B.3B reports, deterministically derive a Phase 3B.4 advisory recommendation set from validated claim IDs, risk metadata, blockers, unknowns, and candidate integration seams.
+9. Present the exact Phase 3B.3B report and Phase 3B.4 recommendation set for a Phase 3B.5 human disposition without turning that disposition into execution approval.
 
 ## Outcome semantics
 
@@ -42,6 +43,14 @@ Phase 3B.4 accepts only an identity-valid Phase 3B.3B report whose section entri
 | `INVESTIGATE` | Evidence is insufficient for a feasibility decision; collect bounded read-only evidence and recompose the report. |
 
 Recommendations are ordered by priority and cover the decision gate, blocker remediation, deterministic security controls, evidence investigation, integration design, and validation. Every recommendation cites validated Phase 3B.3B claim IDs. Recommendation artifacts are `ADVISORY_ONLY` and always carry `executionAuthorized = false`; they do not alter RuntimeKernel, policy admission, approval, or execution authority.
+
+## Phase 3B.5 human-review semantics
+
+Phase 3B.5 opens one deterministic review for an exact workspace/Mission/task/Agent-session-bound report and recommendation set. The reviewer can `ACKNOWLEDGE_FOR_PLANNING`, `REQUEST_CHANGES`, or `REJECT_RECOMMENDATIONS`. Acknowledgement means only that the assessment is accepted as advice for future planning. A change request requires instructions; every disposition is final for that immutable recommendation set, and a revised report produces a distinct review rather than mutating history.
+
+The review record retains the exact report and recommendation-set SHA-256 digests, complete recommendation-ID and validated claim-ID scope, reviewer identity, optional note, timestamp, current authenticated/workspace/app-session binding, and a tamper-evident decision identity. Persisted review events are revalidated during projection. Missing, duplicate, stale, cross-session, or digest-invalid source or review state fails closed and cannot silently reopen as a pending action.
+
+Human assessment review is `ADVISORY_REVIEW_ONLY`. Acknowledging an assessment does not create or satisfy an `ApprovalRequest`, approve an Execution Plan, modify the Evidence Ledger, change RuntimeKernel or Mission admission, or authorize validation, Candidate Patch creation, Legacy mutation, shell, Git, deployment, credential access, or production execution. Requesting assessment changes and rejecting an assessment likewise record feedback only. Those boundaries continue to require their existing independent policy and approval contracts.
 
 ## Required model-side uncertainty
 
