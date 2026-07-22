@@ -147,6 +147,27 @@ enum AssessmentClaimEvidenceBinder {
                 )
                 continue
             }
+            guard let claimLevel = reference.claimLevel else {
+                reject(
+                    .missingClaimLevel,
+                    "Observed evidence must declare the claim maturity it supports."
+                )
+                continue
+            }
+            guard claimLevelIsRecorded(
+                claimLevel,
+                eventID: eventID,
+                workspaceIdentity: workspaceIdentity,
+                path: reference.path,
+                pathRecord: pathRecord,
+                evidenceLedger: evidenceLedger
+            ) else {
+                reject(
+                    .unsupportedClaimLevel,
+                    "The declared claim maturity exceeds or differs from the ledger record."
+                )
+                continue
+            }
             guard sourceMatches(reference: reference, evidence: sourceEvidence) else {
                 reject(
                     .evidenceSourceMismatch,
@@ -179,28 +200,6 @@ enum AssessmentClaimEvidenceBinder {
                 )
                 continue
             }
-            guard let claimLevel = reference.claimLevel else {
-                reject(
-                    .missingClaimLevel,
-                    "Observed evidence must declare the claim maturity it supports."
-                )
-                continue
-            }
-            guard claimLevelIsRecorded(
-                claimLevel,
-                eventID: eventID,
-                workspaceIdentity: workspaceIdentity,
-                path: reference.path,
-                pathRecord: pathRecord,
-                evidenceLedger: evidenceLedger
-            ) else {
-                reject(
-                    .unsupportedClaimLevel,
-                    "The declared claim maturity exceeds or differs from the ledger record."
-                )
-                continue
-            }
-
             let sourceHash = sha256(sourceEvidence.output)
             if let fileHash = reference.fileHash,
                fileHash.lowercased() != sourceHash {

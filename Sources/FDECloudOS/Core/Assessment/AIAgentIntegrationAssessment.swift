@@ -956,24 +956,54 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
     var agentBlackBoxAssessment: AgentBlackBoxAssessment
     var evidenceRecords: [AssessmentEvidenceReference]
     var unknownsAndNextInvestigationSteps: [String]
+    /// Phase 3B.3B composition authority. Legacy Phase 2E reports decode with
+    /// this value absent and continue to use their existing representation.
+    var composition: AssessmentReportComposition? = nil
 
-    var verdict: AgentIntegrationVerdict { compatibilityMatrix.verdict }
+    var verdict: AgentIntegrationVerdict {
+        composition?.executiveVerdict.legacyVerdict ?? compatibilityMatrix.verdict
+    }
+
+    var reportID: String { composition?.reportID ?? assessmentLayerID }
+    var executiveVerdict: AssessmentExecutiveVerdict {
+        composition?.executiveVerdict ?? AssessmentExecutiveVerdict(verdict)
+    }
+    var confidence: AssessmentClaimConfidence {
+        composition?.confidence ?? executiveSummary.confidence
+    }
+    var executionProvenance: AssessmentReportExecutionProvenance? {
+        composition?.executionProvenance
+    }
+    var workspaceTaskSessionBinding: AssessmentReportBinding? {
+        composition?.binding
+    }
+    var scope: AssessmentReportScope? { composition?.scope }
+    var evidenceAppendix: [AssessmentReportEvidenceAppendixEntry] {
+        composition?.evidenceAppendix ?? []
+    }
+    var validationFailures: [AssessmentReportValidationFailure] {
+        composition?.validationFailures ?? []
+    }
 
     var materialClaims: [AssessmentClaim] {
-        [executiveSummary]
-            + legacySystemUnderstanding
-            + compatibilityMatrix.entries.map(\.claim)
-            + integrationOpportunities.map(\.claim)
-            + securityAssessment.claims
-            + integrationBlockers.blockers.map(\.claim)
-            + [recommendedArchitecture.claim]
+        if let composition {
+            return composition.evidenceAppendix.map(\.claim)
+        }
+        var claims = [executiveSummary]
+        claims.append(contentsOf: legacySystemUnderstanding)
+        claims.append(contentsOf: compatibilityMatrix.entries.map(\.claim))
+        claims.append(contentsOf: integrationOpportunities.map(\.claim))
+        claims.append(contentsOf: securityAssessment.claims)
+        claims.append(contentsOf: integrationBlockers.blockers.map(\.claim))
+        claims.append(recommendedArchitecture.claim)
+        return claims
     }
 
     var activitySnapshot: AIAssessmentActivitySnapshot {
         AIAssessmentActivitySnapshot(
             capability: requestedAICapability.name,
             missionState: .finalizingGroundedAssessment,
-            compatibility: verdict,
+            compatibility: composition?.executiveVerdict == .unknown ? nil : verdict,
             risk: [
                 securityAssessment.dataAccessRisk,
                 securityAssessment.permissionRisk,
@@ -989,7 +1019,10 @@ struct FDEAIIntegrationAssessmentReport: Codable, Hashable, Sendable {
     }
 
     func markdown(language: ReadOnlyResponseLanguage) -> String {
-        language == .chinese ? chineseMarkdown() : englishMarkdown()
+        if composition != nil {
+            return phase3B3BMarkdown(language: language)
+        }
+        return language == .chinese ? chineseMarkdown() : englishMarkdown()
     }
 
     private func englishMarkdown() -> String {
