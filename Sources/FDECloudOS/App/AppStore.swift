@@ -101,6 +101,7 @@ final class AppStore: ObservableObject {
     @Published private var generatedTestPlanGenerationsInFlight: Set<String> = []
     @Published private var generatedTestArtifactReviewSessionsInFlight: Set<UUID> = []
     @Published private var candidatePatchReviewActionsInFlight: Set<UUID> = []
+    @Published private var assessmentHumanReviewsInFlight: Set<String> = []
     @Published private(set) var missionCleanupStates: [MissionCleanupState] = []
     @Published private(set) var productionReadinessReports: [ProductionReadinessReport] = []
     @Published private(set) var aiEvalPlans: [AIEvalPlan] = []
@@ -258,6 +259,67 @@ final class AppStore: ObservableObject {
 
     var selectedAgentSessionEvents: [ExecutionEvent] {
         AgentSessionEventScope.events(from: events, for: selectedAgentSession)
+    }
+
+    var selectedAssessmentHumanReviewProjection: AssessmentHumanReviewProjection {
+        AssessmentHumanReviewProjector.project(events: selectedAgentSessionEvents)
+    }
+
+    var selectedAssessmentHumanReviewBundles: [AssessmentHumanReviewBundle] {
+        guard let selectedAgentSession,
+              let scope = selectedConversationScope else { return [] }
+        return selectedAssessmentHumanReviewProjection.bundles.filter { bundle in
+            bundle.review.binding.workspaceID == selectedAgentSession.workspaceID
+                && bundle.review.binding.sessionID == selectedAgentSession.sessionID
+                && scope.containsMissionTask(bundle.review.binding.taskID)
+        }
+    }
+
+    func assessmentHumanReviewEligibility(
+        _ bundle: AssessmentHumanReviewBundle
+    ) -> AssessmentHumanReviewEligibility {
+        guard let submissionBinding = assessmentHumanReviewSubmissionBinding(for: bundle) else {
+            return .unavailable("The exact workspace, Mission, task, Agent session, source-digest, and current app-session binding is required for advisory assessment review.")
+        }
+        guard !assessmentHumanReviewsInFlight.contains(bundle.review.reviewID) else {
+            return .unavailable("This exact assessment review decision is already being recorded.")
+        }
+        return AssessmentHumanReviewWorkflow.eligibility(
+            for: bundle,
+            submissionBinding: submissionBinding
+        )
+    }
+
+    private func assessmentHumanReviewSubmissionBinding(
+        for bundle: AssessmentHumanReviewBundle
+    ) -> AssessmentHumanReviewSubmissionBinding? {
+        guard let selectedAgentSession,
+              let scope = selectedConversationScope,
+              let currentMission = exactCurrentMissionSummary(),
+              isMissionSummaryBoundToSelectedConversation(currentMission),
+              currentMission.missionID == bundle.review.missionID,
+              scope.containsMissionTask(bundle.review.binding.taskID),
+              selectedAgentSession.workspaceID == bundle.review.binding.workspaceID,
+              selectedAgentSession.sessionID == bundle.review.binding.sessionID,
+              let credential = session,
+              credential.workspaceID == bundle.review.binding.workspaceID,
+              let workspaceSessionID = activeWorkspaceSessionID else {
+            return nil
+        }
+        return AssessmentHumanReviewSubmissionBinding(
+            workspaceID: bundle.review.binding.workspaceID,
+            missionID: currentMission.missionID,
+            taskID: bundle.review.binding.taskID,
+            agentSessionID: selectedAgentSession.sessionID,
+            sourceReportID: bundle.review.sourceReportID,
+            sourceReportSHA256: bundle.review.sourceDigests.reportSHA256,
+            recommendationSetID: bundle.review.recommendationSetID,
+            recommendationSetSHA256: bundle.review.sourceDigests.recommendationSetSHA256,
+            reviewID: bundle.review.reviewID,
+            authenticatedLocalSessionID: credential.id,
+            workspaceSessionID: workspaceSessionID,
+            appSessionID: appSessionID
+        )
     }
 
     var selectedConversationActivity: AgentConversationActivity? {
@@ -1523,6 +1585,63 @@ final class AppStore: ObservableObject {
 
     private func exactCurrentMissionSummary() -> MissionSummary? {
         selectedMissionPresentation?.current
+    }
+
+    func reviewAssessmentRecommendations(
+        _ bundle: AssessmentHumanReviewBundle,
+        disposition: AssessmentHumanReviewDisposition,
+        note: String? = nil
+    ) {
+        guard assessmentHumanReviewEligibility(bundle).isAvailable,
+              selectedAssessmentHumanReviewBundles.contains(where: {
+                  $0.review.reviewID == bundle.review.reviewID
+                      && $0.review == bundle.review
+              }),
+              let submissionBinding = assessmentHumanReviewSubmissionBinding(for: bundle) else {
+            lastError = "This advisory assessment review is stale, already decided, or not bound to the exact current session and Mission."
+            return
+        }
+        assessmentHumanReviewsInFlight.insert(bundle.review.reviewID)
+        let context = AssessmentHumanReviewContext(
+            submissionBinding: submissionBinding,
+            reviewerID: submissionBinding.authenticatedLocalSessionID.uuidString
+        )
+        Task {
+            defer { assessmentHumanReviewsInFlight.remove(bundle.review.reviewID) }
+            do {
+                guard assessmentHumanReviewSubmissionBinding(for: bundle) == submissionBinding,
+                      selectedAssessmentHumanReviewBundles.contains(where: {
+                          $0.review.reviewID == bundle.review.reviewID
+                              && $0.review == bundle.review
+                      }) else {
+                    throw AssessmentHumanReviewFailure.bindingMismatch
+                }
+                let reviewed = try AssessmentHumanReviewWorkflow.record(
+                    bundle.review,
+                    disposition: disposition,
+                    note: note,
+                    context: context,
+                    report: bundle.report,
+                    recommendationSet: bundle.recommendationSet
+                )
+                var payload = try reviewed.persistenceEventPayload()
+                payload.merge([
+                    "review_effect": "ADVISORY_DISPOSITION_ONLY",
+                    "review_semantics": "ADVICE_FOR_FUTURE_PLANNING_ONLY"
+                ]) { current, _ in current }
+                try await environment.runtime.recordAuditEvent(
+                    type: .stateUpdated,
+                    workspaceID: reviewed.binding.workspaceID,
+                    taskID: reviewed.binding.taskID,
+                    summary: "Advisory assessment disposition recorded",
+                    payload: payload
+                )
+                await refresh()
+            } catch {
+                lastError = error.localizedDescription
+                await refresh()
+            }
+        }
     }
 
     func reviewProductionReadiness(_ summary: MissionSummary) {

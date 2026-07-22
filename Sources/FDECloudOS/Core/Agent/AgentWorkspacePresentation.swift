@@ -357,6 +357,7 @@ enum HumanReviewDecision: String, Codable, CaseIterable, Hashable, Sendable, Ide
 enum HumanActionDomain: String, Codable, CaseIterable, Hashable, Sendable {
     case controlledEvalResult = "Controlled Eval result review"
     case controlledEvalExecution = "Controlled Eval execution authorization"
+    case assessmentRecommendation = "Assessment recommendation review"
     case productionReadiness = "Production Readiness review"
     case aiEvalPlan = "AI Eval Plan review"
     case generatedTest = "Generated Test review"
@@ -368,6 +369,7 @@ enum HumanActionDomain: String, Codable, CaseIterable, Hashable, Sendable {
         switch self {
         case .controlledEvalResult: return 800
         case .controlledEvalExecution: return 700
+        case .assessmentRecommendation: return 650
         case .productionReadiness: return 600
         case .aiEvalPlan: return 590
         case .generatedTest: return 500
