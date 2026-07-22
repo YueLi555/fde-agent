@@ -11,8 +11,9 @@ The assessment asks whether a specified AI Agent could be integrated with a sele
 3. Inspect only the selected scope using the read-only tool allowlist.
 4. Convert direct observations into evidence-backed architecture signals and explicit absences/unknowns.
 5. Classify each requirement as `SUPPORTED`, `BLOCKED`, or `UNKNOWN`.
-6. Produce a grounded overall answer: `YES`, `PARTIAL`, or `NO`.
+6. Produce a grounded overall answer: `YES`, `PARTIAL`, `NO`, or `UNKNOWN` for Phase 3B.3B reports.
 7. Describe Legacy blockers, model-side black boxes, an operational workflow, and a validation plan.
+8. For Phase 3B.3B reports, deterministically derive a Phase 3B.4 advisory recommendation set from validated claim IDs, risk metadata, blockers, unknowns, and candidate integration seams.
 
 ## Outcome semantics
 
@@ -27,6 +28,20 @@ The assessment asks whether a specified AI Agent could be integrated with a sele
 | `YES` | Critical requirements are statically supported, subject to stated execution unknowns and validation. |
 | `PARTIAL` | Some requirements are supported, but blockers or material unknowns remain. |
 | `NO` | One or more critical requirements are blocked under the requested design. |
+| `UNKNOWN` | No evidence-grounded feasibility conclusion is available for the required scope. |
+
+## Phase 3B.4 recommendation semantics
+
+Phase 3B.4 accepts only an identity-valid Phase 3B.3B report whose section entries resolve to its validated evidence appendix. It produces a stable, workspace/task/session-bound recommendation set and fails closed when report identity, scope, appendix bindings, or claim lineage do not match.
+
+| Recommendation decision | Meaning |
+| --- | --- |
+| `PROCEED_TO_VALIDATION` | Static evidence supports the required scope. Only bounded, non-production validation is recommended. |
+| `CONDITIONALLY_PROCEED` | Advance only the supported subset after the named blockers and material unknowns are resolved or bounded. |
+| `DO_NOT_PROCEED` | Hold integration handoff until evidence-backed blockers are remediated and the assessment is recomposed. |
+| `INVESTIGATE` | Evidence is insufficient for a feasibility decision; collect bounded read-only evidence and recompose the report. |
+
+Recommendations are ordered by priority and cover the decision gate, blocker remediation, deterministic security controls, evidence investigation, integration design, and validation. Every recommendation cites validated Phase 3B.3B claim IDs. Recommendation artifacts are `ADVISORY_ONLY` and always carry `executionAuthorized = false`; they do not alter RuntimeKernel, policy admission, approval, or execution authority.
 
 ## Required model-side uncertainty
 
